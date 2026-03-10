@@ -9,30 +9,30 @@ use rig::providers::{ollama, openai};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::simulation::{DialogueLine, DialogueSession, RelationshipState};
-use crate::world::{City, Npc, World};
+use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
+use crate::simulation::{DialogueLine, DialogueSession, RelationshipState, Speaker};
+use crate::world::{City, CityId, Npc, World};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DialogueRequest {
     pub world_seed: u64,
-    pub current_turn: u32,
+    pub current_time_seconds: u64,
+    pub current_time_label: String,
     pub city_name: String,
-    pub city_biome: String,
-    pub city_economy: String,
-    pub city_culture: String,
+    pub city_biome: Biome,
+    pub city_economy: Economy,
+    pub city_culture: Culture,
     pub city_districts: Vec<String>,
     pub city_landmarks: Vec<String>,
     pub connected_cities: Vec<String>,
     pub npc_name: String,
-    pub npc_archetype: String,
-    pub npc_occupation: String,
-    pub npc_traits: Vec<String>,
-    pub npc_goal: String,
+    pub npc_archetype: NpcArchetype,
+    pub npc_occupation: Occupation,
+    pub npc_traits: Vec<TraitTag>,
+    pub npc_goal: GoalTag,
     pub npc_home_district: String,
     pub relationship_disposition: i32,
     pub relationship_memory: String,
-    pub known_rumors: Vec<String>,
-    pub journal_context: Vec<String>,
     pub transcript: Vec<DialogueLine>,
     pub player_input: String,
 }
@@ -41,12 +41,6 @@ pub struct DialogueRequest {
 pub struct DialogueResponse {
     pub text: String,
     pub actions: Vec<WorldAction>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StreamedDialogue {
-    pub chunks: Vec<String>,
-    pub response: DialogueResponse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
@@ -58,39 +52,12 @@ pub struct ProposedActions {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorldAction {
-    RevealRumor {
-        text: String,
-    },
-    UpdateRelationship {
-        delta: i32,
-        note: String,
-    },
-    OfferFavor {
-        summary: String,
-    },
-    LearnLocation {
-        city_name: String,
-    },
-    ReceiveItem {
-        item: String,
-    },
-    ScheduleMeeting {
-        summary: String,
-        turns_from_now: u32,
-    },
+    UpdateRelationship { delta: i32, note: String },
 }
 
 #[allow(async_fn_in_trait)]
 pub trait LlmBackend {
     async fn generate_dialogue(&self, request: &DialogueRequest) -> Result<DialogueResponse>;
-
-    async fn stream_dialogue(&self, request: &DialogueRequest) -> Result<StreamedDialogue> {
-        let response = self.generate_dialogue(request).await?;
-        Ok(StreamedDialogue {
-            chunks: chunk_text(&response.text),
-            response,
-        })
-    }
 
     async fn summarize_memory(&self, session: &DialogueSession) -> Result<String>;
 
@@ -124,13 +91,6 @@ impl LlmBackend for AnyBackend {
         }
     }
 
-    async fn stream_dialogue(&self, request: &DialogueRequest) -> Result<StreamedDialogue> {
-        match self {
-            Self::Mock(backend) => backend.stream_dialogue(request).await,
-            Self::Rig(backend) => backend.stream_dialogue(request).await,
-        }
-    }
-
     async fn summarize_memory(&self, session: &DialogueSession) -> Result<String> {
         match self {
             Self::Mock(backend) => backend.summarize_memory(session).await,
@@ -155,46 +115,31 @@ impl LlmBackend for MockBackend {
         let mut actions = Vec::new();
         let mut lines = vec![format!(
             "{} the {} leans in, measuring your tone before answering.",
-            request.npc_name, request.npc_occupation
+            request.npc_name,
+            request.npc_occupation.label()
         )];
 
-        if lower.contains("rumor") || lower.contains("secret") || lower.contains("heard") {
-            if let Some(rumor) = request.known_rumors.first() {
-                lines.push(format!("\"Fine. Start with this: {}\"", rumor));
-                actions.push(WorldAction::RevealRumor {
-                    text: rumor.clone(),
-                });
-                actions.push(WorldAction::UpdateRelationship {
-                    delta: 1,
-                    note: "Shared a rumor".to_string(),
-                });
-            }
-        } else if lower.contains("job") || lower.contains("work") || lower.contains("favor") {
-            let summary = format!(
-                "Meet {} near {} and see whether their lead is real.",
-                request.npc_name,
-                request
-                    .city_landmarks
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "the old market".to_string())
-            );
+        if lower.contains("job") || lower.contains("work") || lower.contains("favor") {
+            let landmark = request
+                .city_landmarks
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "the transit station".to_string());
             lines.push(format!(
-                "\"I might have work if you're steady. {}\"",
-                summary
+                "\"I might have something for you if you're reliable. Check around {} and see whether anything looks out of place.\"",
+                landmark
             ));
-            actions.push(WorldAction::OfferFavor { summary });
             actions.push(WorldAction::UpdateRelationship {
                 delta: 1,
-                note: "Offered a favor".to_string(),
+                note: "Opened up about local work".to_string(),
             });
         } else if lower.contains("where") || lower.contains("city") || lower.contains("travel") {
             lines.push(format!(
                 "\"{} is a {} place built on {} and {}. I keep mostly to {}. From here you can push on toward {} if you've got a reason.\"",
                 request.city_name,
-                request.city_biome,
-                request.city_economy,
-                request.city_culture,
+                request.city_biome.label(),
+                request.city_economy.label(),
+                request.city_culture.label(),
                 request.npc_home_district,
                 if request.connected_cities.is_empty() {
                     "nowhere worth naming".to_string()
@@ -204,7 +149,7 @@ impl LlmBackend for MockBackend {
             ));
         } else {
             lines.push(format!(
-                "\"You don't talk like most drifters. In {}, that can be useful or dangerous. I work out of {}, so I hear things before most people do.\"",
+                "\"You don't sound like most people passing through {}. That can be useful or it can get noticed. I spend most of my time around {}, so I hear things early.\"",
                 request.city_name, request.npc_home_district
             ));
             if request.relationship_disposition < 2 {
@@ -228,7 +173,7 @@ impl LlmBackend for MockBackend {
             .rev()
             .take(4)
             .rev()
-            .map(|line| format!("{}: {}", line.speaker, line.text))
+            .map(|line| format!("{}: {}", speaker_label(line), line.text))
             .collect::<Vec<_>>()
             .join(" | ");
         Ok(if summary.is_empty() {
@@ -301,12 +246,9 @@ impl RigBackend {
         let history = request
             .transcript
             .iter()
-            .map(|line| {
-                if line.speaker == "You" {
-                    Message::user(line.text.clone())
-                } else {
-                    Message::assistant(line.text.clone())
-                }
+            .map(|line| match line.speaker {
+                Speaker::Player => Message::user(line.text.clone()),
+                Speaker::Npc(_) | Speaker::System => Message::assistant(line.text.clone()),
             })
             .collect::<Vec<_>>();
         let prompt = build_dialogue_prompt(request);
@@ -386,7 +328,7 @@ impl LlmBackend for RigBackend {
         let transcript = session
             .transcript
             .iter()
-            .map(|line| format!("{}: {}", line.speaker, line.text))
+            .map(|line| format!("{}: {}", speaker_label(line), line.text))
             .collect::<Vec<_>>()
             .join("\n");
         let prompt = format!(
@@ -422,49 +364,52 @@ impl LlmBackend for RigBackend {
     }
 }
 
+fn speaker_label(line: &DialogueLine) -> String {
+    match line.speaker {
+        Speaker::Player => "You".to_string(),
+        Speaker::Npc(_) => "NPC".to_string(),
+        Speaker::System => "System".to_string(),
+    }
+}
+
 pub fn build_request(
     world: &World,
+    city_id: CityId,
     city: &City,
     npc: &Npc,
     relationship: &RelationshipState,
-    journal_context: Vec<String>,
     session: &DialogueSession,
     player_input: String,
 ) -> DialogueRequest {
-    let known_rumors = npc
-        .known_rumor_ids
-        .iter()
-        .map(|rumor_id| world.rumor(*rumor_id).text.clone())
-        .collect::<Vec<_>>();
-
     DialogueRequest {
         world_seed: world.seed,
-        current_turn: session.started_turn + session.transcript.len() as u32,
+        current_time_seconds: session.started_at + session.transcript.len() as u64 * 30,
+        current_time_label: format_clock_label(
+            session.started_at + session.transcript.len() as u64 * 30,
+        ),
         city_name: city.name.clone(),
-        city_biome: city.biome.clone(),
-        city_economy: city.economy.clone(),
-        city_culture: city.culture.clone(),
+        city_biome: city.biome,
+        city_economy: city.economy,
+        city_culture: city.culture,
         city_districts: city
             .districts
             .iter()
             .map(|district| district.name.clone())
             .collect(),
         city_landmarks: city.landmarks.clone(),
-        connected_cities: city
-            .connected_city_ids
+        connected_cities: world
+            .city_connections(city_id)
             .iter()
             .map(|city_id| world.city(*city_id).name.clone())
             .collect(),
         npc_name: npc.name.clone(),
-        npc_archetype: npc.archetype.clone(),
-        npc_occupation: npc.occupation.clone(),
+        npc_archetype: npc.archetype,
+        npc_occupation: npc.occupation,
         npc_traits: npc.personality_traits.clone(),
-        npc_goal: npc.goal.clone(),
+        npc_goal: npc.goal,
         npc_home_district: npc.home_district.clone(),
         relationship_disposition: relationship.disposition,
         relationship_memory: relationship.memory_summary.clone(),
-        known_rumors,
-        journal_context,
         transcript: session.transcript.clone(),
         player_input,
     }
@@ -472,13 +417,14 @@ pub fn build_request(
 
 fn build_dialogue_prompt(request: &DialogueRequest) -> String {
     format!(
-        "World seed: {world_seed}\nTurn: {turn}\nCity: {city} ({biome}, {economy}, {culture})\nDistricts: {districts}\nLandmarks: {landmarks}\nConnected cities: {connected_cities}\nNPC: {npc}, a {occupation} and {archetype}\nHome district: {home_district}\nTraits: {traits}\nGoal: {goal}\nDisposition toward player: {disposition}\nRelationship memory: {memory}\nKnown rumors: {rumors}\nRecent journal context: {journal}\n\nPlayer says: {player_input}\n\nReply as the NPC in 2-4 sentences. Stay grounded in the city and the NPC's motives. Refer only to facts present in this context or naturally implied by them.",
+        "World seed: {world_seed}\nTime: {time_label} ({time_seconds} seconds)\nCity: {city} ({biome}, {economy}, {culture})\nDistricts: {districts}\nLandmarks: {landmarks}\nConnected cities: {connected_cities}\nNPC: {npc}, a {occupation} and {archetype}\nHome district: {home_district}\nTraits: {traits}\nGoal: {goal}\nDisposition toward player: {disposition}\nRelationship memory: {memory}\n\nPlayer says: {player_input}\n\nReply as the NPC in 2-4 sentences. Stay grounded in the city and the NPC's motives. Refer only to facts present in this context or naturally implied by them.",
         world_seed = request.world_seed,
-        turn = request.current_turn,
+        time_label = request.current_time_label,
+        time_seconds = request.current_time_seconds,
         city = request.city_name,
-        biome = request.city_biome,
-        economy = request.city_economy,
-        culture = request.city_culture,
+        biome = request.city_biome.label(),
+        economy = request.city_economy.label(),
+        culture = request.city_culture.label(),
         districts = if request.city_districts.is_empty() {
             "none".to_string()
         } else {
@@ -491,66 +437,41 @@ fn build_dialogue_prompt(request: &DialogueRequest) -> String {
             request.connected_cities.join(", ")
         },
         npc = request.npc_name,
-        occupation = request.npc_occupation,
-        archetype = request.npc_archetype,
+        occupation = request.npc_occupation.label(),
+        archetype = request.npc_archetype.label(),
         home_district = request.npc_home_district,
-        traits = request.npc_traits.join(", "),
-        goal = request.npc_goal,
+        traits = request
+            .npc_traits
+            .iter()
+            .map(|trait_tag| trait_tag.label())
+            .collect::<Vec<_>>()
+            .join(", "),
+        goal = request.npc_goal.label(),
         disposition = request.relationship_disposition,
         memory = if request.relationship_memory.trim().is_empty() {
             "none".to_string()
         } else {
             request.relationship_memory.clone()
         },
-        rumors = if request.known_rumors.is_empty() {
-            "none".to_string()
-        } else {
-            request.known_rumors.join(" | ")
-        },
-        journal = if request.journal_context.is_empty() {
-            "none".to_string()
-        } else {
-            request.journal_context.join(" | ")
-        },
         player_input = request.player_input
     )
 }
 
-fn build_action_prompt(request: &DialogueRequest, text: &str) -> String {
-    format!(
-        "You are extracting game state updates from an NPC response.\nAllowed actions: reveal_rumor, update_relationship, offer_favor, learn_location, receive_item, schedule_meeting.\nOnly emit actions justified by the NPC response and keep them conservative.\n\nCity: {}\nNPC: {}\nPlayer input: {}\nNPC response: {}",
-        request.city_name, request.npc_name, request.player_input, text
-    )
+fn format_clock_label(total_seconds: u64) -> String {
+    let seconds_per_day = 24 * 60 * 60;
+    let day = total_seconds / seconds_per_day + 1;
+    let seconds_in_day = total_seconds % seconds_per_day;
+    let hours = seconds_in_day / 3600;
+    let minutes = (seconds_in_day % 3600) / 60;
+    let seconds = seconds_in_day % 60;
+    format!("Day {} {:02}:{:02}:{:02}", day, hours, minutes, seconds)
 }
 
-fn chunk_text(text: &str) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-
-    for word in text.split_whitespace() {
-        if !current.is_empty() && current.len() + word.len() + 1 > 48 {
-            chunks.push(current.clone());
-            current.clear();
-        }
-        if !current.is_empty() {
-            current.push(' ');
-        }
-        current.push_str(word);
-        if matches!(word.chars().last(), Some('.') | Some('!') | Some('?')) {
-            chunks.push(current.clone());
-            current.clear();
-        }
-    }
-
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-
-    if chunks.is_empty() {
-        chunks.push(String::new());
-    }
-
-    chunks
+fn build_action_prompt(request: &DialogueRequest, text: &str) -> String {
+    format!(
+        "You are extracting game state updates from an NPC response.\nAllowed actions: update_relationship.\nOnly emit actions justified by the NPC response and keep them conservative.\n\nCity: {}\nNPC: {}\nPlayer input: {}\nNPC response: {}",
+        request.city_name, request.npc_name, request.player_input, text
+    )
 }
 
 const DIALOGUE_PREAMBLE: &str = "You are roleplaying a resident of a procedurally generated city in a turn-based text game. Speak in first person as the NPC, stay consistent with the provided setting and personal motive, and do not narrate as a game master.";
@@ -559,35 +480,37 @@ const ACTION_PREAMBLE: &str = "Convert NPC dialogue into conservative structured
 #[cfg(test)]
 mod tests {
     use super::{LlmBackend, MockBackend, WorldAction, build_request};
-    use crate::simulation::{DialogueLine, DialogueSession, RelationshipState};
+    use crate::simulation::{DialogueLine, DialogueSession, RelationshipState, Speaker};
     use crate::world::World;
 
     #[tokio::test]
-    async fn mock_backend_can_reveal_rumor() {
+    async fn mock_backend_updates_relationship_on_normal_conversation() {
         let world = World::generate(2, 16);
-        let city = world.city(0);
-        let npc = world.npc(city.npc_ids[0]);
+        let city_id = world.city_ids()[0];
+        let city = world.city(city_id);
+        let npc_id = world.city_npcs(city_id)[0];
+        let npc = world.npc(npc_id);
         let relationship = RelationshipState {
             disposition: 0,
             memory_summary: String::new(),
-            last_interaction_turn: 0,
+            last_interaction_at: 0,
         };
         let session = DialogueSession {
-            npc_id: npc.id,
-            started_turn: 0,
+            npc_id,
+            started_at: 0,
             transcript: vec![DialogueLine {
-                speaker: "You".to_string(),
+                speaker: Speaker::Player,
                 text: "Hello".to_string(),
             }],
         };
         let request = build_request(
             &world,
+            city_id,
             city,
             npc,
             &relationship,
-            vec!["[0] rumor: Someone is moving a ledger.".to_string()],
             &session,
-            "Any rumors around here?".to_string(),
+            "Hello there.".to_string(),
         );
 
         let response = MockBackend.generate_dialogue(&request).await.unwrap();
@@ -595,32 +518,34 @@ mod tests {
             response
                 .actions
                 .iter()
-                .any(|action| matches!(action, WorldAction::RevealRumor { .. }))
+                .any(|action| matches!(action, WorldAction::UpdateRelationship { .. }))
         );
     }
 
     #[test]
     fn request_contains_npc_and_city_context() {
         let world = World::generate(9, 16);
-        let city = world.city(0);
-        let npc = world.npc(city.npc_ids[0]);
+        let city_id = world.city_ids()[0];
+        let city = world.city(city_id);
+        let npc_id = world.city_npcs(city_id)[0];
+        let npc = world.npc(npc_id);
         let relationship = RelationshipState {
             disposition: 2,
             memory_summary: "The player kept their word once before.".to_string(),
-            last_interaction_turn: 3,
+            last_interaction_at: 3,
         };
         let session = DialogueSession {
-            npc_id: npc.id,
-            started_turn: 4,
+            npc_id,
+            started_at: 4,
             transcript: Vec::new(),
         };
 
         let request = build_request(
             &world,
+            city_id,
             city,
             npc,
             &relationship,
-            vec!["[4] lead: Meet someone at the market.".to_string()],
             &session,
             "What is this city like?".to_string(),
         );
@@ -632,6 +557,5 @@ mod tests {
         assert!(!request.city_districts.is_empty());
         assert!(!request.connected_cities.is_empty());
         assert_eq!(request.relationship_memory, relationship.memory_summary);
-        assert_eq!(request.journal_context.len(), 1);
     }
 }

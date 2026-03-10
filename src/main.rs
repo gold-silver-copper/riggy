@@ -1,8 +1,8 @@
-use riggy::{cli, llm::AnyBackend, simulation::Game};
+use riggy::{app::service::GameService, llm::AnyBackend, tui};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let backend = AnyBackend::from_env()?;
-    let mut game = Game::new(backend);
-    cli::run(&mut game).await
+    let game = GameService::new(backend)?;
+    tui::run(game).await
 }
