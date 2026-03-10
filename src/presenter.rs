@@ -33,7 +33,7 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
         ]),
         Line::from(vec![
             Span::raw("Time: "),
-            highlighted(format_clock(snapshot.status.clock_seconds), Color::Cyan),
+            highlighted(snapshot.status.clock.format(), Color::Cyan),
             Span::raw("  |  Transport: "),
             highlighted(
                 snapshot.status.transport_mode.label().to_string(),
@@ -51,14 +51,12 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
             highlighted(partner.actor.name.clone(), Color::Magenta),
             Span::raw("  |  Job: "),
             highlighted(partner.actor.occupation.label().to_string(), Color::Yellow),
-            Span::raw("  |  Disposition: "),
-            highlighted(partner.disposition.to_string(), Color::Cyan),
             Span::raw("."),
         ]));
         if let Some(memory) = &partner.memory {
             lines.push(Line::from(vec![
-                Span::raw("Relationship memory: "),
-                Span::raw(clean_inline_text(&render_relationship_memory(memory))),
+                Span::raw("Conversation memory: "),
+                Span::raw(clean_inline_text(&render_conversation_memory(memory))),
                 Span::raw("."),
             ]));
         }
@@ -176,12 +174,12 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
 }
 
 pub fn render_route_label(option: &RouteView) -> String {
-    match option.travel_seconds {
-        Some(seconds) => format!(
+    match option.travel_time {
+        Some(duration) => format!(
             "{} via {} ({})",
             option.destination.name,
             option.route.kind.label(),
-            format_duration(seconds),
+            format_duration(duration),
         ),
         None => format!(
             "{} via {} (unavailable)",
@@ -226,13 +224,13 @@ pub fn render_event_notice(event: &GameEvent) -> Option<String> {
             destination,
             transport_mode,
             route,
-            duration_seconds,
+            duration,
         } => Some(format!(
             "You travel to {} by {} on {} in {}.",
             destination.name,
             transport_mode.label(),
             route.kind.label(),
-            format_duration(*duration_seconds)
+            format_duration(*duration)
         )),
         GameEvent::VehicleEntered { entity } => Some(format!("You get into the {}.", entity.name)),
         GameEvent::VehicleExited { entity } => Some(format!("You get out of the {}.", entity.name)),
@@ -242,14 +240,13 @@ pub fn render_event_notice(event: &GameEvent) -> Option<String> {
             entity.kind.label()
         )),
         GameEvent::WaitCompleted {
-            duration_seconds,
-            current_time_seconds,
+            duration,
+            current_time,
         } => Some(format!(
             "You wait for {}. The time is now {}.",
-            format_duration(*duration_seconds),
-            format_clock(*current_time_seconds)
+            format_duration(*duration),
+            current_time.format()
         )),
-        GameEvent::RelationshipChanged { .. } => None,
         GameEvent::ContextAppended { .. } => None,
     }
 }
@@ -260,13 +257,13 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
     for entry in &snapshot.context_feed {
         match entry {
             ContextFeedEntryView::System {
-                timestamp_seconds,
+                timestamp,
                 context,
             } => {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
-                        format!("[{}]", format_clock(*timestamp_seconds)),
+                        format!("[{}]", timestamp.format()),
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::raw("  "),
@@ -281,7 +278,7 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
                 ]));
             }
             ContextFeedEntryView::Dialogue {
-                timestamp_seconds: _,
+                timestamp: _,
                 speaker,
                 text,
             } => {
@@ -331,20 +328,14 @@ fn render_system_context(context: &SystemContext) -> String {
         SystemContext::Travel {
             destination_name,
             transport_mode,
-            duration_seconds,
+            duration,
             ..
         } => format!(
             "Arrived at {} via {} after {}.",
             destination_name,
             transport_mode.label(),
-            format_duration(*duration_seconds)
+            format_duration(*duration)
         ),
-        SystemContext::Relationship {
-            actor_name, note, ..
-        } => format!("{actor_name}: {note}"),
-        SystemContext::ProposalRejected {
-            actor_name, reason, ..
-        } => format!("Rejected AI proposal for {actor_name}: {reason}"),
     }
 }
 
@@ -368,54 +359,16 @@ fn clean_inline_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn format_clock(total_seconds: u64) -> String {
-    let seconds_per_day = 24 * 60 * 60;
-    let day = total_seconds / seconds_per_day + 1;
-    let seconds_in_day = total_seconds % seconds_per_day;
-    let hours = seconds_in_day / 3600;
-    let minutes = (seconds_in_day % 3600) / 60;
-    let seconds = seconds_in_day % 60;
-    format!("Day {} {:02}:{:02}:{:02}", day, hours, minutes, seconds)
-}
-
-fn render_relationship_memory(memory: &crate::domain::relationship::RelationshipMemory) -> String {
-    let mut parts = Vec::new();
-    if !memory.freeform_summary.trim().is_empty() {
-        parts.push(memory.freeform_summary.trim().to_string());
-    }
-    if !memory.known_topics.is_empty() {
-        parts.push(format!("Known topics: {}", memory.known_topics.join(", ")));
-    }
-    if !memory.unresolved_threads.is_empty() {
-        parts.push(format!(
-            "Unresolved: {}",
-            memory.unresolved_threads.join(", ")
-        ));
-    }
-    if memory.trust_delta_summary != 0 {
-        parts.push(format!(
-            "Trust shift summary: {}",
-            memory.trust_delta_summary
-        ));
-    }
-    if parts.is_empty() {
+fn render_conversation_memory(memory: &crate::domain::memory::ConversationMemory) -> String {
+    if memory.summary.trim().is_empty() {
         "none".to_string()
     } else {
-        parts.join(" | ")
+        memory.summary.trim().to_string()
     }
 }
 
-pub fn format_duration(seconds: u64) -> String {
-    let hours = seconds / 3600;
-    let minutes = (seconds % 3600) / 60;
-    let remainder = seconds % 60;
-    if hours > 0 {
-        format!("{hours}h {minutes:02}m {remainder:02}s")
-    } else if minutes > 0 {
-        format!("{minutes}m {remainder:02}s")
-    } else {
-        format!("{remainder}s")
-    }
+pub fn format_duration(duration: crate::domain::time::TimeDelta) -> String {
+    duration.format()
 }
 
 fn highlighted(value: String, color: Color) -> Span<'static> {
@@ -432,7 +385,8 @@ mod tests {
     use super::{
         build_world_text, render_event_notice, render_interactable_label, render_route_label,
     };
-    use crate::domain::events::{NpcRef, PlaceRef, SystemContext};
+    use crate::domain::events::{PlaceRef, SystemContext};
+    use crate::domain::time::{GameTime, TimeDelta};
     use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
     use crate::graph_ecs::{EntityId, NpcId, PlaceId};
     use crate::simulation::{
@@ -484,23 +438,12 @@ mod tests {
                 },
                 transport_mode: TransportMode::Walking,
                 route: sample_snapshot().routes[0].route,
-                duration_seconds: 600,
+                duration: TimeDelta::from_seconds(600),
             });
-        let relationship_notice =
-            render_event_notice(&crate::domain::events::GameEvent::RelationshipChanged {
-                actor: NpcRef {
-                    id: NpcId(NodeIndex::new(3)),
-                    name: "Yana Orchard".to_string(),
-                },
-                disposition: 3,
-                note: Some("Opened up about local work".to_string()),
-            });
-
         assert_eq!(
             travel_notice.as_deref(),
             Some("You travel to Platform Level by walk on arterial road in 10m 00s.")
         );
-        assert!(relationship_notice.is_none());
     }
 
     fn sample_snapshot() -> UiSnapshot {
@@ -530,7 +473,7 @@ mod tests {
         UiSnapshot {
             mode: UiMode::Dialogue,
             status: PlayerStatusView {
-                clock_seconds: 29_400,
+                clock: GameTime::from_seconds(29_400),
                 transport_mode: TransportMode::Walking,
                 known_city_count: 3,
             },
@@ -556,12 +499,8 @@ mod tests {
             },
             dialogue_partner: Some(DialoguePartnerView {
                 actor: actor.clone(),
-                disposition: 2,
-                memory: Some(crate::domain::relationship::RelationshipMemory {
-                    trust_delta_summary: 1,
-                    known_topics: vec!["local lead".to_string()],
-                    unresolved_threads: vec!["Call back tomorrow".to_string()],
-                    freeform_summary: "The player followed up on a local lead.".to_string(),
+                memory: Some(crate::domain::memory::ConversationMemory {
+                    summary: "The player followed up on a local lead.".to_string(),
                 }),
             }),
             routes: vec![RouteView {
@@ -572,7 +511,7 @@ mod tests {
                     transit_seconds: Some(240),
                     driving_seconds: Some(120),
                 },
-                travel_seconds: Some(600),
+                travel_time: Some(TimeDelta::from_seconds(600)),
             }],
             interactables: vec![
                 InteractableOption {
@@ -596,11 +535,11 @@ mod tests {
             nearby_entities: vec![bag],
             context_feed: vec![
                 ContextFeedEntryView::System {
-                    timestamp_seconds: 28_800,
+                    timestamp: GameTime::from_seconds(28_800),
                     context: SystemContext::Start,
                 },
                 ContextFeedEntryView::Dialogue {
-                    timestamp_seconds: 28_830,
+                    timestamp: GameTime::from_seconds(28_830),
                     speaker: DialogueSpeakerView::Npc(ActorRefView {
                         id: NpcId(NodeIndex::new(3)),
                         name: "Yana Orchard".to_string(),

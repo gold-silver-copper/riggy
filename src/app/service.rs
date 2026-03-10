@@ -4,12 +4,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use crate::ai::context::build_npc_dialogue_context_v1;
-use crate::ai::policy::ConservativeProposalPolicy;
-use crate::ai::validation::{
-    ProposalRejectionReason, ProposalValidationContext, RejectedProposal, ValidatedProposal,
-    validate_proposals,
-};
+use crate::ai::context::build_npc_dialogue_context;
 use crate::app::query::{current_transport_mode, current_vehicle_id, reachable_car_ids};
 use crate::app::read_model::build_ui_snapshot;
 use crate::domain::commands::GameCommand;
@@ -17,17 +12,18 @@ use crate::domain::events::{
     CommandResult, ContextEvent, DialogueEventLine, DialogueSpeakerRef, EntityRef, GameEvent,
     NpcRef, PlaceRef, SystemContext,
 };
-use crate::domain::relationship::RelationshipMemory;
+use crate::domain::seed::WorldSeed;
+use crate::domain::time::{GameTime, TimeDelta};
 use crate::llm::LlmBackend;
 use crate::simulation::{
     ContextEntry, ContextEntryKind, DialogueLine, DialogueSession, GameState, OccupancyState,
-    RelationshipState, Speaker, UiSnapshot,
+    NpcMemoryState, Speaker, UiSnapshot,
 };
 use crate::world::{EntityId, NpcId, PlaceId, PlaceKind, TransportMode, World};
 
-const START_TIME_SECONDS: u64 = 8 * 60 * 60;
-const DIALOGUE_SECONDS: u64 = 30;
-const RELATIONSHIP_DECAY_AFTER_SECONDS: u64 = 8 * 60 * 60;
+const START_TIME: GameTime = GameTime::from_seconds(8 * 60 * 60);
+const DIALOGUE_TIME: TimeDelta = TimeDelta::from_seconds(30);
+
 #[derive(Debug)]
 pub struct GameService<B> {
     state: GameState,
@@ -36,7 +32,7 @@ pub struct GameService<B> {
 
 impl<B: LlmBackend> GameService<B> {
     pub fn new(backend: B) -> Result<Self> {
-        let seed = 42;
+        let seed = WorldSeed::new(42);
         let world = World::generate(seed, 18);
         validate_world(&world)?;
         let start_city_id = world.city_ids()[0];
@@ -77,14 +73,14 @@ impl<B: LlmBackend> GameService<B> {
         Ok(Self {
             state: GameState {
                 world,
-                clock_seconds: START_TIME_SECONDS,
+                clock: START_TIME,
                 player_city_id: start_city_id,
                 player_place_id: start_place_id,
                 occupancy: OccupancyState::OnFoot,
                 known_city_ids,
-                relationships: BTreeMap::new(),
+                npc_memories: BTreeMap::new(),
                 context_feed: vec![ContextEntry {
-                    timestamp_seconds: START_TIME_SECONDS,
+                    timestamp: START_TIME,
                     kind: ContextEntryKind::System(SystemContext::Start),
                 }],
                 active_dialogue: None,
@@ -109,7 +105,7 @@ impl<B: LlmBackend> GameService<B> {
             GameCommand::EnterVehicle(entity_id) => vec![self.enter_vehicle(entity_id)?],
             GameCommand::ExitVehicle => vec![self.exit_vehicle()?],
             GameCommand::InspectEntity(entity_id) => vec![self.inspect_entity(entity_id)?],
-            GameCommand::Wait(seconds) => vec![self.wait_for(seconds.max(1))],
+            GameCommand::Wait(duration) => vec![self.wait_for(duration.max(TimeDelta::ONE_SECOND))],
             GameCommand::LeaveDialogue => vec![self.leave_dialogue().await?],
         };
         Ok(CommandResult {
@@ -149,7 +145,7 @@ impl<B: LlmBackend> GameService<B> {
         let mut events = self.push_dialogue_context(
             Speaker::Player,
             trimmed.to_string(),
-            self.state.clock_seconds,
+            self.state.clock,
         );
 
         let session_snapshot = self
@@ -158,18 +154,18 @@ impl<B: LlmBackend> GameService<B> {
             .clone()
             .expect("dialogue just confirmed");
         let npc_id = session_snapshot.npc_id;
-        let relationship = self.relationship(npc_id).clone();
-        let context = build_npc_dialogue_context_v1(
+        let memory = self.npc_memory(npc_id).clone();
+        let context = build_npc_dialogue_context(
             &self.state.world,
-            self.state.clock_seconds,
+            self.state.clock,
             self.state.player_city_id,
-            &relationship,
+            &memory,
             &session_snapshot,
             trimmed.to_string(),
         )?;
 
         let response = self.backend.generate_dialogue(&context).await?;
-        let text = response.text.clone();
+        let text = response.text;
 
         {
             let session = self
@@ -185,26 +181,9 @@ impl<B: LlmBackend> GameService<B> {
         events.extend(self.push_dialogue_context(
             Speaker::Npc(npc_id),
             text,
-            self.state.clock_seconds,
+            self.state.clock,
         ));
-        self.advance_time(DIALOGUE_SECONDS);
-        let review = validate_proposals(
-            &ConservativeProposalPolicy,
-            &ProposalValidationContext {
-                active_dialogue_npc_id: self
-                    .state
-                    .active_dialogue
-                    .as_ref()
-                    .map(|session| session.npc_id),
-                target_npc_id: npc_id,
-                target_exists: self.state.world.npc_ids().contains(&npc_id),
-                current_disposition: self.relationship(npc_id).disposition,
-            },
-            response.proposals,
-        );
-        events.extend(self.record_rejected_proposals(npc_id, review.rejected));
-        events.extend(self.apply_validated_proposals(review.accepted));
-
+        self.advance_time(DIALOGUE_TIME);
         Ok(events)
     }
 
@@ -227,7 +206,7 @@ impl<B: LlmBackend> GameService<B> {
         {
             bail!("You can only drive along roads while you are in a vehicle.");
         }
-        let travel_seconds = route.travel_seconds(transport_mode).ok_or_else(|| {
+        let travel_time = route.travel_time(transport_mode).ok_or_else(|| {
             anyhow::anyhow!("You cannot use {} on this route.", transport_mode.label())
         })?;
 
@@ -242,16 +221,16 @@ impl<B: LlmBackend> GameService<B> {
                 .world
                 .move_entity(vehicle_id, resolved_destination_id);
         }
-        self.advance_time(travel_seconds);
+        self.advance_time(travel_time);
         self.learn_city(self.state.player_city_id);
         let destination_name = self.current_place().name.clone();
         let context_event = self.push_system_context(
-            self.state.clock_seconds,
+            self.state.clock,
             SystemContext::Travel {
                 destination_id: resolved_destination_id,
                 destination_name: destination_name.clone(),
                 transport_mode,
-                duration_seconds: travel_seconds,
+                duration: travel_time,
             },
         );
         Ok(vec![
@@ -264,7 +243,7 @@ impl<B: LlmBackend> GameService<B> {
                 },
                 transport_mode,
                 route,
-                duration_seconds: travel_seconds,
+                duration: travel_time,
             },
         ])
     }
@@ -280,7 +259,7 @@ impl<B: LlmBackend> GameService<B> {
         }
         self.state.active_dialogue = Some(DialogueSession {
             npc_id,
-            started_at: self.state.clock_seconds,
+            started_at: self.state.clock,
             transcript: vec![DialogueLine {
                 speaker: Speaker::Npc(npc_id),
                 text: format!(
@@ -299,7 +278,7 @@ impl<B: LlmBackend> GameService<B> {
         events.extend(self.push_dialogue_context(
             Speaker::Npc(npc_id),
             opening_text,
-            self.state.clock_seconds,
+            self.state.clock,
         ));
         Ok(events)
     }
@@ -373,12 +352,12 @@ impl<B: LlmBackend> GameService<B> {
         })
     }
 
-    fn wait_for(&mut self, seconds: u64) -> GameEvent {
-        let seconds = seconds.max(1);
-        self.advance_time(seconds);
+    fn wait_for(&mut self, duration: TimeDelta) -> GameEvent {
+        let duration = duration.max(TimeDelta::ONE_SECOND);
+        self.advance_time(duration);
         GameEvent::WaitCompleted {
-            duration_seconds: seconds,
-            current_time_seconds: self.state.clock_seconds,
+            duration,
+            current_time: self.state.clock,
         }
     }
 
@@ -389,11 +368,8 @@ impl<B: LlmBackend> GameService<B> {
         let npc_id = session.npc_id;
         let npc_name = self.state.world.npc(npc_id).name.clone();
         let summary = self.backend.summarize_memory(&session).await?;
-        let clock_seconds = self.state.clock_seconds;
         self.state.active_dialogue.take();
-        let relationship = self.relationship_mut(npc_id);
-        relationship.memory.merge_update(summary);
-        relationship.last_interaction_at = clock_seconds;
+        self.npc_memory_mut(npc_id).memory.merge_update(summary);
         Ok(GameEvent::DialogueEnded {
             actor: NpcRef {
                 id: npc_id,
@@ -402,14 +378,14 @@ impl<B: LlmBackend> GameService<B> {
         })
     }
 
-    fn push_system_context(&mut self, timestamp_seconds: u64, context: SystemContext) -> GameEvent {
+    fn push_system_context(&mut self, timestamp: GameTime, context: SystemContext) -> GameEvent {
         self.state.context_feed.push(ContextEntry {
-            timestamp_seconds,
+            timestamp,
             kind: ContextEntryKind::System(context.clone()),
         });
         GameEvent::ContextAppended {
             entry: ContextEvent::System {
-                timestamp_seconds,
+                timestamp,
                 context,
             },
         }
@@ -419,10 +395,10 @@ impl<B: LlmBackend> GameService<B> {
         &mut self,
         speaker: Speaker,
         text: String,
-        timestamp_seconds: u64,
+        timestamp: GameTime,
     ) -> Vec<GameEvent> {
         self.state.context_feed.push(ContextEntry {
-            timestamp_seconds,
+            timestamp,
             kind: ContextEntryKind::Dialogue {
                 speaker: speaker.clone(),
                 text: text.clone(),
@@ -432,14 +408,14 @@ impl<B: LlmBackend> GameService<B> {
         vec![
             GameEvent::DialogueLineRecorded {
                 line: DialogueEventLine {
-                    timestamp_seconds,
+                    timestamp,
                     speaker: speaker_ref.clone(),
                     text: text.clone(),
                 },
             },
             GameEvent::ContextAppended {
                 entry: ContextEvent::Dialogue {
-                    timestamp_seconds,
+                    timestamp,
                     speaker: speaker_ref,
                     text,
                 },
@@ -447,86 +423,8 @@ impl<B: LlmBackend> GameService<B> {
         ]
     }
 
-    fn apply_validated_proposals(&mut self, proposals: Vec<ValidatedProposal>) -> Vec<GameEvent> {
-        let mut applied = Vec::new();
-        for proposal in proposals {
-            match proposal {
-                ValidatedProposal::NoChange => {}
-                ValidatedProposal::RelationshipAdjustment(adjustment) => {
-                    let npc_id = adjustment.target_npc_id;
-                    let timestamp_seconds = self.state.clock_seconds;
-                    let npc_name = self.state.world.npc(npc_id).name.clone();
-                    let disposition = {
-                        let relationship = self.relationship_mut(npc_id);
-                        relationship.disposition =
-                            (relationship.disposition + adjustment.delta).clamp(-10, 10);
-                        relationship.last_interaction_at = timestamp_seconds;
-                        relationship.disposition
-                    };
-                    if let Some(note) = &adjustment.note {
-                        applied.push(self.push_system_context(
-                            timestamp_seconds,
-                            SystemContext::Relationship {
-                                actor_id: npc_id,
-                                actor_name: npc_name.clone(),
-                                note: note.clone(),
-                            },
-                        ));
-                    }
-                    applied.push(GameEvent::RelationshipChanged {
-                        actor: NpcRef {
-                            id: npc_id,
-                            name: npc_name,
-                        },
-                        disposition,
-                        note: adjustment.note,
-                    });
-                }
-            }
-        }
-        applied
-    }
-
-    fn record_rejected_proposals(
-        &mut self,
-        npc_id: NpcId,
-        rejected: Vec<RejectedProposal>,
-    ) -> Vec<GameEvent> {
-        if rejected.is_empty() {
-            return Vec::new();
-        }
-        let actor_name = if self.state.world.npc_ids().contains(&npc_id) {
-            self.state.world.npc(npc_id).name.clone()
-        } else {
-            format!("npc#{}", npc_id.index())
-        };
-
-        rejected
-            .into_iter()
-            .map(|rejection| {
-                self.push_system_context(
-                    self.state.clock_seconds,
-                    SystemContext::ProposalRejected {
-                        actor_id: npc_id,
-                        actor_name: actor_name.clone(),
-                        reason: render_proposal_rejection_reason(&rejection.reason),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    fn advance_time(&mut self, seconds: u64) {
-        self.state.clock_seconds = self.state.clock_seconds.saturating_add(seconds);
-        for relationship in self.state.relationships.values_mut() {
-            let idle = self
-                .state
-                .clock_seconds
-                .saturating_sub(relationship.last_interaction_at);
-            if idle > RELATIONSHIP_DECAY_AFTER_SECONDS && relationship.disposition > 0 {
-                relationship.disposition -= 1;
-            }
-        }
+    fn advance_time(&mut self, duration: TimeDelta) {
+        self.state.clock = self.state.clock.advance(duration);
     }
 
     fn learn_city(&mut self, city_id: crate::world::CityId) {
@@ -538,22 +436,18 @@ impl<B: LlmBackend> GameService<B> {
         self.state.known_city_ids.dedup();
     }
 
-    fn relationship(&self, npc_id: NpcId) -> &RelationshipState {
+    fn npc_memory(&self, npc_id: NpcId) -> &NpcMemoryState {
         self.state
-            .relationships
+            .npc_memories
             .get(&npc_id)
-            .unwrap_or(&DEFAULT_RELATIONSHIP)
+            .unwrap_or(&DEFAULT_NPC_MEMORY)
     }
 
-    fn relationship_mut(&mut self, npc_id: NpcId) -> &mut RelationshipState {
+    fn npc_memory_mut(&mut self, npc_id: NpcId) -> &mut NpcMemoryState {
         self.state
-            .relationships
+            .npc_memories
             .entry(npc_id)
-            .or_insert_with(|| RelationshipState {
-                disposition: 0,
-                memory: RelationshipMemory::default(),
-                last_interaction_at: self.state.clock_seconds,
-            })
+            .or_default()
     }
 
     fn current_city(&self) -> &crate::world::City {
@@ -590,34 +484,10 @@ fn validate_world(world: &World) -> Result<()> {
     }
 }
 
-fn render_proposal_rejection_reason(reason: &ProposalRejectionReason) -> String {
-    match reason {
-        ProposalRejectionReason::NoActiveDialogue => "no active dialogue session".to_string(),
-        ProposalRejectionReason::DialogueTargetMismatch => {
-            "proposal targeted a different dialogue participant".to_string()
-        }
-        ProposalRejectionReason::TargetMissing => "proposal target no longer exists".to_string(),
-        ProposalRejectionReason::NoMeaningfulChange => {
-            "proposal resulted in no meaningful state change".to_string()
-        }
-        ProposalRejectionReason::DeltaOutOfRange { delta } => {
-            format!("relationship delta {delta} is outside policy bounds")
-        }
-        ProposalRejectionReason::NoteTooLong { len, max } => {
-            format!("proposal note length {len} exceeds max {max}")
-        }
-    }
-}
-
-static DEFAULT_RELATIONSHIP: RelationshipState = RelationshipState {
-    disposition: 0,
-    memory: RelationshipMemory {
-        trust_delta_summary: 0,
-        known_topics: Vec::new(),
-        unresolved_threads: Vec::new(),
-        freeform_summary: String::new(),
+static DEFAULT_NPC_MEMORY: NpcMemoryState = NpcMemoryState {
+    memory: crate::domain::memory::ConversationMemory {
+        summary: String::new(),
     },
-    last_interaction_at: 0,
 };
 
 #[cfg(test)]
@@ -627,11 +497,11 @@ mod tests {
     use petgraph::visit::EdgeRef;
     use serde_json::to_vec_pretty;
 
-    use crate::ai::context::NpcDialogueContextV1;
-    use crate::ai::proposals::{AiProposal, RelationshipAdjustmentProposal};
+    use crate::ai::context::NpcDialogueContext;
     use crate::domain::commands::GameCommand;
-    use crate::domain::events::{GameEvent, SystemContext};
-    use crate::domain::relationship::RelationshipMemory;
+    use crate::domain::events::GameEvent;
+    use crate::domain::memory::ConversationMemory;
+    use crate::domain::time::TimeDelta;
     use crate::graph_ecs::WorldEdge;
     use crate::llm::{DialogueResponse, LlmBackend, MockBackend};
     use crate::simulation::{InteractionTarget, UiMode};
@@ -639,59 +509,22 @@ mod tests {
     use super::GameService;
 
     #[derive(Debug, Clone, Copy)]
-    struct InvalidProposalBackend;
-
-    #[derive(Debug, Clone, Copy)]
     struct FailingSummaryBackend;
-
-    impl LlmBackend for InvalidProposalBackend {
-        async fn generate_dialogue(
-            &self,
-            _context: &NpcDialogueContextV1,
-        ) -> anyhow::Result<DialogueResponse> {
-            Ok(DialogueResponse {
-                text: "I am saying something normal.".to_string(),
-                proposals: vec![AiProposal::RelationshipAdjustment(
-                    RelationshipAdjustmentProposal {
-                        delta: 9,
-                        note: "This should be rejected by policy.".to_string(),
-                    },
-                )],
-            })
-        }
-
-        async fn summarize_memory(
-            &self,
-            _session: &crate::simulation::DialogueSession,
-        ) -> anyhow::Result<RelationshipMemory> {
-            Ok(RelationshipMemory {
-                trust_delta_summary: 0,
-                known_topics: Vec::new(),
-                unresolved_threads: Vec::new(),
-                freeform_summary: "Nothing durable happened.".to_string(),
-            })
-        }
-
-        fn name(&self) -> &'static str {
-            "invalid-proposal"
-        }
-    }
 
     impl LlmBackend for FailingSummaryBackend {
         async fn generate_dialogue(
             &self,
-            _context: &NpcDialogueContextV1,
+            _context: &NpcDialogueContext,
         ) -> anyhow::Result<DialogueResponse> {
             Ok(DialogueResponse {
                 text: "Normal reply.".to_string(),
-                proposals: Vec::new(),
             })
         }
 
         async fn summarize_memory(
             &self,
             _session: &crate::simulation::DialogueSession,
-        ) -> anyhow::Result<RelationshipMemory> {
+        ) -> anyhow::Result<ConversationMemory> {
             anyhow::bail!("summary failed")
         }
 
@@ -729,12 +562,14 @@ mod tests {
     #[tokio::test]
     async fn save_and_load_round_trip() {
         let mut game = GameService::new(MockBackend).unwrap();
-        game.apply_command(GameCommand::Wait(60)).await.unwrap();
+        game.apply_command(GameCommand::Wait(TimeDelta::from_seconds(60)))
+            .await
+            .unwrap();
         game.save(Path::new("/tmp/riggy-test-save.json")).unwrap();
 
         let mut loaded = GameService::new(MockBackend).unwrap();
         loaded.load(Path::new("/tmp/riggy-test-save.json")).unwrap();
-        assert_eq!(game.state.clock_seconds, loaded.state.clock_seconds);
+        assert_eq!(game.state.clock, loaded.state.clock);
         assert_eq!(game.state.player_city_id, loaded.state.player_city_id);
     }
 
@@ -768,7 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leaving_dialogue_persists_structured_relationship_memory() {
+    async fn leaving_dialogue_persists_conversation_memory() {
         let mut game = GameService::new(MockBackend).unwrap();
         let npc_id = game
             .snapshot()
@@ -792,21 +627,9 @@ mod tests {
             .await
             .unwrap();
 
-        let relationship = game.state.relationships.get(&npc_id).unwrap();
-        assert_eq!(relationship.memory.trust_delta_summary, 1);
-        assert!(
-            relationship
-                .memory
-                .known_topics
-                .contains(&"local work".to_string())
-        );
-        assert!(
-            relationship
-                .memory
-                .unresolved_threads
-                .contains(&"Follow up on possible local work".to_string())
-        );
-        assert!(!relationship.memory.freeform_summary.is_empty());
+        let memory = game.state.npc_memories.get(&npc_id).unwrap();
+        assert!(!memory.memory.summary.is_empty());
+        assert!(memory.memory.summary.contains("tell me about work"));
     }
 
     #[tokio::test]
@@ -841,7 +664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leaving_dialogue_merges_structured_memory_across_sessions() {
+    async fn leaving_dialogue_merges_conversation_memory_across_sessions() {
         let mut game = GameService::new(MockBackend).unwrap();
         let npc_id = game
             .snapshot()
@@ -877,25 +700,9 @@ mod tests {
             .await
             .unwrap();
 
-        let relationship = game.state.relationships.get(&npc_id).unwrap();
-        assert!(
-            relationship
-                .memory
-                .known_topics
-                .contains(&"local work".to_string())
-        );
-        assert!(
-            relationship
-                .memory
-                .known_topics
-                .contains(&"city layout".to_string())
-        );
-        assert!(
-            relationship
-                .memory
-                .unresolved_threads
-                .contains(&"Follow up on possible local work".to_string())
-        );
+        let memory = game.state.npc_memories.get(&npc_id).unwrap();
+        assert!(memory.memory.summary.contains("tell me about work"));
+        assert!(memory.memory.summary.contains("tell me about the city"));
     }
 
     #[tokio::test]
@@ -940,42 +747,4 @@ mod tests {
         assert!(err.to_string().contains("world validation failed"));
     }
 
-    #[tokio::test]
-    async fn invalid_ai_proposals_are_rejected_without_mutating_state() {
-        let mut game = GameService::new(InvalidProposalBackend).unwrap();
-        let npc_id = game
-            .snapshot()
-            .interactables
-            .into_iter()
-            .find_map(|option| match option.target {
-                InteractionTarget::Npc(npc_id) => Some(npc_id),
-                InteractionTarget::Entity(_) => None,
-            })
-            .expect("expected a nearby npc");
-
-        game.apply_command(GameCommand::OpenDialogue(npc_id))
-            .await
-            .unwrap();
-        let result = game
-            .apply_command(GameCommand::SubmitDialogueLine("hello".to_string()))
-            .await
-            .unwrap();
-
-        assert!(
-            !result
-                .events
-                .iter()
-                .any(|event| matches!(event, GameEvent::RelationshipChanged { .. }))
-        );
-        assert!(result.events.iter().any(|event| matches!(
-            event,
-            GameEvent::ContextAppended {
-                entry: crate::domain::events::ContextEvent::System {
-                    context: SystemContext::ProposalRejected { .. },
-                    ..
-                }
-            }
-        )));
-        assert_eq!(game.relationship(npc_id).disposition, 0);
-    }
 }

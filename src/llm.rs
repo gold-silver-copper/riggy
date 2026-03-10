@@ -2,28 +2,25 @@ use std::fmt;
 
 use anyhow::Result;
 use rig::client::{CompletionClient, Nothing, ProviderClient};
-use rig::completion::Chat;
-use rig::extractor::ExtractionError;
+use rig::completion::{Chat, Prompt};
 use rig::message::Message;
 use rig::providers::{ollama, openai};
 
-use crate::ai::context::{DialogueTranscriptSpeakerV1, NpcDialogueContextV1};
-use crate::ai::prompting::{build_dialogue_prompt_v1, build_proposal_prompt_v1};
-use crate::ai::proposals::{AiProposal, ProposedProposals, RelationshipAdjustmentProposal};
-use crate::domain::relationship::RelationshipMemory;
+use crate::ai::context::{DialogueTranscriptSpeaker, NpcDialogueContext};
+use crate::ai::prompting::build_dialogue_prompt;
+use crate::domain::memory::ConversationMemory;
 use crate::simulation::{DialogueLine, DialogueSession, Speaker};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogueResponse {
     pub text: String,
-    pub proposals: Vec<AiProposal>,
 }
 
 #[allow(async_fn_in_trait)]
 pub trait LlmBackend {
-    async fn generate_dialogue(&self, context: &NpcDialogueContextV1) -> Result<DialogueResponse>;
+    async fn generate_dialogue(&self, context: &NpcDialogueContext) -> Result<DialogueResponse>;
 
-    async fn summarize_memory(&self, session: &DialogueSession) -> Result<RelationshipMemory>;
+    async fn summarize_memory(&self, session: &DialogueSession) -> Result<ConversationMemory>;
 
     fn name(&self) -> &'static str;
 }
@@ -48,14 +45,14 @@ impl AnyBackend {
 }
 
 impl LlmBackend for AnyBackend {
-    async fn generate_dialogue(&self, context: &NpcDialogueContextV1) -> Result<DialogueResponse> {
+    async fn generate_dialogue(&self, context: &NpcDialogueContext) -> Result<DialogueResponse> {
         match self {
             Self::Mock(backend) => backend.generate_dialogue(context).await,
             Self::Rig(backend) => backend.generate_dialogue(context).await,
         }
     }
 
-    async fn summarize_memory(&self, session: &DialogueSession) -> Result<RelationshipMemory> {
+    async fn summarize_memory(&self, session: &DialogueSession) -> Result<ConversationMemory> {
         match self {
             Self::Mock(backend) => backend.summarize_memory(session).await,
             Self::Rig(backend) => backend.summarize_memory(session).await,
@@ -74,12 +71,11 @@ impl LlmBackend for AnyBackend {
 pub struct MockBackend;
 
 impl LlmBackend for MockBackend {
-    async fn generate_dialogue(&self, context: &NpcDialogueContextV1) -> Result<DialogueResponse> {
+    async fn generate_dialogue(&self, context: &NpcDialogueContext) -> Result<DialogueResponse> {
         let lower = context.turn.player_input.to_lowercase();
-        let mut proposals = Vec::new();
         let mut lines = vec![format!(
             "{} the {} leans in, measuring your tone before answering.",
-            context.npc.name,
+            context.npc.name(context.world_seed),
             context.npc.occupation.label()
         )];
 
@@ -88,72 +84,48 @@ impl LlmBackend for MockBackend {
                 .city
                 .landmarks
                 .first()
-                .cloned()
+                .map(|landmark| landmark.id.name(context.world_seed))
                 .unwrap_or_else(|| "the transit station".to_string());
             lines.push(format!(
                 "\"I might have something for you if you're reliable. Check around {} and see whether anything looks out of place.\"",
                 landmark
             ));
-            proposals.push(AiProposal::RelationshipAdjustment(
-                RelationshipAdjustmentProposal {
-                    delta: 1,
-                    note: "Opened up about local work".to_string(),
-                },
-            ));
         } else if lower.contains("where") || lower.contains("city") || lower.contains("travel") {
             lines.push(format!(
                 "\"{} is a {} place built on {} and {}. I keep mostly to {}. From here you can push on toward {} if you've got a reason.\"",
-                context.city.name,
+                context.city.name(context.world_seed),
                 context.city.biome.label(),
                 context.city.economy.label(),
                 context.city.culture.label(),
-                context.npc.home_district,
+                context.npc.home_district_name(context.world_seed),
                 if context.city.connected_cities.is_empty() {
                     "nowhere worth naming".to_string()
                 } else {
-                    context.city.connected_cities.join(", ")
+                    context
+                        .city
+                        .connected_cities
+                        .iter()
+                        .map(|city| city.name(context.world_seed))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 }
             ));
         } else {
             lines.push(format!(
                 "\"You don't sound like most people passing through {}. That can be useful or it can get noticed. I spend most of my time around {}, so I hear things early.\"",
-                context.city.name, context.npc.home_district
+                context.city.name(context.world_seed),
+                context.npc.home_district_name(context.world_seed)
             ));
-            if context.relationship.disposition < 2 {
-                proposals.push(AiProposal::RelationshipAdjustment(
-                    RelationshipAdjustmentProposal {
-                        delta: 1,
-                        note: "Held a decent conversation".to_string(),
-                    },
-                ));
-            }
         }
 
         Ok(DialogueResponse {
             text: lines.join(" "),
-            proposals,
         })
     }
 
-    async fn summarize_memory(&self, session: &DialogueSession) -> Result<RelationshipMemory> {
-        let summary = session
-            .transcript
-            .iter()
-            .rev()
-            .take(4)
-            .rev()
-            .map(|line| format!("{}: {}", speaker_label(line), line.text))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        Ok(RelationshipMemory {
-            trust_delta_summary: infer_mock_trust_delta(session),
-            known_topics: infer_mock_known_topics(session),
-            unresolved_threads: infer_mock_unresolved_threads(session),
-            freeform_summary: if summary.is_empty() {
-                "No memorable conversation yet.".to_string()
-            } else {
-                summary
-            },
+    async fn summarize_memory(&self, session: &DialogueSession) -> Result<ConversationMemory> {
+        Ok(ConversationMemory {
+            summary: fallback_summary(session),
         }
         .normalized())
     }
@@ -217,19 +189,19 @@ impl RigBackend {
         })
     }
 
-    async fn prompt_text(&self, context: &NpcDialogueContextV1) -> Result<String> {
+    async fn prompt_text(&self, context: &NpcDialogueContext) -> Result<String> {
         let history = context
             .turn
             .transcript
             .iter()
             .map(|line| match line.speaker {
-                DialogueTranscriptSpeakerV1::Player => Message::user(line.text.clone()),
-                DialogueTranscriptSpeakerV1::Npc | DialogueTranscriptSpeakerV1::System => {
+                DialogueTranscriptSpeaker::Player => Message::user(line.text.clone()),
+                DialogueTranscriptSpeaker::Npc | DialogueTranscriptSpeaker::System => {
                     Message::assistant(line.text.clone())
                 }
             })
             .collect::<Vec<_>>();
-        let prompt = build_dialogue_prompt_v1(context);
+        let prompt = build_dialogue_prompt(context);
 
         match &self.provider {
             RigProvider::Ollama { client, model } => {
@@ -251,91 +223,54 @@ impl RigBackend {
         }
     }
 
-    async fn extract_proposals(
-        &self,
-        context: &NpcDialogueContextV1,
-        text: &str,
-    ) -> Result<Vec<AiProposal>> {
-        let extraction_prompt = build_proposal_prompt_v1(context, text);
-        let parsed: Result<ProposedProposals> = match &self.provider {
-            RigProvider::Ollama { client, model } => client
-                .extractor::<ProposedProposals>(model.clone())
-                .build()
-                .extract(extraction_prompt)
-                .await
-                .map_err(|err| anyhow::anyhow!(err.to_string())),
+    async fn prompt_memory_summary_text(&self, transcript: &str) -> Result<String> {
+        let prompt = format!(
+            "Summarize what this NPC and player talked about in 1-2 durable sentences.\n\nConversation:\n{}",
+            transcript
+        );
+
+        match &self.provider {
+            RigProvider::Ollama { client, model } => {
+                let agent = client
+                    .agent(model.clone())
+                    .preamble(MEMORY_PREAMBLE)
+                    .temperature(0.2)
+                    .build();
+                Ok(agent.prompt(prompt).await?)
+            }
             RigProvider::OpenAiCompatible { client, model } => {
                 let agent = client
                     .agent(model.clone())
-                    .preamble(ACTION_PREAMBLE)
-                    .temperature(0.1)
-                    .output_schema::<ProposedProposals>()
+                    .preamble(MEMORY_PREAMBLE)
+                    .temperature(0.2)
                     .build();
-                rig::prelude::TypedPrompt::prompt_typed::<ProposedProposals>(
-                    &agent,
-                    extraction_prompt,
-                )
-                .await
-                .map_err(|err| anyhow::anyhow!(err.to_string()))
-            }
-        };
-
-        match parsed {
-            Ok(proposals) => Ok(proposals.proposals),
-            Err(err) => {
-                if let Some(extraction_error) = err.downcast_ref::<ExtractionError>() {
-                    return Err(anyhow::anyhow!(extraction_error.to_string()));
-                }
-                Ok(Vec::new())
+                Ok(agent.prompt(prompt).await?)
             }
         }
     }
 }
 
 impl LlmBackend for RigBackend {
-    async fn generate_dialogue(&self, context: &NpcDialogueContextV1) -> Result<DialogueResponse> {
-        let text = self.prompt_text(context).await?;
-        let proposals = self
-            .extract_proposals(context, &text)
-            .await
-            .unwrap_or_default();
-        Ok(DialogueResponse { text, proposals })
+    async fn generate_dialogue(&self, context: &NpcDialogueContext) -> Result<DialogueResponse> {
+        Ok(DialogueResponse {
+            text: self.prompt_text(context).await?,
+        })
     }
 
-    async fn summarize_memory(&self, session: &DialogueSession) -> Result<RelationshipMemory> {
+    async fn summarize_memory(&self, session: &DialogueSession) -> Result<ConversationMemory> {
         let transcript = session
             .transcript
             .iter()
             .map(|line| format!("{}: {}", speaker_label(line), line.text))
             .collect::<Vec<_>>()
             .join("\n");
-        let prompt = format!(
-            "Return structured relationship memory from this conversation.\nFields:\n- trust_delta_summary: integer describing overall trust movement during the conversation\n- known_topics: short durable topics the NPC and player discussed\n- unresolved_threads: short leads, promises, or follow-ups left open\n- freeform_summary: 1-2 sentence durable summary\n\nConversation:\n{}",
-            transcript
-        );
 
-        let parsed: Result<RelationshipMemory> = match &self.provider {
-            RigProvider::Ollama { client, model } => client
-                .extractor::<RelationshipMemory>(model.clone())
-                .build()
-                .extract(prompt)
-                .await
-                .map_err(|err| anyhow::anyhow!(err.to_string())),
-            RigProvider::OpenAiCompatible { client, model } => {
-                let agent = client
-                    .agent(model.clone())
-                    .preamble(MEMORY_PREAMBLE)
-                    .temperature(0.1)
-                    .output_schema::<RelationshipMemory>()
-                    .build();
-                rig::prelude::TypedPrompt::prompt_typed::<RelationshipMemory>(&agent, prompt)
-                    .await
-                    .map_err(|err| anyhow::anyhow!(err.to_string()))
-            }
-        };
+        let summary = self
+            .prompt_memory_summary_text(&transcript)
+            .await
+            .unwrap_or_else(|_| fallback_summary(session));
 
-        let memory = parsed?;
-        Ok(memory.normalized())
+        Ok(ConversationMemory { summary }.normalized())
     }
 
     fn name(&self) -> &'static str {
@@ -355,149 +290,125 @@ fn speaker_label(line: &DialogueLine) -> String {
 }
 
 const DIALOGUE_PREAMBLE: &str = "You are roleplaying a resident of a procedurally generated city in a turn-based text game. Speak in first person as the NPC, stay consistent with the provided setting and personal motive, and do not narrate as a game master.";
-const ACTION_PREAMBLE: &str = "Convert NPC dialogue into conservative structured AI proposals. If nothing durable changes, return an empty proposals list or a no_change proposal.";
-const MEMORY_PREAMBLE: &str = "Summarize conversations for a text game into structured relationship memory. Keep only durable topics, unresolved threads, and a conservative trust shift summary.";
+const MEMORY_PREAMBLE: &str =
+    "Summarize conversations for a text game. Keep only durable memory of what was discussed.";
 
-fn infer_mock_trust_delta(session: &DialogueSession) -> i32 {
-    let transcript = session
+fn fallback_summary(session: &DialogueSession) -> String {
+    let summary = session
         .transcript
         .iter()
-        .map(|line| line.text.to_lowercase())
-        .collect::<Vec<_>>();
-    if transcript
-        .iter()
-        .any(|line| line.contains("job") || line.contains("work") || line.contains("favor"))
-    {
-        1
+        .rev()
+        .take(6)
+        .rev()
+        .map(|line| format!("{}: {}", speaker_label(line), line.text))
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    if summary.is_empty() {
+        "No memorable conversation yet.".to_string()
     } else {
-        0
+        summary
     }
 }
 
-fn infer_mock_known_topics(session: &DialogueSession) -> Vec<String> {
-    let transcript = session
-        .transcript
-        .iter()
-        .map(|line| line.text.to_lowercase())
-        .collect::<Vec<_>>();
-    let mut topics = Vec::new();
-    if transcript
-        .iter()
-        .any(|line| line.contains("city") || line.contains("travel") || line.contains("where"))
-    {
-        topics.push("city layout".to_string());
-    }
-    if transcript
-        .iter()
-        .any(|line| line.contains("job") || line.contains("work") || line.contains("favor"))
-    {
-        topics.push("local work".to_string());
-    }
-    topics
-}
-
-fn infer_mock_unresolved_threads(session: &DialogueSession) -> Vec<String> {
-    let transcript = session
-        .transcript
-        .iter()
-        .map(|line| line.text.to_lowercase())
-        .collect::<Vec<_>>();
-    let mut threads = Vec::new();
-    if transcript
-        .iter()
-        .any(|line| line.contains("job") || line.contains("work") || line.contains("favor"))
-    {
-        threads.push("Follow up on possible local work".to_string());
-    }
-    threads
+#[cfg(test)]
+fn fallback_conversation_memory(session: &DialogueSession, summary: String) -> ConversationMemory {
+    let _ = session;
+    ConversationMemory { summary }.normalized()
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::ai::context::build_npc_dialogue_context_v1;
-    use crate::ai::proposals::AiProposal;
-    use crate::domain::relationship::RelationshipMemory;
-    use crate::llm::{LlmBackend, MockBackend};
-    use crate::simulation::{DialogueLine, DialogueSession, RelationshipState, Speaker};
+    use crate::ai::context::build_npc_dialogue_context;
+    use crate::domain::memory::ConversationMemory;
+    use crate::domain::time::GameTime;
+    use crate::llm::{LlmBackend, MockBackend, fallback_conversation_memory};
+    use crate::simulation::{DialogueLine, DialogueSession, NpcMemoryState, Speaker};
     use crate::world::World;
 
     #[tokio::test]
-    async fn mock_backend_updates_relationship_on_normal_conversation() {
-        let world = World::generate(2, 16);
+    async fn mock_backend_generates_dialogue() {
+        let world = World::generate(crate::domain::seed::WorldSeed::new(2), 16);
         let city_id = world.city_ids()[0];
         let npc_id = world.city_npcs(city_id)[0];
-        let relationship = RelationshipState {
-            disposition: 0,
-            memory: RelationshipMemory::default(),
-            last_interaction_at: 0,
+        let memory = NpcMemoryState {
+            memory: ConversationMemory::default(),
         };
         let session = DialogueSession {
             npc_id,
-            started_at: 0,
+            started_at: GameTime::from_seconds(0),
             transcript: vec![DialogueLine {
                 speaker: Speaker::Player,
                 text: "Hello".to_string(),
             }],
         };
-        let context = build_npc_dialogue_context_v1(
+        let context = build_npc_dialogue_context(
             &world,
-            0,
+            GameTime::from_seconds(0),
             city_id,
-            &relationship,
+            &memory,
             &session,
             "Hello there.".to_string(),
         )
         .unwrap();
 
         let response = MockBackend.generate_dialogue(&context).await.unwrap();
-        assert!(
-            response
-                .proposals
-                .iter()
-                .any(|proposal| matches!(proposal, AiProposal::RelationshipAdjustment(_)))
-        );
+        assert!(!response.text.is_empty());
     }
 
     #[test]
     fn context_contains_npc_and_city_state() {
-        let world = World::generate(9, 16);
+        let world = World::generate(crate::domain::seed::WorldSeed::new(9), 16);
         let city_id = world.city_ids()[0];
         let npc_id = world.city_npcs(city_id)[0];
-        let relationship = RelationshipState {
-            disposition: 2,
-            memory: RelationshipMemory {
-                trust_delta_summary: 1,
-                known_topics: vec!["follow-through".to_string()],
-                unresolved_threads: Vec::new(),
-                freeform_summary: "The player kept their word once before.".to_string(),
+        let memory = NpcMemoryState {
+            memory: ConversationMemory {
+                summary: "The player kept their word once before.".to_string(),
             },
-            last_interaction_at: 3,
         };
         let session = DialogueSession {
             npc_id,
-            started_at: 4,
+            started_at: GameTime::from_seconds(4),
             transcript: Vec::new(),
         };
 
-        let context = build_npc_dialogue_context_v1(
+        let context = build_npc_dialogue_context(
             &world,
-            34,
+            GameTime::from_seconds(34),
             city_id,
-            &relationship,
+            &memory,
             &session,
             "What is this city like?".to_string(),
         )
         .unwrap();
 
-        assert_eq!(context.npc.name, world.npc(npc_id).name);
-        assert_eq!(context.npc.home_district, world.npc(npc_id).home_district);
-        assert_eq!(context.city.name, world.city(city_id).name);
-        assert_eq!(context.city.economy, world.city(city_id).economy);
+        assert_eq!(context.npc.id, npc_id);
+        assert_eq!(context.npc.home_district.city_id, city_id);
+        assert_eq!(context.city.id, city_id);
         assert!(!context.city.districts.is_empty());
         assert!(!context.city.connected_cities.is_empty());
-        assert_eq!(
-            context.relationship.freeform_summary,
-            relationship.memory.freeform_summary
-        );
+        assert_eq!(context.memory.summary, memory.memory.summary);
+    }
+
+    #[test]
+    fn fallback_conversation_memory_preserves_summary() {
+        let npc_id = crate::world::NpcId(petgraph::stable_graph::NodeIndex::new(2));
+        let session = DialogueSession {
+            npc_id,
+            started_at: GameTime::from_seconds(0),
+            transcript: vec![
+                DialogueLine {
+                    speaker: Speaker::Player,
+                    text: "tell me about work".to_string(),
+                },
+                DialogueLine {
+                    speaker: Speaker::Npc(npc_id),
+                    text: "I might have a job if you're reliable.".to_string(),
+                },
+            ],
+        };
+
+        let memory = fallback_conversation_memory(&session, "Fallback summary".to_string());
+        assert_eq!(memory.summary, "Fallback summary");
     }
 }

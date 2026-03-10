@@ -1,21 +1,23 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::domain::events::SystemContext;
-use crate::domain::relationship::RelationshipMemory;
+use crate::domain::memory::ConversationMemory;
+use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
 use crate::world::{CityId, EntityId, EntityKind, NpcId, PlaceId, PlaceKind, TransportMode, World};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameState {
     pub world: World,
-    pub clock_seconds: u64,
+    pub clock: GameTime,
     pub player_city_id: CityId,
     pub player_place_id: PlaceId,
     pub occupancy: OccupancyState,
     pub known_city_ids: Vec<CityId>,
-    pub relationships: BTreeMap<NpcId, RelationshipState>,
+    #[serde(default)]
+    pub npc_memories: BTreeMap<NpcId, NpcMemoryState>,
     #[serde(default)]
     pub context_feed: Vec<ContextEntry>,
     pub active_dialogue: Option<DialogueSession>,
@@ -27,21 +29,15 @@ pub enum OccupancyState {
     InVehicle(EntityId),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RelationshipState {
-    pub disposition: i32,
-    #[serde(
-        default,
-        alias = "memory_summary",
-        deserialize_with = "deserialize_relationship_memory"
-    )]
-    pub memory: RelationshipMemory,
-    pub last_interaction_at: u64,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct NpcMemoryState {
+    #[serde(default)]
+    pub memory: ConversationMemory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextEntry {
-    pub timestamp_seconds: u64,
+    pub timestamp: GameTime,
     pub kind: ContextEntryKind,
 }
 
@@ -54,7 +50,7 @@ pub enum ContextEntryKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DialogueSession {
     pub npc_id: NpcId,
-    pub started_at: u64,
+    pub started_at: GameTime,
     pub transcript: Vec<DialogueLine>,
 }
 
@@ -90,7 +86,7 @@ pub struct UiSnapshot {
 pub struct RouteView {
     pub destination: PlaceView,
     pub route: crate::world::TravelRoute,
-    pub travel_seconds: Option<u64>,
+    pub travel_time: Option<TimeDelta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +98,7 @@ pub struct InteractableOption {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerStatusView {
-    pub clock_seconds: u64,
+    pub clock: GameTime,
     pub transport_mode: TransportMode,
     pub known_city_count: usize,
 }
@@ -132,8 +128,7 @@ pub struct PlaceView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialoguePartnerView {
     pub actor: ActorView,
-    pub disposition: i32,
-    pub memory: Option<RelationshipMemory>,
+    pub memory: Option<ConversationMemory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,11 +161,11 @@ pub struct EntityView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextFeedEntryView {
     System {
-        timestamp_seconds: u64,
+        timestamp: GameTime,
         context: SystemContext,
     },
     Dialogue {
-        timestamp_seconds: u64,
+        timestamp: GameTime,
         speaker: DialogueSpeakerView,
         text: String,
     },
@@ -201,49 +196,4 @@ pub enum InteractionVerb {
     EnterVehicle,
     ExitVehicle,
     Inspect,
-}
-
-fn deserialize_relationship_memory<'de, D>(deserializer: D) -> Result<RelationshipMemory, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum RelationshipMemoryField {
-        Structured(RelationshipMemory),
-        LegacySummary(String),
-    }
-
-    let value = Option::<RelationshipMemoryField>::deserialize(deserializer)?;
-    Ok(match value {
-        Some(RelationshipMemoryField::Structured(memory)) => memory.normalized(),
-        Some(RelationshipMemoryField::LegacySummary(summary)) => RelationshipMemory {
-            freeform_summary: summary,
-            ..RelationshipMemory::default()
-        }
-        .normalized(),
-        None => RelationshipMemory::default(),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::RelationshipState;
-
-    #[test]
-    fn relationship_state_deserializes_legacy_memory_summary() {
-        let state: RelationshipState = serde_json::from_str(
-            r#"{
-                "disposition": 2,
-                "memory_summary": "The player kept a promise.",
-                "last_interaction_at": 90
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(state.disposition, 2);
-        assert_eq!(state.memory.freeform_summary, "The player kept a promise.");
-        assert_eq!(state.memory.trust_delta_summary, 0);
-        assert!(state.memory.known_topics.is_empty());
-    }
 }

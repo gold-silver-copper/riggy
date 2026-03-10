@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::domain::time::{GameTime, TimeDelta};
 use crate::world::{EntityId, EntityKind, NpcId, PlaceId, PlaceKind, TransportMode, TravelRoute};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +24,7 @@ pub enum GameEvent {
         destination: PlaceRef,
         transport_mode: TransportMode,
         route: TravelRoute,
-        duration_seconds: u64,
+        duration: TimeDelta,
     },
     VehicleEntered {
         entity: EntityRef,
@@ -35,13 +36,8 @@ pub enum GameEvent {
         entity: EntityRef,
     },
     WaitCompleted {
-        duration_seconds: u64,
-        current_time_seconds: u64,
-    },
-    RelationshipChanged {
-        actor: NpcRef,
-        disposition: i32,
-        note: Option<String>,
+        duration: TimeDelta,
+        current_time: GameTime,
     },
     ContextAppended {
         entry: ContextEvent,
@@ -70,7 +66,7 @@ pub struct EntityRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DialogueEventLine {
-    pub timestamp_seconds: u64,
+    pub timestamp: GameTime,
     pub speaker: DialogueSpeakerRef,
     pub text: String,
 }
@@ -85,11 +81,11 @@ pub enum DialogueSpeakerRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextEvent {
     System {
-        timestamp_seconds: u64,
+        timestamp: GameTime,
         context: SystemContext,
     },
     Dialogue {
-        timestamp_seconds: u64,
+        timestamp: GameTime,
         speaker: DialogueSpeakerRef,
         text: String,
     },
@@ -102,17 +98,7 @@ pub enum SystemContext {
         destination_id: PlaceId,
         destination_name: String,
         transport_mode: TransportMode,
-        duration_seconds: u64,
-    },
-    Relationship {
-        actor_id: NpcId,
-        actor_name: String,
-        note: String,
-    },
-    ProposalRejected {
-        actor_id: NpcId,
-        actor_name: String,
-        reason: String,
+        duration: TimeDelta,
     },
 }
 
@@ -121,8 +107,6 @@ impl SystemContext {
         match self {
             Self::Start => "start",
             Self::Travel { .. } => "travel",
-            Self::Relationship { .. } => "relationship",
-            Self::ProposalRejected { .. } => "ai",
         }
     }
 }

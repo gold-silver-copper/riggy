@@ -6,13 +6,15 @@ use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::invariants::{InvariantViolation, validate_world};
+use crate::domain::seed::WorldSeed;
+use crate::domain::time::TimeDelta;
 use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
 pub use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId};
 use crate::graph_ecs::{WorldEdge, WorldGraph, WorldNode, add_edge, edge_snapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct World {
-    pub seed: u64,
+    pub seed: WorldSeed,
     pub graph: WorldGraph,
 }
 
@@ -98,16 +100,16 @@ pub struct TravelRoute {
 }
 
 impl TravelRoute {
-    pub fn travel_seconds(self, mode: TransportMode) -> Option<u64> {
+    pub fn travel_time(self, mode: TransportMode) -> Option<TimeDelta> {
         match mode {
-            TransportMode::Walking => Some(self.walking_seconds as u64),
-            TransportMode::Transit => self.transit_seconds.map(|value| value as u64),
-            TransportMode::Car => self.driving_seconds.map(|value| value as u64),
+            TransportMode::Walking => Some(TimeDelta::from_seconds(self.walking_seconds)),
+            TransportMode::Transit => self.transit_seconds.map(TimeDelta::from_seconds),
+            TransportMode::Car => self.driving_seconds.map(TimeDelta::from_seconds),
         }
     }
 
     pub fn supports(self, mode: TransportMode) -> bool {
-        self.travel_seconds(mode).is_some()
+        self.travel_time(mode).is_some()
     }
 }
 
@@ -213,8 +215,8 @@ impl EntityKind {
 }
 
 impl World {
-    pub fn generate(seed: u64, city_count: usize) -> Self {
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    pub fn generate(seed: WorldSeed, city_count: usize) -> Self {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed.raw());
         let target_cities = city_count.clamp(16, 24);
 
         let district_prefixes = [
@@ -1069,15 +1071,15 @@ mod tests {
 
     #[test]
     fn procgen_is_deterministic() {
-        let a = World::generate(42, 18);
-        let b = World::generate(42, 18);
+        let a = World::generate(crate::domain::seed::WorldSeed::new(42), 18);
+        let b = World::generate(crate::domain::seed::WorldSeed::new(42), 18);
         assert_eq!(a, b);
         assert!(a.validate().is_empty());
     }
 
     #[test]
     fn world_is_connected_and_in_bounds() {
-        let world = World::generate(7, 24);
+        let world = World::generate(crate::domain::seed::WorldSeed::new(7), 24);
         assert_eq!(world.city_ids().len(), 24);
 
         let mut visited = std::collections::BTreeSet::new();
@@ -1096,7 +1098,7 @@ mod tests {
 
     #[test]
     fn validator_detects_missing_place_container() {
-        let mut world = World::generate(3, 16);
+        let mut world = World::generate(crate::domain::seed::WorldSeed::new(3), 16);
         let place_id = world.city_places(world.city_ids()[0])[0];
         let edge_id = world
             .graph
@@ -1115,7 +1117,7 @@ mod tests {
 
     #[test]
     fn validator_detects_npc_present_outside_resident_city() {
-        let mut world = World::generate(5, 16);
+        let mut world = World::generate(crate::domain::seed::WorldSeed::new(5), 16);
         let npc_id = world.npc_ids()[0];
         let resident_city_id = world
             .graph

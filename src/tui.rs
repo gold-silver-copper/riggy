@@ -13,6 +13,7 @@ use tokio::task::{LocalSet, spawn_local};
 
 use crate::app::service::GameService;
 use crate::domain::commands::GameCommand;
+use crate::domain::time::TimeDelta;
 use crate::domain::events::CommandResult;
 use crate::llm::LlmBackend;
 use crate::presenter::{
@@ -54,7 +55,7 @@ struct App {
     cursor: usize,
     menu_state: ListState,
     notices: Vec<String>,
-    wait_seconds: u64,
+    wait_duration: TimeDelta,
     spinner_frame: usize,
     pending: Option<PendingCommand>,
 }
@@ -75,7 +76,7 @@ impl App {
             cursor: 0,
             menu_state,
             notices: Vec::new(),
-            wait_seconds: 60,
+            wait_duration: TimeDelta::from_minutes(1),
             spinner_frame: 0,
             pending: None,
         }
@@ -504,7 +505,7 @@ impl App {
             Menu::Travel => snapshot
                 .routes
                 .get(index)
-                .filter(|option| option.travel_seconds.is_some())
+                .filter(|option| option.travel_time.is_some())
                 .map(|option| GameCommand::TravelTo(option.destination.id)),
             Menu::Interact => snapshot
                 .interactables
@@ -530,7 +531,7 @@ impl App {
                         InteractionTarget::Npc(_) => unreachable!("inspect only targets entities"),
                     },
                 }),
-            Menu::Wait => Some(GameCommand::Wait(self.wait_seconds)),
+            Menu::Wait => Some(GameCommand::Wait(self.wait_duration)),
             Menu::None => None,
         }
     }
@@ -651,7 +652,7 @@ impl App {
             Line::from(vec![
                 Span::styled("Wait for ", Style::default().fg(Color::Cyan)),
                 Span::styled(
-                    format_duration(self.wait_seconds),
+                    format_duration(self.wait_duration),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
@@ -662,8 +663,14 @@ impl App {
     }
 
     fn adjust_wait(&mut self, delta: i64) {
-        let next = self.wait_seconds as i64 + delta;
-        self.wait_seconds = next.clamp(1, 12 * 60 * 60) as u64;
+        let next = if delta.is_negative() {
+            self.wait_duration
+                .saturating_sub(TimeDelta::from_seconds(delta.unsigned_abs() as u32))
+        } else {
+            self.wait_duration
+                .saturating_add(TimeDelta::from_seconds(delta as u32))
+        };
+        self.wait_duration = next.clamp(TimeDelta::ONE_SECOND, TimeDelta::from_hours(12));
     }
 
     fn overlay_area(&self, area: Rect, width: u16, height: u16) -> Rect {

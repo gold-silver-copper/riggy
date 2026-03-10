@@ -19,7 +19,7 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
         .as_ref()
         .map(|session| state.world.npc(session.npc_id));
     let status = PlayerStatusView {
-        clock_seconds: state.clock_seconds,
+        clock: state.clock,
         transport_mode: current_transport_mode(state),
         known_city_count: state.known_city_ids.len(),
     };
@@ -48,7 +48,7 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
             .as_ref()
             .map(|session| session.npc_id)
             .expect("dialogue partner should have active dialogue");
-        let relationship = state.relationships.get(&npc_id);
+        let memory = state.npc_memories.get(&npc_id);
         DialoguePartnerView {
             actor: ActorView {
                 id: npc_id,
@@ -56,8 +56,7 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
                 occupation: npc.occupation,
                 archetype: npc.archetype,
             },
-            disposition: relationship.map_or(0, |entry| entry.disposition),
-            memory: relationship
+            memory: memory
                 .and_then(|entry| (!entry.memory.is_empty()).then(|| entry.memory.clone())),
         }
     });
@@ -67,7 +66,7 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
         .iter()
         .map(|(place_id, route)| {
             let target = state.world.place(*place_id);
-            let travel_seconds = route.travel_seconds(current_transport_mode(state));
+            let travel_time = route.travel_time(current_transport_mode(state));
             RouteView {
                 destination: PlaceView {
                     id: *place_id,
@@ -75,7 +74,7 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
                     kind: target.kind,
                 },
                 route: *route,
-                travel_seconds,
+                travel_time,
             }
         })
         .collect::<Vec<_>>();
@@ -185,11 +184,11 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
         .rev()
         .map(|entry| match &entry.kind {
             ContextEntryKind::System(context) => ContextFeedEntryView::System {
-                timestamp_seconds: entry.timestamp_seconds,
+                timestamp: entry.timestamp,
                 context: context.clone(),
             },
             ContextEntryKind::Dialogue { speaker, text } => ContextFeedEntryView::Dialogue {
-                timestamp_seconds: entry.timestamp_seconds,
+                timestamp: entry.timestamp,
                 speaker: match speaker {
                     Speaker::Player => DialogueSpeakerView::Player,
                     Speaker::Npc(npc_id) => DialogueSpeakerView::Npc(ActorRefView {
