@@ -7,22 +7,53 @@ use crate::world::World;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvariantViolation {
-    PlaceMissingCity { place_id: PlaceId },
-    PlaceMultipleCities { place_id: PlaceId, count: usize },
-    NpcMissingResidentCity { npc_id: NpcId },
-    NpcMultipleResidentCities { npc_id: NpcId, count: usize },
-    NpcMultiplePresentAtPlaces { npc_id: NpcId, count: usize },
+    PlaceMissingCity {
+        place_id: PlaceId,
+    },
+    PlaceMultipleCities {
+        place_id: PlaceId,
+        count: usize,
+    },
+    NpcMissingResidentCity {
+        npc_id: NpcId,
+    },
+    NpcMultipleResidentCities {
+        npc_id: NpcId,
+        count: usize,
+    },
+    NpcMultiplePresentAtPlaces {
+        npc_id: NpcId,
+        count: usize,
+    },
     NpcPresentOutsideResidentCity {
         npc_id: NpcId,
         resident_city_id: CityId,
         present_city_id: CityId,
     },
-    EntityMultipleContainers { entity_id: EntityId, count: usize },
-    InvalidTravelRouteEndpoints { from: usize, to: usize },
-    InvalidContainsPlaceEdge { city_id: CityId, target: usize },
-    InvalidContainsEntityEdge { place_id: PlaceId, target: usize },
-    InvalidResidentEdge { city_id: CityId, target: usize },
-    InvalidPresentAtEdge { place_id: PlaceId, target: usize },
+    EntityMultipleContainers {
+        entity_id: EntityId,
+        count: usize,
+    },
+    InvalidTravelRouteEndpoints {
+        from: usize,
+        to: usize,
+    },
+    InvalidContainsPlaceEdge {
+        city_id: CityId,
+        target: usize,
+    },
+    InvalidContainsEntityEdge {
+        place_id: PlaceId,
+        target: usize,
+    },
+    InvalidResidentEdge {
+        city_id: CityId,
+        target: usize,
+    },
+    InvalidPresentAtEdge {
+        place_id: PlaceId,
+        target: usize,
+    },
 }
 
 pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
@@ -78,9 +109,10 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                         count: present_at_places.len(),
                     });
                 }
-                if let (Some(resident_city_id), Some(present_place_id)) =
-                    (resident_cities.first().copied(), present_at_places.first().copied())
-                {
+                if let (Some(resident_city_id), Some(present_place_id)) = (
+                    resident_cities.first().copied(),
+                    present_at_places.first().copied(),
+                ) {
                     if let Some(present_city_id) = world.place_city_id(present_place_id) {
                         if resident_city_id != present_city_id {
                             violations.push(InvariantViolation::NpcPresentOutsideResidentCity {

@@ -57,9 +57,8 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
                 archetype: npc.archetype,
             },
             disposition: relationship.map_or(0, |entry| entry.disposition),
-            memory_summary: relationship.and_then(|entry| {
-                (!entry.memory_summary.trim().is_empty()).then(|| entry.memory_summary.clone())
-            }),
+            memory: relationship
+                .and_then(|entry| (!entry.memory.is_empty()).then(|| entry.memory.clone())),
         }
     });
     let routes = state

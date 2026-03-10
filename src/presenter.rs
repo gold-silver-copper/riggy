@@ -55,10 +55,10 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
             highlighted(partner.disposition.to_string(), Color::Cyan),
             Span::raw("."),
         ]));
-        if let Some(memory) = &partner.memory_summary {
+        if let Some(memory) = &partner.memory {
             lines.push(Line::from(vec![
                 Span::raw("Relationship memory: "),
-                Span::raw(clean_inline_text(memory)),
+                Span::raw(clean_inline_text(&render_relationship_memory(memory))),
                 Span::raw("."),
             ]));
         }
@@ -342,6 +342,9 @@ fn render_system_context(context: &SystemContext) -> String {
         SystemContext::Relationship {
             actor_name, note, ..
         } => format!("{actor_name}: {note}"),
+        SystemContext::ProposalRejected {
+            actor_name, reason, ..
+        } => format!("Rejected AI proposal for {actor_name}: {reason}"),
     }
 }
 
@@ -373,6 +376,33 @@ fn format_clock(total_seconds: u64) -> String {
     let minutes = (seconds_in_day % 3600) / 60;
     let seconds = seconds_in_day % 60;
     format!("Day {} {:02}:{:02}:{:02}", day, hours, minutes, seconds)
+}
+
+fn render_relationship_memory(memory: &crate::domain::relationship::RelationshipMemory) -> String {
+    let mut parts = Vec::new();
+    if !memory.freeform_summary.trim().is_empty() {
+        parts.push(memory.freeform_summary.trim().to_string());
+    }
+    if !memory.known_topics.is_empty() {
+        parts.push(format!("Known topics: {}", memory.known_topics.join(", ")));
+    }
+    if !memory.unresolved_threads.is_empty() {
+        parts.push(format!(
+            "Unresolved: {}",
+            memory.unresolved_threads.join(", ")
+        ));
+    }
+    if memory.trust_delta_summary != 0 {
+        parts.push(format!(
+            "Trust shift summary: {}",
+            memory.trust_delta_summary
+        ));
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" | ")
+    }
 }
 
 pub fn format_duration(seconds: u64) -> String {
@@ -527,7 +557,12 @@ mod tests {
             dialogue_partner: Some(DialoguePartnerView {
                 actor: actor.clone(),
                 disposition: 2,
-                memory_summary: Some("The player followed up on a local lead.".to_string()),
+                memory: Some(crate::domain::relationship::RelationshipMemory {
+                    trust_delta_summary: 1,
+                    known_topics: vec!["local lead".to_string()],
+                    unresolved_threads: vec!["Call back tomorrow".to_string()],
+                    freeform_summary: "The player followed up on a local lead.".to_string(),
+                }),
             }),
             routes: vec![RouteView {
                 destination: route_destination,

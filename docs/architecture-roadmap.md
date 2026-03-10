@@ -20,12 +20,12 @@ Completed phases:
 - [x] Phase 2: typed command/event application boundary
 - [x] Phase 3: graph-authoritative identity and invariants
 - [x] Phase 4: canonical semantic vocabularies
+- [x] Phase 5: AI proposal/validation boundary
+- [x] Phase 6: versioned AI context contracts
+- [x] Phase 7: structured relationship memory
 
 Not started:
 
-- [ ] Phase 5: AI proposal/validation boundary
-- [ ] Phase 6: versioned AI context contracts
-- [ ] Phase 7: structured relationship memory
 - [ ] Phase 8: persistence versioning
 - [ ] Phase 9: TUI runtime state machine hardening
 
@@ -42,27 +42,27 @@ What is true in the code now:
 - `src/domain/vocab.rs` owns canonical enums for city and NPC semantics
 - `GameService::new` and `GameService::load` validate worlds before gameplay begins
 - world generation now samples typed semantic vocabularies rather than raw string tables
-- `DialogueRequest` now carries canonical typed semantic fields, with prompt rendering responsible for human-readable labels
+- `src/ai/proposals.rs` defines typed `AiProposal` values emitted by the LLM layer
+- `src/ai/policy.rs` defines a conservative proposal policy
+- `src/ai/validation.rs` validates proposals before they can reach state mutation
+- `src/app/service.rs` applies only validated proposals; raw LLM output is never applied directly
+- neutral `NoChange` proposals are treated as valid no-op outcomes rather than policy rejections
+- rejected proposals are now surfaced into the context feed for auditability
+- `src/ai/context.rs` defines the versioned AI context contracts used by NPC dialogue
+- `src/ai/prompting.rs` defines the prompt builders that consume those versioned contracts
+- `src/llm.rs` now consumes `NpcDialogueContextV1` instead of assembling ad hoc prompt-facing request structs
+- `src/domain/relationship.rs` now defines structured `RelationshipMemory`
+- `RelationshipState` now stores typed relationship memory rather than a single opaque summary string
+- `src/llm.rs` now summarizes dialogue into structured relationship memory
+- AI context and UI read models now include both structured and freeform relationship memory
 
 ## Current Problems
 
-### 1. The AI boundary is still too weak
-
-The LLM still returns `WorldAction`, and the application service still applies those actions directly after generation. The action set is small, but the architectural shape is still "model proposes mutation, service applies it" rather than "model proposes, validator checks, policy approves, application translates".
-
-### 2. AI context and prompt construction are still ad hoc
-
-Dialogue context is assembled directly from live game state into prompt-facing structs, and prompt construction is still string-heavy. The system does not yet have versioned AI contracts or a clean separation between authoritative facts, derived facts, and presentation text.
-
-### 3. Relationship memory is still too freeform
-
-`RelationshipState.memory_summary` is still a plain `String`. That is enough for current behavior, but it is not yet machine-usable memory the game can reason over.
-
-### 4. Persistence is not versioned
+### 1. Persistence is not versioned
 
 Save/load works, but persisted state is not schema-versioned yet. That makes future refactors riskier than they need to be.
 
-### 5. The TUI runtime still relies on an ad hoc UI state machine
+### 2. The TUI runtime still relies on an ad hoc UI state machine
 
 The command boundary is typed, but modal behavior in `src/tui.rs` is still encoded directly in event-handler branches rather than a dedicated typed UI state machine.
 
@@ -349,7 +349,7 @@ Completion notes:
 - `Npc.archetype`, `Npc.occupation`, `Npc.personality_traits`, and `Npc.goal` are now typed enums/tags instead of `String`.
 - `src/app/read_model.rs` now projects those canonical types directly into `UiSnapshot`.
 - `src/presenter.rs` now renders semantic labels from canonical types instead of receiving preformatted semantics.
-- `src/llm.rs` now builds prompts from typed semantic fields in `DialogueRequest`.
+- `src/llm.rs` now works with typed semantic fields through the versioned AI context contract.
 - procgen still produces freeform flavor text such as district descriptions, place descriptions, names, and landmarks, but canonical simulation semantics are now separate from that flavor text.
 
 ### Phase 5: Redesign the AI Boundary Around Proposals
@@ -357,6 +357,20 @@ Completion notes:
 Goal:
 
 Ensure the LLM cannot directly mutate authoritative state.
+
+Progress:
+
+- [x] replaced `WorldAction` with typed `AiProposal` values in the LLM boundary
+- [x] added `src/ai/proposals.rs` for proposal types and extraction schema
+- [x] added `src/ai/policy.rs` for conservative proposal policy decisions
+- [x] added `src/ai/validation.rs` for proposal review, accepted proposals, rejected proposals, and rejection reasons
+- [x] updated `src/app/service.rs` to validate proposals before any state mutation
+- [x] added regression coverage for accepted conservative proposals, rejected invalid proposals, and service-level rejection without state mutation
+
+Status:
+
+- Phase 5 is complete.
+- The LLM boundary now follows a proposal -> validation/policy -> application flow instead of a direct action-application flow.
 
 Work:
 
@@ -384,11 +398,35 @@ Acceptance criteria:
 - invalid proposals are rejected safely
 - accepted proposals are auditable and testable
 
+Completion notes:
+
+- `src/llm.rs` now returns `DialogueResponse { text, proposals }` instead of `text` plus directly applied actions.
+- `src/ai/proposals.rs` now owns `AiProposal` and the structured extraction schema used by Rig.
+- `src/ai/policy.rs` now enforces conservative relationship proposal bounds and note limits.
+- `src/ai/validation.rs` now turns raw proposals into a `ProposalReview` with accepted and rejected results.
+- `src/app/service.rs` now derives proposal target existence from live world state instead of hardcoding it.
+- neutral `AiProposal::NoChange` outcomes are now accepted as explicit no-op results.
+- rejected proposals are now recorded into the push-only context feed through `SystemContext::ProposalRejected`.
+- tests now cover validator acceptance/rejection, valid `NoChange` behavior, missing targets, and a service-level case where an invalid AI proposal is rejected without mutating relationship state.
+
 ### Phase 6: Version AI Context and Prompt Contracts
 
 Goal:
 
 Make AI context explicit, stable, and testable.
+
+Progress:
+
+- [x] added `src/ai/context.rs` with `NpcDialogueContextV1`, `DialogueTurnContextV1`, and `RelationshipMemoryViewV1`
+- [x] added `src/ai/prompting.rs` with prompt builders that consume only versioned context structs
+- [x] updated `src/llm.rs` to accept `NpcDialogueContextV1` instead of an ad hoc request type
+- [x] moved prompt-shape tests to context-fixture tests that do not require live world state
+- [x] updated the application service to build versioned AI context through `build_npc_dialogue_context_v1`
+
+Status:
+
+- Phase 6 is complete.
+- The LLM boundary now consumes an explicit versioned context contract instead of a prompt-facing request struct assembled directly inside `src/llm.rs`.
 
 Work:
 
@@ -410,6 +448,17 @@ Acceptance criteria:
 - AI requests are built from versioned context structs
 - prompt tests use context fixtures instead of live game state
 - changing prompt shape does not require touching simulation logic
+
+Completion notes:
+
+- `src/ai/context.rs` now owns the versioned dialogue context contract.
+- the AI contract now owns its own transcript line and speaker types instead of embedding simulation transcript structs.
+- `src/ai/prompting.rs` now owns dialogue and proposal prompt rendering for `NpcDialogueContextV1`.
+- `src/llm.rs` now consumes `NpcDialogueContextV1` directly, and no longer owns the prompt-facing request contract.
+- prompt rendering tests now use hand-built context fixtures instead of constructing a live `World`.
+- the application service now builds AI context through `build_npc_dialogue_context_v1`, keeping prompt-shape assembly out of the LLM adapter layer.
+- `build_npc_dialogue_context_v1` now derives city and NPC facts from authoritative world ids and rejects incoherent city/NPC/session combinations.
+- dialogue clock values in `NpcDialogueContextV1` now come from authoritative game time instead of transcript-length heuristics.
 
 ### Phase 7: Replace Freeform Memory With Structured Memory
 
@@ -436,6 +485,24 @@ Acceptance criteria:
 
 - relationship state contains machine-usable memory
 - AI context can include both structured and freeform memory
+
+Status:
+
+- Phase 7 is complete.
+- Relationship memory is now a typed domain object instead of a single summary string.
+
+Completion notes:
+
+- `src/domain/relationship.rs` now owns the structured `RelationshipMemory` type with normalization helpers.
+- structured memory updates are now merged durably across conversations instead of overwriting prior known topics and unresolved threads.
+- `RelationshipState` now stores `memory: RelationshipMemory` instead of `memory_summary: String`.
+- `RelationshipState` deserialization now accepts legacy `memory_summary` saves as a compatibility shim ahead of full persistence versioning.
+- `src/llm.rs` now summarizes conversations into `RelationshipMemory` for both mock and Rig backends.
+- `src/ai/context.rs` now includes structured memory fields plus freeform summary in `NpcDialogueContextV1`.
+- `src/ai/prompting.rs` now renders both structured and freeform relationship memory into dialogue prompts.
+- `src/app/read_model.rs` and `src/presenter.rs` now project and render structured relationship memory.
+- dialogue exit now preserves the active session if structured memory summarization fails, instead of discarding the conversation before the await succeeds.
+- tests now cover relationship memory normalization, structured AI context mapping, and service-level persistence of structured memory after dialogue.
 
 ### Phase 8: Introduce Persistence Versioning
 
@@ -549,17 +616,12 @@ Recommended order for implementation:
 1. typed read models and presenter extraction
 2. typed commands and events
 3. graph invariant layer
-4. AI proposal/validation split
-5. semantic vocab types
+4. semantic vocab types
+5. AI proposal/validation split
 6. versioned AI context contracts
 7. structured relationship memory
 8. persistence versioning
 9. TUI state machine hardening
-
-Rationale for the reordered next steps:
-
-- the AI mutation boundary is the highest remaining architectural risk
-- canonical vocabularies are still important, but they are safer to add once the AI path is no longer coupled directly to live state mutation
 
 ## Definition of Done
 
@@ -575,17 +637,16 @@ This refactor is complete when:
 
 ## Immediate Next Work
 
-Start with Phase 5.
+Start with Phase 8.
 
 Reason:
 
-- it removes the highest-risk remaining architectural shortcut
-- it turns the LLM boundary from "trusted actions" into "validated proposals"
-- it makes later work on typed vocabularies and versioned AI contracts safer
-- it creates an auditable path for all AI-driven state change
+- the relationship and AI contracts are now typed enough that save compatibility becomes the main structural risk
+- persistence is still the weakest architectural boundary left in the core runtime
+- versioned saves are the cleanest next step before more schema-heavy work lands
 
 The first concrete code change should be:
 
-- add typed `AiProposal` types
-- add a validator/policy step between LLM output and application state changes
-- stop applying `WorldAction` directly inside `src/app/service.rs`
+- add a versioned persisted save wrapper
+- separate persisted gameplay state from runtime-only UI/application state
+- define explicit migration entry points for future schema changes

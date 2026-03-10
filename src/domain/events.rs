@@ -109,6 +109,11 @@ pub enum SystemContext {
         actor_name: String,
         note: String,
     },
+    ProposalRejected {
+        actor_id: NpcId,
+        actor_name: String,
+        reason: String,
+    },
 }
 
 impl SystemContext {
@@ -117,6 +122,7 @@ impl SystemContext {
             Self::Start => "start",
             Self::Travel { .. } => "travel",
             Self::Relationship { .. } => "relationship",
+            Self::ProposalRejected { .. } => "ai",
         }
     }
 }

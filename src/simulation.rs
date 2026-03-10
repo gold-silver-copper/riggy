@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::domain::events::SystemContext;
+use crate::domain::relationship::RelationshipMemory;
 use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
 use crate::world::{CityId, EntityId, EntityKind, NpcId, PlaceId, PlaceKind, TransportMode, World};
 
@@ -29,7 +30,12 @@ pub enum OccupancyState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelationshipState {
     pub disposition: i32,
-    pub memory_summary: String,
+    #[serde(
+        default,
+        alias = "memory_summary",
+        deserialize_with = "deserialize_relationship_memory"
+    )]
+    pub memory: RelationshipMemory,
     pub last_interaction_at: u64,
 }
 
@@ -127,7 +133,7 @@ pub struct PlaceView {
 pub struct DialoguePartnerView {
     pub actor: ActorView,
     pub disposition: i32,
-    pub memory_summary: Option<String>,
+    pub memory: Option<RelationshipMemory>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,4 +201,49 @@ pub enum InteractionVerb {
     EnterVehicle,
     ExitVehicle,
     Inspect,
+}
+
+fn deserialize_relationship_memory<'de, D>(deserializer: D) -> Result<RelationshipMemory, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum RelationshipMemoryField {
+        Structured(RelationshipMemory),
+        LegacySummary(String),
+    }
+
+    let value = Option::<RelationshipMemoryField>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(RelationshipMemoryField::Structured(memory)) => memory.normalized(),
+        Some(RelationshipMemoryField::LegacySummary(summary)) => RelationshipMemory {
+            freeform_summary: summary,
+            ..RelationshipMemory::default()
+        }
+        .normalized(),
+        None => RelationshipMemory::default(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RelationshipState;
+
+    #[test]
+    fn relationship_state_deserializes_legacy_memory_summary() {
+        let state: RelationshipState = serde_json::from_str(
+            r#"{
+                "disposition": 2,
+                "memory_summary": "The player kept a promise.",
+                "last_interaction_at": 90
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(state.disposition, 2);
+        assert_eq!(state.memory.freeform_summary, "The player kept a promise.");
+        assert_eq!(state.memory.trust_delta_summary, 0);
+        assert!(state.memory.known_topics.is_empty());
+    }
 }

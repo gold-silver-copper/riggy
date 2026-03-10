@@ -22,7 +22,9 @@ pub fn reachable_car_ids(state: &GameState) -> Vec<EntityId> {
             .world
             .place_routes(state.player_place_id)
             .into_iter()
-            .filter(|(place_id, _)| matches!(state.world.place(*place_id).kind, PlaceKind::RoadLane))
+            .filter(|(place_id, _)| {
+                matches!(state.world.place(*place_id).kind, PlaceKind::RoadLane)
+            })
             .flat_map(|(place_id, _)| state.world.place_cars(place_id)),
     );
     cars.sort_unstable();

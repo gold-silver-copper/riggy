@@ -270,7 +270,8 @@ impl App {
         spawn_local(async move {
             let result = {
                 let mut game = game.lock().await;
-                game.apply_command(GameCommand::SubmitDialogueLine(input)).await
+                game.apply_command(GameCommand::SubmitDialogueLine(input))
+                    .await
             };
             let _ = tx.send(result);
         });

@@ -5,11 +5,9 @@ use rand::prelude::IndexedRandom;
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::vocab::{
-    Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag,
-};
-pub use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId};
 use crate::domain::invariants::{InvariantViolation, validate_world};
+use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
+pub use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId};
 use crate::graph_ecs::{WorldEdge, WorldGraph, WorldNode, add_edge, edge_snapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -994,10 +992,7 @@ fn add_place(
 }
 
 fn add_entity(graph: &mut WorldGraph, name: String, kind: EntityKind) -> EntityId {
-    let index = graph.add_node(WorldNode::Entity(Entity {
-        name,
-        kind,
-    }));
+    let index = graph.add_node(WorldNode::Entity(Entity { name, kind }));
     EntityId(index)
 }
 
@@ -1111,7 +1106,11 @@ mod tests {
             .expect("place should have containing city");
         world.graph.remove_edge(edge_id);
 
-        assert!(world.validate().contains(&InvariantViolation::PlaceMissingCity { place_id }));
+        assert!(
+            world
+                .validate()
+                .contains(&InvariantViolation::PlaceMissingCity { place_id })
+        );
     }
 
     #[test]
@@ -1137,15 +1136,18 @@ mod tests {
             .expect("world should have another city");
         let present_place_id = world.city_places(present_city_id)[0];
         world.graph.remove_edge(present_edge_id);
-        world.graph
+        world
+            .graph
             .add_edge(present_place_id.0, npc_id.0, WorldEdge::PresentAt);
 
-        assert!(world
-            .validate()
-            .contains(&InvariantViolation::NpcPresentOutsideResidentCity {
-                npc_id,
-                resident_city_id,
-                present_city_id,
-            }));
+        assert!(
+            world
+                .validate()
+                .contains(&InvariantViolation::NpcPresentOutsideResidentCity {
+                    npc_id,
+                    resident_city_id,
+                    present_city_id,
+                })
+        );
     }
 }
