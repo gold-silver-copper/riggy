@@ -5,7 +5,7 @@ use crate::domain::seed::WorldSeed;
 use crate::domain::time::GameTime;
 use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
 use crate::simulation::{DialogueSession, NpcMemoryState, Speaker};
-use crate::world::{CityId, NpcId, World};
+use crate::world::{CityId, DistrictId, LandmarkId, NpcId, World};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NpcDialogueContext {
@@ -41,7 +41,7 @@ pub struct CityContext {
 
 impl CityContext {
     pub fn name(&self, world_seed: WorldSeed) -> String {
-        procgen_city_name(world_seed, self.id)
+        self.id.name(world_seed)
     }
 }
 
@@ -70,72 +70,15 @@ pub struct NpcContext {
     pub home_district: DistrictId,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DistrictId {
-    pub city_id: CityId,
-    pub district_index: u16,
-}
-
-impl DistrictId {
-    pub fn name(self, world_seed: WorldSeed) -> String {
-        let key = mix_seed(
-            world_seed,
-            &[1, self.city_id.index() as u64, self.district_index as u64],
-        );
-        format!(
-            "{} {}",
-            DISTRICT_PREFIXES[(key as usize) % DISTRICT_PREFIXES.len()],
-            DISTRICT_SUFFIXES[((key >> 16) as usize) % DISTRICT_SUFFIXES.len()]
-        )
-    }
-
-    pub fn description(self, world_seed: WorldSeed) -> String {
-        let key = mix_seed(
-            world_seed,
-            &[2, self.city_id.index() as u64, self.district_index as u64],
-        );
-        format!(
-            "{} with {}",
-            DISTRICT_TEXTURES[(key as usize) % DISTRICT_TEXTURES.len()],
-            DISTRICT_FUNCTIONS[((key >> 16) as usize) % DISTRICT_FUNCTIONS.len()]
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LandmarkId {
-    pub city_id: CityId,
-    pub landmark_index: u16,
-}
-
-impl LandmarkId {
-    pub fn name(self, world_seed: WorldSeed) -> String {
-        let key = mix_seed(
-            world_seed,
-            &[3, self.city_id.index() as u64, self.landmark_index as u64],
-        );
-        format!(
-            "{} {}",
-            LANDMARK_PREFIXES[(key as usize) % LANDMARK_PREFIXES.len()],
-            LANDMARK_NOUNS[((key >> 16) as usize) % LANDMARK_NOUNS.len()]
-        )
-    }
-}
-
 impl ConnectedCityContext {
     pub fn name(&self, world_seed: WorldSeed) -> String {
-        procgen_city_name(world_seed, self.id)
+        self.id.name(world_seed)
     }
 }
 
 impl NpcContext {
     pub fn name(&self, world_seed: WorldSeed) -> String {
-        let key = mix_seed(world_seed, &[4, self.id.index() as u64]);
-        format!(
-            "{} {}",
-            NPC_FIRST_NAMES[(key as usize) % NPC_FIRST_NAMES.len()],
-            NPC_LAST_NAMES[((key >> 16) as usize) % NPC_LAST_NAMES.len()]
-        )
+        self.id.name(world_seed)
     }
 
     pub fn home_district_name(&self, world_seed: WorldSeed) -> String {
@@ -187,12 +130,6 @@ pub fn build_npc_dialogue_context(
 
     let city = world.city(city_id);
     let npc = world.npc(session.npc_id);
-    let home_district_index = city
-        .districts
-        .iter()
-        .position(|district| district.name == npc.home_district)
-        .ok_or_else(|| anyhow::anyhow!("dialogue context npc home district is missing"))?;
-
     Ok(NpcDialogueContext {
         world_seed: world.seed,
         clock: DialogueClock {
@@ -206,24 +143,12 @@ pub fn build_npc_dialogue_context(
             districts: city
                 .districts
                 .iter()
-                .enumerate()
-                .map(|(district_index, _district)| DistrictContext {
-                    id: DistrictId {
-                        city_id,
-                        district_index: district_index as u16,
-                    },
-                })
+                .map(|district| DistrictContext { id: district.id })
                 .collect(),
             landmarks: city
                 .landmarks
                 .iter()
-                .enumerate()
-                .map(|(landmark_index, _landmark)| LandmarkContext {
-                    id: LandmarkId {
-                        city_id,
-                        landmark_index: landmark_index as u16,
-                    },
-                })
+                .map(|landmark| LandmarkContext { id: landmark.id })
                 .collect(),
             connected_cities: world
                 .city_connections(city_id)
@@ -239,10 +164,7 @@ pub fn build_npc_dialogue_context(
             occupation: npc.occupation,
             traits: npc.personality_traits.clone(),
             goal: npc.goal,
-            home_district: DistrictId {
-                city_id,
-                district_index: home_district_index as u16,
-            },
+            home_district: npc.home_district,
         },
         memory: ConversationMemoryView {
             summary: memory.memory.summary.clone(),
@@ -264,77 +186,6 @@ pub fn build_npc_dialogue_context(
         },
     })
 }
-
-fn mix_seed(seed: WorldSeed, parts: &[u64]) -> u64 {
-    let mut value = seed.raw() ^ 0x9E37_79B9_7F4A_7C15;
-    for part in parts {
-        value ^= part.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        value = value.rotate_left(27).wrapping_mul(0x94D0_49BB_1331_11EB);
-    }
-    value
-}
-
-fn procgen_city_name(world_seed: WorldSeed, city_id: CityId) -> String {
-    let key = mix_seed(world_seed, &[5, city_id.index() as u64]);
-    format!(
-        "{}{}",
-        CITY_PREFIXES[(key as usize) % CITY_PREFIXES.len()],
-        CITY_SUFFIXES[((key >> 16) as usize) % CITY_SUFFIXES.len()]
-    )
-}
-
-const DISTRICT_PREFIXES: [&str; 10] = [
-    "Ash", "Market", "Harbor", "Station", "North", "South", "River", "Glass", "Union", "Cedar",
-];
-const DISTRICT_SUFFIXES: [&str; 10] = [
-    "Quarter", "Heights", "Square", "Point", "Terrace", "Center", "Row", "Reach", "Gate", "Yard",
-];
-const DISTRICT_TEXTURES: [&str; 8] = [
-    "dense midrise blocks",
-    "retail-heavy streets",
-    "quiet apartment corridors",
-    "office-facing avenues",
-    "warehouse edges",
-    "night-shift storefronts",
-    "mixed-use corners",
-    "narrow commuter lanes",
-];
-const DISTRICT_FUNCTIONS: [&str; 8] = [
-    "corner stores and takeout windows",
-    "small offices and service counters",
-    "loading bays and fenced lots",
-    "apartment entries and laundromats",
-    "transit foot traffic and kiosks",
-    "cafes and repair shops",
-    "late-night traffic and side parking",
-    "municipal buildings and walk-ups",
-];
-const LANDMARK_PREFIXES: [&str; 8] = [
-    "Old", "North", "Glass", "Moon", "Union", "Raven", "Low", "Civic",
-];
-const LANDMARK_NOUNS: [&str; 8] = [
-    "Exchange",
-    "Museum",
-    "Data Center",
-    "Overpass",
-    "Terminal",
-    "Arcade",
-    "Park",
-    "Archive",
-];
-const NPC_FIRST_NAMES: [&str; 12] = [
-    "Yana", "Finn", "Mara", "Theo", "Iris", "Nico", "Leah", "Owen", "Tess", "Miles", "Juno", "Evan",
-];
-const NPC_LAST_NAMES: [&str; 12] = [
-    "Orchard", "Ives", "Vale", "Morrow", "Hale", "Cross", "Rowan", "Keene", "Mercer", "Sable",
-    "Dane", "Quill",
-];
-const CITY_PREFIXES: [&str; 10] = [
-    "Ash", "Low", "Raven", "North", "Dawn", "Brae", "Quartz", "Moon", "Kings", "Harbor",
-];
-const CITY_SUFFIXES: [&str; 10] = [
-    "crest", "harbor", "cross", "park", "view", "market", "ford", "center", "bridge", "field",
-];
 
 #[cfg(test)]
 mod tests {

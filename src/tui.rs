@@ -293,8 +293,12 @@ impl App {
                         events,
                         should_quit,
                     }) => {
+                        let world_seed = {
+                            let game = game.lock().await;
+                            game.snapshot().world_seed
+                        };
                         for event in &events {
-                            if let Some(text) = render_event_notice(event) {
+                            if let Some(text) = render_event_notice(world_seed, event) {
                                 self.push_notice(text);
                             }
                         }
@@ -352,13 +356,25 @@ impl App {
         Paragraph::new(build_world_text(snapshot, &self.notices))
             .block(Block::bordered().title(Line::from(vec![
                 Span::styled(
-                    format!("{} ({})", snapshot.place.name, snapshot.place.kind.label()),
+                    format!(
+                        "{} ({})",
+                        crate::world::place_name_from_parts(
+                            snapshot.world_seed,
+                            snapshot.place.id,
+                            snapshot.place.district_id,
+                            snapshot.place.kind,
+                        ),
+                        snapshot.place.kind.label()
+                    ),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled(snapshot.city.name.clone(), Style::default().fg(Color::Green)),
+                Span::styled(
+                    snapshot.city.id.name(snapshot.world_seed),
+                    Style::default().fg(Color::Green),
+                ),
                 Span::raw("  "),
                 Span::styled(
                     format!("[{}]", mode_label),
@@ -480,7 +496,9 @@ impl App {
                     snapshot
                         .routes
                         .iter()
-                        .map(|option| ListItem::new(render_route_label(option)))
+                        .map(|option| {
+                            ListItem::new(render_route_label(snapshot.world_seed, option))
+                        })
                         .collect()
                 }
             }
@@ -491,7 +509,9 @@ impl App {
                     snapshot
                         .interactables
                         .iter()
-                        .map(|option| ListItem::new(render_interactable_label(option)))
+                        .map(|option| {
+                            ListItem::new(render_interactable_label(snapshot.world_seed, option))
+                        })
                         .collect()
                 }
             }

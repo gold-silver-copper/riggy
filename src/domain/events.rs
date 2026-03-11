@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::time::{GameTime, TimeDelta};
-use crate::world::{EntityId, EntityKind, NpcId, PlaceId, PlaceKind, TransportMode, TravelRoute};
+use crate::world::{
+    DistrictId, EntityId, EntityKind, NpcId, PlaceId, PlaceKind, TransportMode, TravelRoute,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
@@ -47,20 +49,18 @@ pub enum GameEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NpcRef {
     pub id: NpcId,
-    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaceRef {
     pub id: PlaceId,
-    pub name: String,
+    pub district_id: DistrictId,
     pub kind: PlaceKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntityRef {
     pub id: EntityId,
-    pub name: String,
     pub kind: EntityKind,
 }
 
@@ -95,8 +95,7 @@ pub enum ContextEvent {
 pub enum SystemContext {
     Start,
     Travel {
-        destination_id: PlaceId,
-        destination_name: String,
+        destination: PlaceRef,
         transport_mode: TransportMode,
         duration: TimeDelta,
     },

@@ -75,14 +75,15 @@ fn render_conversation_memory(context: &NpcDialogueContext) -> String {
 #[cfg(test)]
 mod tests {
     use crate::ai::context::{
-        CityContext, ConnectedCityContext, DialogueClock, DialogueTranscriptLine,
-        DialogueTranscriptSpeaker, DialogueTurnContext, DistrictContext, DistrictId,
-        LandmarkContext, LandmarkId, NpcContext, NpcDialogueContext, ConversationMemoryView,
+        CityContext, ConnectedCityContext, ConversationMemoryView, DialogueClock,
+        DialogueTranscriptLine, DialogueTranscriptSpeaker, DialogueTurnContext, DistrictContext,
+        LandmarkContext, NpcContext, NpcDialogueContext,
     };
     use crate::domain::seed::WorldSeed;
     use crate::domain::vocab::{
         Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag,
     };
+    use crate::world::{DistrictId, LandmarkId};
 
     use super::build_dialogue_prompt;
 

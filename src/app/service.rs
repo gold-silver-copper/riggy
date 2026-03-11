@@ -223,12 +223,11 @@ impl<B: LlmBackend> GameService<B> {
         }
         self.advance_time(travel_time);
         self.learn_city(self.state.player_city_id);
-        let destination_name = self.current_place().name.clone();
+        let destination = self.place_ref(resolved_destination_id);
         let context_event = self.push_system_context(
             self.state.clock,
             SystemContext::Travel {
-                destination_id: resolved_destination_id,
-                destination_name: destination_name.clone(),
+                destination: destination.clone(),
                 transport_mode,
                 duration: travel_time,
             },
@@ -236,11 +235,7 @@ impl<B: LlmBackend> GameService<B> {
         Ok(vec![
             context_event,
             GameEvent::TravelCompleted {
-                destination: PlaceRef {
-                    id: resolved_destination_id,
-                    name: destination_name,
-                    kind: self.current_place().kind,
-                },
+                destination,
                 transport_mode,
                 route,
                 duration: travel_time,
@@ -264,13 +259,13 @@ impl<B: LlmBackend> GameService<B> {
                 speaker: Speaker::Npc(npc_id),
                 text: format!(
                     "What do you want to know about {}?",
-                    self.current_city().name
+                    self.state.world.city_name(self.state.player_city_id)
                 ),
             }],
         });
         let opening_text = format!(
             "What do you want to know about {}?",
-            self.current_city().name
+            self.state.world.city_name(self.state.player_city_id)
         );
         let mut events = vec![GameEvent::DialogueStarted {
             actor: self.npc_ref(npc_id),
@@ -307,14 +302,9 @@ impl<B: LlmBackend> GameService<B> {
             .world
             .place_city_id(vehicle_place_id)
             .expect("place should belong to a city");
-        let vehicle = self.state.world.entity(entity_id).clone();
         self.state.occupancy = OccupancyState::InVehicle(entity_id);
         Ok(GameEvent::VehicleEntered {
-            entity: EntityRef {
-                id: entity_id,
-                name: vehicle.name,
-                kind: vehicle.kind,
-            },
+            entity: self.entity_ref(entity_id),
         })
     }
 
@@ -322,14 +312,9 @@ impl<B: LlmBackend> GameService<B> {
         let Some(vehicle_id) = current_vehicle_id(&self.state) else {
             bail!("You are not in a vehicle.");
         };
-        let vehicle = self.state.world.entity(vehicle_id).clone();
         self.state.occupancy = OccupancyState::OnFoot;
         Ok(GameEvent::VehicleExited {
-            entity: EntityRef {
-                id: vehicle_id,
-                name: vehicle.name,
-                kind: vehicle.kind,
-            },
+            entity: self.entity_ref(vehicle_id),
         })
     }
 
@@ -342,13 +327,8 @@ impl<B: LlmBackend> GameService<B> {
         if !is_here {
             bail!("That entity is no longer here.");
         }
-        let entity = self.state.world.entity(entity_id);
         Ok(GameEvent::EntityInspected {
-            entity: EntityRef {
-                id: entity_id,
-                name: entity.name.clone(),
-                kind: entity.kind,
-            },
+            entity: self.entity_ref(entity_id),
         })
     }
 
@@ -366,15 +346,11 @@ impl<B: LlmBackend> GameService<B> {
             bail!("You are not talking to anyone right now.");
         };
         let npc_id = session.npc_id;
-        let npc_name = self.state.world.npc(npc_id).name.clone();
         let summary = self.backend.summarize_memory(&session).await?;
         self.state.active_dialogue.take();
         self.npc_memory_mut(npc_id).memory.merge_update(summary);
         Ok(GameEvent::DialogueEnded {
-            actor: NpcRef {
-                id: npc_id,
-                name: npc_name,
-            },
+            actor: self.npc_ref(npc_id),
         })
     }
 
@@ -450,19 +426,28 @@ impl<B: LlmBackend> GameService<B> {
             .or_default()
     }
 
-    fn current_city(&self) -> &crate::world::City {
-        self.state.world.city(self.state.player_city_id)
-    }
-
     fn current_place(&self) -> &crate::world::Place {
         self.state.world.place(self.state.player_place_id)
     }
 
     fn npc_ref(&self, npc_id: NpcId) -> NpcRef {
-        let npc = self.state.world.npc(npc_id);
-        NpcRef {
-            id: npc_id,
-            name: npc.name.clone(),
+        NpcRef { id: npc_id }
+    }
+
+    fn place_ref(&self, place_id: PlaceId) -> PlaceRef {
+        let place = self.state.world.place(place_id);
+        PlaceRef {
+            id: place_id,
+            district_id: place.district_id,
+            kind: place.kind,
+        }
+    }
+
+    fn entity_ref(&self, entity_id: EntityId) -> EntityRef {
+        let entity = self.state.world.entity(entity_id);
+        EntityRef {
+            id: entity_id,
+            kind: entity.kind,
         }
     }
 

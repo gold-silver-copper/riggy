@@ -4,8 +4,8 @@ use crate::app::query::{current_transport_mode, current_vehicle_id, reachable_ca
 use crate::simulation::{
     ActorRefView, ActorView, CityView, ContextEntryKind, ContextFeedEntryView, DialoguePartnerView,
     DialogueSpeakerView, DistrictView, EntityView, GameState, InteractableOption,
-    InteractableSubjectView, InteractionTarget, InteractionVerb, PlaceView, PlayerStatusView,
-    RouteView, Speaker, UiMode, UiSnapshot,
+    InteractableSubjectView, InteractionTarget, InteractionVerb, LandmarkView, PlaceView,
+    PlayerStatusView, RouteView, Speaker, UiMode, UiSnapshot,
 };
 use crate::world::EntityKind;
 
@@ -24,22 +24,24 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
         known_city_count: state.known_city_ids.len(),
     };
     let city_view = CityView {
-        name: city.name.clone(),
+        id: state.player_city_id,
         biome: city.biome,
         economy: city.economy,
         culture: city.culture,
         districts: city
             .districts
             .iter()
-            .map(|district| DistrictView {
-                name: district.name.clone(),
-            })
+            .map(|district| DistrictView { id: district.id })
             .collect(),
-        landmarks: city.landmarks.clone(),
+        landmarks: city
+            .landmarks
+            .iter()
+            .map(|landmark| LandmarkView { id: landmark.id })
+            .collect(),
     };
     let place_view = PlaceView {
         id: state.player_place_id,
-        name: place.name.clone(),
+        district_id: place.district_id,
         kind: place.kind,
     };
     let dialogue_partner = dialogue_npc.map(|npc| {
@@ -52,7 +54,6 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
         DialoguePartnerView {
             actor: ActorView {
                 id: npc_id,
-                name: npc.name.clone(),
                 occupation: npc.occupation,
                 archetype: npc.archetype,
             },
@@ -70,7 +71,7 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
             RouteView {
                 destination: PlaceView {
                     id: *place_id,
-                    name: target.name.clone(),
+                    district_id: target.district_id,
                     kind: target.kind,
                 },
                 route: *route,
@@ -86,7 +87,6 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
             let npc = state.world.npc(*npc_id);
             ActorView {
                 id: *npc_id,
-                name: npc.name.clone(),
                 occupation: npc.occupation,
                 archetype: npc.archetype,
             }
@@ -103,7 +103,6 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
             let entity = state.world.entity(*entity_id);
             EntityView {
                 id: *entity_id,
-                name: entity.name.clone(),
                 kind: entity.kind,
             }
         })
@@ -154,7 +153,6 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
             let entity = state.world.entity(entity_id);
             EntityView {
                 id: entity_id,
-                name: entity.name.clone(),
                 kind: entity.kind,
             }
         })
@@ -191,10 +189,7 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
                 timestamp: entry.timestamp,
                 speaker: match speaker {
                     Speaker::Player => DialogueSpeakerView::Player,
-                    Speaker::Npc(npc_id) => DialogueSpeakerView::Npc(ActorRefView {
-                        id: *npc_id,
-                        name: state.world.npc(*npc_id).name.clone(),
-                    }),
+                    Speaker::Npc(npc_id) => DialogueSpeakerView::Npc(ActorRefView { id: *npc_id }),
                     Speaker::System => DialogueSpeakerView::System,
                 },
                 text: text.clone(),
@@ -203,6 +198,7 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
         .collect();
 
     UiSnapshot {
+        world_seed: state.world.seed,
         mode: if state.active_dialogue.is_some() {
             UiMode::Dialogue
         } else {

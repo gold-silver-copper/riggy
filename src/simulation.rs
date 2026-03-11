@@ -4,9 +4,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::events::SystemContext;
 use crate::domain::memory::ConversationMemory;
+use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
-use crate::world::{CityId, EntityId, EntityKind, NpcId, PlaceId, PlaceKind, TransportMode, World};
+use crate::world::{
+    CityId, DistrictId, EntityId, EntityKind, LandmarkId, NpcId, PlaceId, PlaceKind,
+    TransportMode, World,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameState {
@@ -69,6 +73,7 @@ pub enum Speaker {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiSnapshot {
+    pub world_seed: WorldSeed,
     pub mode: UiMode,
     pub status: PlayerStatusView,
     pub city: CityView,
@@ -105,23 +110,28 @@ pub struct PlayerStatusView {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CityView {
-    pub name: String,
+    pub id: CityId,
     pub biome: Biome,
     pub economy: Economy,
     pub culture: Culture,
     pub districts: Vec<DistrictView>,
-    pub landmarks: Vec<String>,
+    pub landmarks: Vec<LandmarkView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistrictView {
-    pub name: String,
+    pub id: DistrictId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandmarkView {
+    pub id: LandmarkId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceView {
     pub id: PlaceId,
-    pub name: String,
+    pub district_id: DistrictId,
     pub kind: PlaceKind,
 }
 
@@ -134,7 +144,6 @@ pub struct DialoguePartnerView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorView {
     pub id: NpcId,
-    pub name: String,
     pub occupation: Occupation,
     pub archetype: NpcArchetype,
 }
@@ -142,7 +151,6 @@ pub struct ActorView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorRefView {
     pub id: NpcId,
-    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,7 +162,6 @@ pub enum InteractableSubjectView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityView {
     pub id: EntityId,
-    pub name: String,
     pub kind: EntityKind,
 }
 
