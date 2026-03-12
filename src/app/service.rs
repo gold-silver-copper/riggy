@@ -5,6 +5,9 @@ use std::path::Path;
 use anyhow::{Result, bail};
 
 use crate::ai::context::build_npc_dialogue_context;
+use crate::app::projection::{
+    entity_summary as build_entity_summary, place_summary as build_place_summary,
+};
 use crate::app::query::{current_transport_mode, current_vehicle_id, reachable_car_ids};
 use crate::app::read_model::build_ui_snapshot;
 use crate::domain::commands::GameCommand;
@@ -376,20 +379,11 @@ impl<B: LlmBackend> GameService<B> {
     }
 
     fn place_summary(&self, place_id: PlaceId) -> PlaceSummary {
-        let place = self.state.world.place(place_id);
-        PlaceSummary {
-            id: place_id,
-            district_id: place.district_id,
-            kind: place.kind,
-        }
+        build_place_summary(&self.state.world, place_id)
     }
 
     fn entity_summary(&self, entity_id: EntityId) -> EntitySummary {
-        let entity = self.state.world.entity(entity_id);
-        EntitySummary {
-            id: entity_id,
-            kind: entity.kind,
-        }
+        build_entity_summary(&self.state.world, entity_id)
     }
 }
 
@@ -420,7 +414,7 @@ mod tests {
     use crate::domain::time::TimeDelta;
     use crate::graph_ecs::WorldEdge;
     use crate::llm::{DialogueResponse, LlmBackend, MockBackend};
-    use crate::simulation::{InteractionTarget, UiMode};
+    use crate::simulation::{Interactable, UiMode};
     use crate::world::NpcId;
 
     use super::GameService;
@@ -454,9 +448,9 @@ mod tests {
         game.snapshot()
             .interactables
             .into_iter()
-            .find_map(|option| match option.target {
-                InteractionTarget::Npc(npc_id) => Some(npc_id),
-                InteractionTarget::Entity(_) => None,
+            .find_map(|interactable| match interactable {
+                Interactable::Talk(actor) => Some(actor.id),
+                _ => None,
             })
             .expect("expected a nearby npc")
     }

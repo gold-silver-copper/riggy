@@ -20,7 +20,7 @@ use crate::presenter::{
     build_world_text, build_world_title, format_duration, render_event_notice,
     render_interactable_label, render_route_label,
 };
-use crate::simulation::{InteractionTarget, InteractionVerb, UiMode, UiSnapshot};
+use crate::simulation::{Interactable, UiMode, UiSnapshot};
 
 const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
 const NOTICE_HISTORY_LIMIT: usize = 48;
@@ -89,30 +89,11 @@ impl ListMenuKind {
             Self::Interact => snapshot
                 .interactables
                 .get(index)
-                .map(|option| match option.verb {
-                    InteractionVerb::Talk => match option.target {
-                        InteractionTarget::Npc(npc_id) => GameCommand::OpenDialogue(npc_id),
-                        InteractionTarget::Entity(_) => {
-                            unreachable!("talk verb only targets npcs")
-                        }
-                    },
-                    InteractionVerb::EnterVehicle => match option.target {
-                        InteractionTarget::Entity(entity_id) => {
-                            GameCommand::EnterVehicle(entity_id)
-                        }
-                        InteractionTarget::Npc(_) => {
-                            unreachable!("enter vehicle only targets entities")
-                        }
-                    },
-                    InteractionVerb::ExitVehicle => GameCommand::ExitVehicle,
-                    InteractionVerb::Inspect => match option.target {
-                        InteractionTarget::Entity(entity_id) => {
-                            GameCommand::InspectEntity(entity_id)
-                        }
-                        InteractionTarget::Npc(_) => {
-                            unreachable!("inspect only targets entities")
-                        }
-                    },
+                .map(|interactable| match interactable {
+                    Interactable::Talk(actor) => GameCommand::OpenDialogue(actor.id),
+                    Interactable::EnterVehicle(entity) => GameCommand::EnterVehicle(entity.id),
+                    Interactable::ExitVehicle(_) => GameCommand::ExitVehicle,
+                    Interactable::Inspect(entity) => GameCommand::InspectEntity(entity.id),
                 }),
         }
     }
@@ -193,15 +174,6 @@ struct PendingState {
     rx: oneshot::Receiver<anyhow::Result<CommandResult>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UiStateKind {
-    Idle,
-    ListMenu,
-    WaitMenu,
-    DialogueInput,
-    Pending,
-}
-
 enum UiState {
     Idle,
     ListMenu(ListMenuState),
@@ -274,22 +246,12 @@ impl App {
             return Ok(true);
         }
 
-        match self.state_kind() {
-            UiStateKind::Pending => Ok(false),
-            UiStateKind::Idle => self.handle_idle_key(key, game, snapshot),
-            UiStateKind::ListMenu => self.handle_list_menu_key(key, game, snapshot),
-            UiStateKind::WaitMenu => self.handle_wait_key(key, game),
-            UiStateKind::DialogueInput => self.handle_dialogue_input_key(key, game),
-        }
-    }
-
-    fn state_kind(&self) -> UiStateKind {
-        match self.state {
-            UiState::Idle => UiStateKind::Idle,
-            UiState::ListMenu(_) => UiStateKind::ListMenu,
-            UiState::WaitMenu => UiStateKind::WaitMenu,
-            UiState::DialogueInput(_) => UiStateKind::DialogueInput,
-            UiState::Pending(_) => UiStateKind::Pending,
+        match &self.state {
+            UiState::Pending(_) => Ok(false),
+            UiState::Idle => self.handle_idle_key(key, game, snapshot),
+            UiState::ListMenu(_) => self.handle_list_menu_key(key, game, snapshot),
+            UiState::WaitMenu => self.handle_wait_key(key, game),
+            UiState::DialogueInput(_) => self.handle_dialogue_input_key(key, game),
         }
     }
 

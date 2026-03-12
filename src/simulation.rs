@@ -46,25 +46,23 @@ pub struct UiSnapshot {
     pub place: PlaceSummary,
     pub dialogue_partner: Option<DialoguePartnerView>,
     pub routes: Vec<RouteView>,
-    pub interactables: Vec<InteractableOption>,
-    pub nearby_actors: Vec<ActorView>,
-    pub nearby_cars: Vec<EntitySummary>,
-    pub nearby_entities: Vec<EntitySummary>,
+    pub interactables: Vec<Interactable>,
     pub context_feed: Vec<ContextEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteView {
     pub destination: PlaceSummary,
     pub route: crate::world::TravelRoute,
     pub travel_time: Option<TimeDelta>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InteractableOption {
-    pub target: InteractionTarget,
-    pub verb: InteractionVerb,
-    pub subject: InteractableSubjectView,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Interactable {
+    Talk(ActorView),
+    EnterVehicle(EntitySummary),
+    ExitVehicle(EntitySummary),
+    Inspect(EntitySummary),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,35 +88,15 @@ pub struct DialoguePartnerView {
     pub memory: Option<ConversationMemory>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActorView {
     pub id: NpcId,
     pub occupation: Occupation,
     pub archetype: NpcArchetype,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InteractableSubjectView {
-    Actor(ActorView),
-    Entity(EntitySummary),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiMode {
     Explore,
     Dialogue,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InteractionTarget {
-    Npc(NpcId),
-    Entity(EntityId),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InteractionVerb {
-    Talk,
-    EnterVehicle,
-    ExitVehicle,
-    Inspect,
 }

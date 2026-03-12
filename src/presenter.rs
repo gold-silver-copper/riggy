@@ -5,17 +5,16 @@ use crate::domain::events::{
     ContextEntry, DialogueSpeaker, EntitySummary, GameEvent, PlaceSummary, SystemContext,
 };
 use crate::domain::seed::WorldSeed;
-use crate::simulation::{
-    InteractableOption, InteractableSubjectView, InteractionVerb, RouteView, UiSnapshot,
-};
+use crate::simulation::{ActorView, Interactable, RouteView, UiSnapshot};
 use crate::world::{entity_name_from_parts, place_name_from_parts};
 
 pub fn build_world_title(snapshot: &UiSnapshot) -> Line<'static> {
+    let formatter = WorldFormatter::new(snapshot.world_seed);
     Line::from(vec![
         Span::styled(
             format!(
                 "{} ({})",
-                place_name(snapshot.world_seed, &snapshot.place),
+                formatter.place(&snapshot.place),
                 snapshot.place.kind.label()
             ),
             Style::default()
@@ -31,13 +30,11 @@ pub fn build_world_title(snapshot: &UiSnapshot) -> Line<'static> {
 }
 
 pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'static> {
+    let formatter = WorldFormatter::new(snapshot.world_seed);
     let mut lines = vec![
         Line::from(vec![
             Span::raw("You are in "),
-            highlighted(
-                place_name(snapshot.world_seed, &snapshot.place),
-                Color::Yellow,
-            ),
+            highlighted(formatter.place(&snapshot.place), Color::Yellow),
             Span::raw(" in "),
             highlighted(snapshot.city.id.name(snapshot.world_seed), Color::Green),
             Span::raw(", a "),
@@ -74,7 +71,7 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
     if let Some(partner) = &snapshot.dialogue_partner {
         lines.push(Line::from(vec![
             Span::raw("Current conversation: "),
-            highlighted(partner.actor.id.name(snapshot.world_seed), Color::Magenta),
+            highlighted(formatter.actor(&partner.actor), Color::Magenta),
             Span::raw("  |  Job: "),
             highlighted(partner.actor.occupation.label().to_string(), Color::Yellow),
             Span::raw("."),
@@ -102,47 +99,64 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
         );
     }
 
-    if !snapshot.nearby_actors.is_empty() {
+    let people_here = snapshot
+        .interactables
+        .iter()
+        .filter_map(|interactable| match interactable {
+            Interactable::Talk(actor) => Some(format!(
+                "{} - {}, {}",
+                formatter.actor(actor),
+                actor.occupation.label(),
+                actor.archetype.label()
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !people_here.is_empty() {
         push_list_section(
             &mut lines,
             "People here",
-            snapshot.nearby_actors.iter().map(|person| {
-                format!(
-                    "{} - {}, {}",
-                    person.id.name(snapshot.world_seed),
-                    person.occupation.label(),
-                    person.archetype.label()
-                )
-            }),
+            people_here.into_iter(),
             Color::Magenta,
             " | ",
         );
     }
 
-    if !snapshot.nearby_cars.is_empty() {
+    let vehicles_within_reach = snapshot
+        .interactables
+        .iter()
+        .filter_map(|interactable| match interactable {
+            Interactable::EnterVehicle(entity) | Interactable::ExitVehicle(entity) => {
+                Some(formatter.entity(entity))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !vehicles_within_reach.is_empty() {
         push_list_section(
             &mut lines,
             "Vehicles within reach",
-            snapshot
-                .nearby_cars
-                .iter()
-                .map(|entity| entity_name(snapshot.world_seed, entity)),
+            vehicles_within_reach.into_iter(),
             Color::Yellow,
             " | ",
         );
     }
 
-    if !snapshot.nearby_entities.is_empty() {
+    let other_details = snapshot
+        .interactables
+        .iter()
+        .filter_map(|interactable| match interactable {
+            Interactable::Inspect(entity) => {
+                Some(format!("{} ({})", formatter.entity(entity), entity.kind.label()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !other_details.is_empty() {
         push_list_section(
             &mut lines,
             "Other notable details",
-            snapshot.nearby_entities.iter().map(|entity| {
-                format!(
-                    "{} ({})",
-                    entity_name(snapshot.world_seed, entity),
-                    entity.kind.label()
-                )
-            }),
+            other_details.into_iter(),
             Color::Cyan,
             " | ",
         );
@@ -191,7 +205,7 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
 }
 
 pub fn render_route_label(world_seed: WorldSeed, option: &RouteView) -> String {
-    let destination_name = place_name(world_seed, &option.destination);
+    let destination_name = WorldFormatter::new(world_seed).place(&option.destination);
     match option.travel_time {
         Some(duration) => format!(
             "{} via {} ({})",
@@ -207,83 +221,29 @@ pub fn render_route_label(world_seed: WorldSeed, option: &RouteView) -> String {
     }
 }
 
-pub fn render_interactable_label(world_seed: WorldSeed, option: &InteractableOption) -> String {
-    match (&option.subject, option.verb) {
-        (InteractableSubjectView::Actor(actor), InteractionVerb::Talk) => {
-            format!(
-                "{} - talk ({}, {})",
-                actor.id.name(world_seed),
-                actor.occupation.label(),
-                actor.archetype.label()
-            )
+pub fn render_interactable_label(world_seed: WorldSeed, interactable: &Interactable) -> String {
+    let formatter = WorldFormatter::new(world_seed);
+    match interactable {
+        Interactable::Talk(actor) => format!(
+            "{} - talk ({}, {})",
+            formatter.actor(actor),
+            actor.occupation.label(),
+            actor.archetype.label()
+        ),
+        Interactable::EnterVehicle(entity) => {
+            format!("{} - enter vehicle", formatter.entity(entity))
         }
-        (InteractableSubjectView::Entity(entity), InteractionVerb::EnterVehicle) => {
-            format!("{} - enter vehicle", entity_name(world_seed, entity))
+        Interactable::ExitVehicle(entity) => {
+            format!("{} - exit vehicle", formatter.entity(entity))
         }
-        (InteractableSubjectView::Entity(entity), InteractionVerb::ExitVehicle) => {
-            format!("{} - exit vehicle", entity_name(world_seed, entity))
+        Interactable::Inspect(entity) => {
+            format!("{} - inspect {}", formatter.entity(entity), entity.kind.label())
         }
-        (InteractableSubjectView::Entity(entity), InteractionVerb::Inspect) => {
-            format!(
-                "{} - inspect {}",
-                entity_name(world_seed, entity),
-                entity.kind.label()
-            )
-        }
-        _ => "Unavailable interaction".to_string(),
     }
 }
 
 pub fn render_event_notice(world_seed: WorldSeed, event: &GameEvent) -> Option<String> {
-    match event {
-        GameEvent::DialogueStarted { npc_id } => Some(format!(
-            "You approach {}. Type normally to speak, or press Esc to end the conversation.",
-            npc_id.name(world_seed)
-        )),
-        GameEvent::DialogueLineRecorded { .. } => None,
-        GameEvent::DialogueEnded { npc_id } => {
-            Some(format!("You step away from {}.", npc_id.name(world_seed)))
-        }
-        GameEvent::TravelCompleted {
-            destination,
-            transport_mode,
-            route,
-            duration,
-        } => Some(format!(
-            "You travel to {} by {} on {} in {}.",
-            place_name_from_parts(
-                world_seed,
-                destination.id,
-                destination.district_id,
-                destination.kind
-            ),
-            transport_mode.label(),
-            route.kind.label(),
-            format_duration(*duration)
-        )),
-        GameEvent::VehicleEntered { entity } => Some(format!(
-            "You get into the {}.",
-            entity_name_from_parts(world_seed, entity.id, entity.kind)
-        )),
-        GameEvent::VehicleExited { entity } => Some(format!(
-            "You get out of the {}.",
-            entity_name_from_parts(world_seed, entity.id, entity.kind)
-        )),
-        GameEvent::EntityInspected { entity } => Some(format!(
-            "You inspect {}. It looks like a {} left out in plain view.",
-            entity_name_from_parts(world_seed, entity.id, entity.kind),
-            entity.kind.label()
-        )),
-        GameEvent::WaitCompleted {
-            duration,
-            current_time,
-        } => Some(format!(
-            "You wait for {}. The time is now {}.",
-            format_duration(*duration),
-            current_time.format()
-        )),
-        GameEvent::ContextAppended { .. } => None,
-    }
+    WorldFormatter::new(world_seed).event_notice(event)
 }
 
 fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<Line<'static>> {
@@ -352,30 +312,11 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
 }
 
 fn render_system_context(world_seed: WorldSeed, context: &SystemContext) -> String {
-    match context {
-        SystemContext::Start => {
-            "You arrived in a starter apartment with a need for useful names and a parked car somewhere close by.".to_string()
-        }
-        SystemContext::Travel {
-            destination,
-            transport_mode,
-            duration,
-            ..
-        } => format!(
-            "Arrived at {} via {} after {}.",
-            place_name_from_parts(world_seed, destination.id, destination.district_id, destination.kind),
-            transport_mode.label(),
-            format_duration(*duration)
-        ),
-    }
+    WorldFormatter::new(world_seed).system_context(context)
 }
 
 fn dialogue_speaker_label(world_seed: WorldSeed, speaker: DialogueSpeaker) -> String {
-    match speaker {
-        DialogueSpeaker::Player => "You".to_string(),
-        DialogueSpeaker::Npc(npc_id) => npc_id.name(world_seed),
-        DialogueSpeaker::System => "System".to_string(),
-    }
+    WorldFormatter::new(world_seed).speaker(speaker)
 }
 
 fn dialogue_speaker_color(speaker: DialogueSpeaker) -> Color {
@@ -418,19 +359,105 @@ fn push_list_section<I>(
     ]));
 }
 
-fn place_name(world_seed: WorldSeed, place: &PlaceSummary) -> String {
-    place_name_from_parts(world_seed, place.id, place.district_id, place.kind)
-}
-
-fn entity_name(world_seed: WorldSeed, entity: &EntitySummary) -> String {
-    entity_name_from_parts(world_seed, entity.id, entity.kind)
-}
-
 fn highlighted(value: String, color: Color) -> Span<'static> {
     Span::styled(
         value,
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )
+}
+
+struct WorldFormatter {
+    seed: WorldSeed,
+}
+
+impl WorldFormatter {
+    fn new(seed: WorldSeed) -> Self {
+        Self { seed }
+    }
+
+    fn place(&self, place: &PlaceSummary) -> String {
+        place_name_from_parts(self.seed, place.id, place.district_id, place.kind)
+    }
+
+    fn entity(&self, entity: &EntitySummary) -> String {
+        entity_name_from_parts(self.seed, entity.id, entity.kind)
+    }
+
+    fn actor(&self, actor: &ActorView) -> String {
+        actor.id.name(self.seed)
+    }
+
+    fn speaker(&self, speaker: DialogueSpeaker) -> String {
+        match speaker {
+            DialogueSpeaker::Player => "You".to_string(),
+            DialogueSpeaker::Npc(npc_id) => npc_id.name(self.seed),
+            DialogueSpeaker::System => "System".to_string(),
+        }
+    }
+
+    fn system_context(&self, context: &SystemContext) -> String {
+        match context {
+            SystemContext::Start => {
+                "You arrived in a starter apartment with a need for useful names and a parked car somewhere close by.".to_string()
+            }
+            SystemContext::Travel {
+                destination,
+                transport_mode,
+                duration,
+                ..
+            } => format!(
+                "Arrived at {} via {} after {}.",
+                self.place(destination),
+                transport_mode.label(),
+                format_duration(*duration)
+            ),
+        }
+    }
+
+    fn event_notice(&self, event: &GameEvent) -> Option<String> {
+        match event {
+            GameEvent::DialogueStarted { npc_id } => Some(format!(
+                "You approach {}. Type normally to speak, or press Esc to end the conversation.",
+                npc_id.name(self.seed)
+            )),
+            GameEvent::DialogueLineRecorded { .. } => None,
+            GameEvent::DialogueEnded { npc_id } => {
+                Some(format!("You step away from {}.", npc_id.name(self.seed)))
+            }
+            GameEvent::TravelCompleted {
+                destination,
+                transport_mode,
+                route,
+                duration,
+            } => Some(format!(
+                "You travel to {} by {} on {} in {}.",
+                self.place(destination),
+                transport_mode.label(),
+                route.kind.label(),
+                format_duration(*duration)
+            )),
+            GameEvent::VehicleEntered { entity } => {
+                Some(format!("You get into the {}.", self.entity(entity)))
+            }
+            GameEvent::VehicleExited { entity } => {
+                Some(format!("You get out of the {}.", self.entity(entity)))
+            }
+            GameEvent::EntityInspected { entity } => Some(format!(
+                "You inspect {}. It looks like a {} left out in plain view.",
+                self.entity(entity),
+                entity.kind.label()
+            )),
+            GameEvent::WaitCompleted {
+                duration,
+                current_time,
+            } => Some(format!(
+                "You wait for {}. The time is now {}.",
+                format_duration(*duration),
+                current_time.format()
+            )),
+            GameEvent::ContextAppended { .. } => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -448,8 +475,8 @@ mod tests {
     use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
     use crate::graph_ecs::{EntityId, NpcId, PlaceId};
     use crate::simulation::{
-        ActorView, CityView, DialoguePartnerView, InteractableOption, InteractionTarget,
-        InteractionVerb, PlayerStatusView, RouteView, UiMode, UiSnapshot,
+        ActorView, CityView, DialoguePartnerView, Interactable, PlayerStatusView, RouteView,
+        UiMode, UiSnapshot,
     };
     use crate::world::{
         CityId, DistrictId, EntityKind, PlaceKind, RouteKind, TransportMode, TravelRoute,
@@ -470,7 +497,7 @@ mod tests {
         )));
         assert!(rendered.contains(&snapshot.city.id.name(snapshot.world_seed)));
         assert!(rendered.contains("Current conversation:"));
-        assert!(rendered.contains(&snapshot.nearby_actors[0].id.name(snapshot.world_seed)));
+        assert!(rendered.contains(&snapshot.dialogue_partner.as_ref().unwrap().actor.id.name(snapshot.world_seed)));
         assert!(rendered.contains("Routes from here:"));
         assert!(rendered.contains("Recent Context"));
     }
@@ -487,18 +514,22 @@ mod tests {
             talk_label,
             format!(
                 "{} - talk (journalist, watcher)",
-                snapshot.nearby_actors[0].id.name(snapshot.world_seed)
+                match snapshot.interactables[0] {
+                    Interactable::Talk(actor) => actor.id.name(snapshot.world_seed),
+                    _ => unreachable!("expected talk interactable"),
+                }
             )
         );
         assert_eq!(
             inspect_label,
             format!(
                 "{} - inspect bag",
-                entity_name_from_parts(
-                    snapshot.world_seed,
-                    snapshot.nearby_entities[0].id,
-                    snapshot.nearby_entities[0].kind,
-                )
+                match snapshot.interactables[2] {
+                    Interactable::Inspect(entity) => {
+                        entity_name_from_parts(snapshot.world_seed, entity.id, entity.kind)
+                    }
+                    _ => unreachable!("expected inspect interactable"),
+                }
             )
         );
     }
@@ -621,25 +652,10 @@ mod tests {
                 travel_time: Some(TimeDelta::from_seconds(600)),
             }],
             interactables: vec![
-                InteractableOption {
-                    target: InteractionTarget::Npc(actor.id),
-                    verb: InteractionVerb::Talk,
-                    subject: crate::simulation::InteractableSubjectView::Actor(actor.clone()),
-                },
-                InteractableOption {
-                    target: InteractionTarget::Entity(car.id),
-                    verb: InteractionVerb::EnterVehicle,
-                    subject: crate::simulation::InteractableSubjectView::Entity(car.clone()),
-                },
-                InteractableOption {
-                    target: InteractionTarget::Entity(bag.id),
-                    verb: InteractionVerb::Inspect,
-                    subject: crate::simulation::InteractableSubjectView::Entity(bag.clone()),
-                },
+                Interactable::Talk(actor),
+                Interactable::EnterVehicle(car),
+                Interactable::Inspect(bag),
             ],
-            nearby_actors: vec![actor],
-            nearby_cars: vec![car],
-            nearby_entities: vec![bag],
             context_feed: vec![
                 ContextEntry::System {
                     timestamp: GameTime::from_seconds(28_800),

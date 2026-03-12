@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::app::projection::{city_context, npc_context};
 use crate::domain::events::DialogueLine;
 use crate::domain::memory::ConversationMemory;
 use crate::domain::seed::WorldSeed;
@@ -80,28 +81,11 @@ pub fn build_npc_dialogue_context(
         bail!("dialogue context npc does not belong to the provided city");
     }
 
-    let city = world.city(city_id);
-    let npc = world.npc(session.npc_id);
     Ok(NpcDialogueContext {
         world_seed: world.seed,
         current_time,
-        city: CityContext {
-            id: city_id,
-            biome: city.biome,
-            economy: city.economy,
-            culture: city.culture,
-            districts: city.districts.iter().map(|district| district.id).collect(),
-            landmarks: city.landmarks.iter().map(|landmark| landmark.id).collect(),
-            connected_cities: world.city_connections(city_id),
-        },
-        npc: NpcContext {
-            id: session.npc_id,
-            archetype: npc.archetype,
-            occupation: npc.occupation,
-            traits: npc.personality_traits.clone(),
-            goal: npc.goal,
-            home_district: npc.home_district,
-        },
+        city: city_context(world, city_id),
+        npc: npc_context(world, session.npc_id),
         memory: memory.clone(),
         turn: DialogueTurnContext {
             transcript: session.transcript.clone(),
