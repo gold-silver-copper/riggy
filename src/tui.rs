@@ -13,14 +13,16 @@ use tokio::task::{LocalSet, spawn_local};
 
 use crate::app::service::GameService;
 use crate::domain::commands::GameCommand;
-use crate::domain::time::TimeDelta;
 use crate::domain::events::CommandResult;
+use crate::domain::time::TimeDelta;
 use crate::llm::LlmBackend;
 use crate::presenter::{
-    build_world_text, format_duration, render_event_notice, render_interactable_label,
-    render_route_label,
+    build_world_text, build_world_title, format_duration, render_event_notice,
+    render_interactable_label, render_route_label,
 };
-use crate::simulation::{InteractionTarget, InteractionVerb, UiMode, UiSnapshot};
+use crate::simulation::{
+    InteractableOption, InteractionTarget, InteractionVerb, RouteView, UiMode, UiSnapshot,
+};
 
 const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
 const NOTICE_HISTORY_LIMIT: usize = 48;
@@ -63,6 +65,110 @@ struct App {
 struct PendingCommand {
     enter_input_on_success: bool,
     rx: oneshot::Receiver<anyhow::Result<CommandResult>>,
+}
+
+enum ActiveListMenu<'a> {
+    Travel {
+        world_seed: crate::domain::seed::WorldSeed,
+        routes: &'a [RouteView],
+    },
+    Interact {
+        world_seed: crate::domain::seed::WorldSeed,
+        options: &'a [InteractableOption],
+    },
+}
+
+impl<'a> ActiveListMenu<'a> {
+    fn from(snapshot: &'a UiSnapshot, menu: Menu) -> Option<Self> {
+        match menu {
+            Menu::Travel => Some(Self::Travel {
+                world_seed: snapshot.world_seed,
+                routes: &snapshot.routes,
+            }),
+            Menu::Interact => Some(Self::Interact {
+                world_seed: snapshot.world_seed,
+                options: &snapshot.interactables,
+            }),
+            Menu::None | Menu::Wait => None,
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match self {
+            Self::Travel { .. } => "Travel",
+            Self::Interact { .. } => "Interact",
+        }
+    }
+
+    fn hint(&self) -> Line<'static> {
+        match self {
+            Self::Travel { .. } => Line::from("Up/Down route  Enter travel  Esc back  Ctrl+C quit"),
+            Self::Interact { .. } => {
+                Line::from("Up/Down target  Enter interact  Esc back  Ctrl+C quit")
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Travel { routes, .. } => routes.len(),
+            Self::Interact { options, .. } => options.len(),
+        }
+    }
+
+    fn items(&self) -> Vec<ListItem<'static>> {
+        match self {
+            Self::Travel { world_seed, routes } => {
+                if routes.is_empty() {
+                    vec![ListItem::new("Nothing available.")]
+                } else {
+                    routes
+                        .iter()
+                        .map(|route| ListItem::new(render_route_label(*world_seed, route)))
+                        .collect()
+                }
+            }
+            Self::Interact {
+                world_seed,
+                options,
+            } => {
+                if options.is_empty() {
+                    vec![ListItem::new("Nothing available.")]
+                } else {
+                    options
+                        .iter()
+                        .map(|option| ListItem::new(render_interactable_label(*world_seed, option)))
+                        .collect()
+                }
+            }
+        }
+    }
+
+    fn action(&self, index: usize) -> Option<GameCommand> {
+        match self {
+            Self::Travel { routes, .. } => routes
+                .get(index)
+                .filter(|route| route.travel_time.is_some())
+                .map(|route| GameCommand::TravelTo(route.destination.id)),
+            Self::Interact { options, .. } => options.get(index).map(|option| match option.verb {
+                InteractionVerb::Talk => match option.target {
+                    InteractionTarget::Npc(npc_id) => GameCommand::OpenDialogue(npc_id),
+                    InteractionTarget::Entity(_) => unreachable!("talk verb only targets npcs"),
+                },
+                InteractionVerb::EnterVehicle => match option.target {
+                    InteractionTarget::Entity(entity_id) => GameCommand::EnterVehicle(entity_id),
+                    InteractionTarget::Npc(_) => {
+                        unreachable!("enter vehicle only targets entities")
+                    }
+                },
+                InteractionVerb::ExitVehicle => GameCommand::ExitVehicle,
+                InteractionVerb::Inspect => match option.target {
+                    InteractionTarget::Entity(entity_id) => GameCommand::InspectEntity(entity_id),
+                    InteractionTarget::Npc(_) => unreachable!("inspect only targets entities"),
+                },
+            }),
+        }
+    }
 }
 
 impl App {
@@ -147,11 +253,9 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('g') if snapshot.mode == UiMode::Explore => {
-                self.open_menu(Menu::Travel, snapshot.routes.len())
-            }
+            KeyCode::Char('g') if snapshot.mode == UiMode::Explore => self.open_menu(Menu::Travel),
             KeyCode::Char('e') if snapshot.mode == UiMode::Explore => {
-                self.open_menu(Menu::Interact, snapshot.interactables.len())
+                self.open_menu(Menu::Interact)
             }
             KeyCode::Char('w') if snapshot.mode == UiMode::Explore => self.menu = Menu::Wait,
             KeyCode::Char(ch)
@@ -173,14 +277,14 @@ impl App {
             KeyCode::Right if self.menu == Menu::Wait => self.adjust_wait(1),
             KeyCode::Down if self.menu == Menu::Wait => self.adjust_wait(-60),
             KeyCode::Up if self.menu == Menu::Wait => self.adjust_wait(60),
-            KeyCode::Down if matches!(self.menu, Menu::Travel | Menu::Interact) => {
+            KeyCode::Down if ActiveListMenu::from(snapshot, self.menu).is_some() => {
                 self.next_item(snapshot)
             }
-            KeyCode::Up if matches!(self.menu, Menu::Travel | Menu::Interact) => {
+            KeyCode::Up if ActiveListMenu::from(snapshot, self.menu).is_some() => {
                 self.previous_item(snapshot)
             }
             KeyCode::Enter => {
-                if let Some(action) = self.menu_action(snapshot) {
+                if let Some(action) = self.selected_menu_action(snapshot) {
                     let enter_input = matches!(action, GameCommand::OpenDialogue(_));
                     return self.execute_action(game, action, enter_input);
                 } else if snapshot.mode == UiMode::Dialogue {
@@ -219,7 +323,11 @@ impl App {
                 if submitted.trim().is_empty() {
                     self.mode = Mode::Normal;
                 } else {
-                    return self.execute_dialogue_input(game, submitted.trim().to_string());
+                    return self.execute_action(
+                        game,
+                        GameCommand::SubmitDialogueLine(submitted.trim().to_string()),
+                        true,
+                    );
                 }
             }
             KeyCode::Backspace => self.delete_char(),
@@ -250,29 +358,6 @@ impl App {
             let result = {
                 let mut game = game.lock().await;
                 game.apply_command(action).await
-            };
-            let _ = tx.send(result);
-        });
-        Ok(false)
-    }
-
-    fn execute_dialogue_input<B: LlmBackend + Clone + 'static>(
-        &mut self,
-        game: &Arc<Mutex<GameService<B>>>,
-        input: String,
-    ) -> Result<bool> {
-        let (tx, rx) = oneshot::channel();
-        let game = Arc::clone(game);
-        self.pending = Some(PendingCommand {
-            enter_input_on_success: true,
-            rx,
-        });
-        self.mode = Mode::Input;
-        spawn_local(async move {
-            let result = {
-                let mut game = game.lock().await;
-                game.apply_command(GameCommand::SubmitDialogueLine(input))
-                    .await
             };
             let _ = tx.send(result);
         });
@@ -353,34 +438,14 @@ impl App {
             UiMode::Explore => "Explore",
             UiMode::Dialogue => "Dialogue",
         };
+        let mut title = build_world_title(snapshot).spans;
+        title.push(Span::raw("  "));
+        title.push(Span::styled(
+            format!("[{}]", mode_label),
+            Style::default().fg(Color::Cyan),
+        ));
         Paragraph::new(build_world_text(snapshot, &self.notices))
-            .block(Block::bordered().title(Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{} ({})",
-                        crate::world::place_name_from_parts(
-                            snapshot.world_seed,
-                            snapshot.place.id,
-                            snapshot.place.district_id,
-                            snapshot.place.kind,
-                        ),
-                        snapshot.place.kind.label()
-                    ),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    snapshot.city.id.name(snapshot.world_seed),
-                    Style::default().fg(Color::Green),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    format!("[{}]", mode_label),
-                    Style::default().fg(Color::Cyan),
-                ),
-            ])))
+            .block(Block::bordered().title(Line::from(title)))
             .wrap(Wrap { trim: false })
     }
 
@@ -406,11 +471,14 @@ impl App {
                     frame.render_widget(self.wait_widget(), area);
                 }
                 Menu::Travel | Menu::Interact => {
-                    let items = self.menu_items(snapshot);
+                    let Some(menu) = ActiveListMenu::from(snapshot, self.menu) else {
+                        return;
+                    };
+                    let items = menu.items();
                     let height = items.len().min(8) as u16 + 2;
                     let area = self.overlay_area(world_area, 76, height.max(4));
                     let list = List::new(items)
-                        .block(self.context_block())
+                        .block(Block::bordered().title(menu.title()))
                         .highlight_style(selected_style())
                         .highlight_symbol("› ");
                     frame.render_widget(Clear, area);
@@ -472,10 +540,9 @@ impl App {
                 }
             },
             Mode::Normal => match self.menu {
-                Menu::Travel => Line::from("Up/Down route  Enter travel  Esc back  Ctrl+C quit"),
-                Menu::Interact => {
-                    Line::from("Up/Down target  Enter interact  Esc back  Ctrl+C quit")
-                }
+                Menu::Travel | Menu::Interact => ActiveListMenu::from(snapshot, self.menu)
+                    .expect("list menu should exist")
+                    .hint(),
                 Menu::Wait => {
                     Line::from("Left/Right +/-1s  Up/Down +/-1m  Enter wait  Esc back  Ctrl+C quit")
                 }
@@ -487,81 +554,21 @@ impl App {
         }
     }
 
-    fn menu_items(&self, snapshot: &UiSnapshot) -> Vec<ListItem<'static>> {
-        match self.menu {
-            Menu::Travel => {
-                if snapshot.routes.is_empty() {
-                    vec![ListItem::new("Nothing available.")]
-                } else {
-                    snapshot
-                        .routes
-                        .iter()
-                        .map(|option| {
-                            ListItem::new(render_route_label(snapshot.world_seed, option))
-                        })
-                        .collect()
-                }
-            }
-            Menu::Interact => {
-                if snapshot.interactables.is_empty() {
-                    vec![ListItem::new("Nothing available.")]
-                } else {
-                    snapshot
-                        .interactables
-                        .iter()
-                        .map(|option| {
-                            ListItem::new(render_interactable_label(snapshot.world_seed, option))
-                        })
-                        .collect()
-                }
-            }
-            Menu::None | Menu::Wait => vec![ListItem::new("Nothing available.")],
-        }
-    }
-
-    fn menu_action(&self, snapshot: &UiSnapshot) -> Option<GameCommand> {
+    fn selected_menu_action(&self, snapshot: &UiSnapshot) -> Option<GameCommand> {
         let index = self.menu_state.selected().unwrap_or(0);
         match self.menu {
-            Menu::Travel => snapshot
-                .routes
-                .get(index)
-                .filter(|option| option.travel_time.is_some())
-                .map(|option| GameCommand::TravelTo(option.destination.id)),
-            Menu::Interact => snapshot
-                .interactables
-                .get(index)
-                .map(|option| match option.verb {
-                    InteractionVerb::Talk => match option.target {
-                        InteractionTarget::Npc(npc_id) => GameCommand::OpenDialogue(npc_id),
-                        InteractionTarget::Entity(_) => unreachable!("talk verb only targets npcs"),
-                    },
-                    InteractionVerb::EnterVehicle => match option.target {
-                        InteractionTarget::Entity(entity_id) => {
-                            GameCommand::EnterVehicle(entity_id)
-                        }
-                        InteractionTarget::Npc(_) => {
-                            unreachable!("enter vehicle only targets entities")
-                        }
-                    },
-                    InteractionVerb::ExitVehicle => GameCommand::ExitVehicle,
-                    InteractionVerb::Inspect => match option.target {
-                        InteractionTarget::Entity(entity_id) => {
-                            GameCommand::InspectEntity(entity_id)
-                        }
-                        InteractionTarget::Npc(_) => unreachable!("inspect only targets entities"),
-                    },
-                }),
+            Menu::Travel | Menu::Interact => {
+                ActiveListMenu::from(snapshot, self.menu).and_then(|menu| menu.action(index))
+            }
             Menu::Wait => Some(GameCommand::Wait(self.wait_duration)),
             Menu::None => None,
         }
     }
 
     fn sync_menu(&mut self, snapshot: &UiSnapshot) {
-        let len = match self.menu {
-            Menu::Travel => snapshot.routes.len(),
-            Menu::Interact => snapshot.interactables.len(),
-            Menu::Wait | Menu::None => 0,
-        };
+        let len = ActiveListMenu::from(snapshot, self.menu)
+            .map(|menu| menu.len())
+            .unwrap_or(0);
         if len == 0 {
             self.menu_state.select(Some(0));
         } else {
@@ -571,11 +578,9 @@ impl App {
     }
 
     fn next_item(&mut self, snapshot: &UiSnapshot) {
-        let len = match self.menu {
-            Menu::Travel => snapshot.routes.len(),
-            Menu::Interact => snapshot.interactables.len(),
-            Menu::Wait | Menu::None => 0,
-        };
+        let len = ActiveListMenu::from(snapshot, self.menu)
+            .map(|menu| menu.len())
+            .unwrap_or(0);
         if len == 0 {
             return;
         }
@@ -587,11 +592,9 @@ impl App {
     }
 
     fn previous_item(&mut self, snapshot: &UiSnapshot) {
-        let len = match self.menu {
-            Menu::Travel => snapshot.routes.len(),
-            Menu::Interact => snapshot.interactables.len(),
-            Menu::Wait | Menu::None => 0,
-        };
+        let len = ActiveListMenu::from(snapshot, self.menu)
+            .map(|menu| menu.len())
+            .unwrap_or(0);
         if len == 0 {
             return;
         }
@@ -602,7 +605,7 @@ impl App {
         self.menu_state.select(Some(previous));
     }
 
-    fn open_menu(&mut self, menu: Menu, _len: usize) {
+    fn open_menu(&mut self, menu: Menu) {
         self.menu = menu;
         self.menu_state.select(Some(0));
     }

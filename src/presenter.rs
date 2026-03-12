@@ -9,11 +9,34 @@ use crate::simulation::{
 };
 use crate::world::{entity_name_from_parts, place_name_from_parts};
 
+pub fn build_world_title(snapshot: &UiSnapshot) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(
+                "{} ({})",
+                place_name(snapshot.world_seed, &snapshot.place),
+                snapshot.place.kind.label()
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            snapshot.city.id.name(snapshot.world_seed),
+            Style::default().fg(Color::Green),
+        ),
+    ])
+}
+
 pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'static> {
     let mut lines = vec![
         Line::from(vec![
             Span::raw("You are in "),
-            highlighted(place_name(snapshot.world_seed, &snapshot.place), Color::Yellow),
+            highlighted(
+                place_name(snapshot.world_seed, &snapshot.place),
+                Color::Yellow,
+            ),
             Span::raw(" in "),
             highlighted(snapshot.city.id.name(snapshot.world_seed), Color::Green),
             Span::raw(", a "),
@@ -65,114 +88,90 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
     }
 
     if !snapshot.city.districts.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("Districts nearby: "),
-            highlighted(
-                snapshot
-                    .city
-                    .districts
-                    .iter()
-                    .map(|district| district.id.name(snapshot.world_seed))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                Color::Green,
-            ),
-            Span::raw("."),
-        ]));
+        push_list_section(
+            &mut lines,
+            "Districts nearby",
+            snapshot
+                .city
+                .districts
+                .iter()
+                .map(|district| district.id.name(snapshot.world_seed)),
+            Color::Green,
+            ", ",
+        );
     }
 
     if !snapshot.nearby_actors.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("People here: "),
-            highlighted(
-                snapshot
-                    .nearby_actors
-                    .iter()
-                    .map(|person| {
-                        format!(
-                            "{} - {}, {}",
-                            person.id.name(snapshot.world_seed),
-                            person.occupation.label(),
-                            person.archetype.label()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | "),
-                Color::Magenta,
-            ),
-            Span::raw("."),
-        ]));
+        push_list_section(
+            &mut lines,
+            "People here",
+            snapshot.nearby_actors.iter().map(|person| {
+                format!(
+                    "{} - {}, {}",
+                    person.id.name(snapshot.world_seed),
+                    person.occupation.label(),
+                    person.archetype.label()
+                )
+            }),
+            Color::Magenta,
+            " | ",
+        );
     }
 
     if !snapshot.nearby_cars.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("Vehicles within reach: "),
-            highlighted(
-                snapshot
-                    .nearby_cars
-                    .iter()
-                    .map(|entity| entity_name(snapshot.world_seed, entity))
-                    .collect::<Vec<_>>()
-                    .join(" | "),
-                Color::Yellow,
-            ),
-            Span::raw("."),
-        ]));
+        push_list_section(
+            &mut lines,
+            "Vehicles within reach",
+            snapshot
+                .nearby_cars
+                .iter()
+                .map(|entity| entity_name(snapshot.world_seed, entity)),
+            Color::Yellow,
+            " | ",
+        );
     }
 
     if !snapshot.nearby_entities.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("Other notable details: "),
-            highlighted(
-                snapshot
-                    .nearby_entities
-                    .iter()
-                    .map(|entity| {
-                        format!(
-                            "{} ({})",
-                            entity_name(snapshot.world_seed, entity),
-                            entity.kind.label()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | "),
-                Color::Cyan,
-            ),
-            Span::raw("."),
-        ]));
+        push_list_section(
+            &mut lines,
+            "Other notable details",
+            snapshot.nearby_entities.iter().map(|entity| {
+                format!(
+                    "{} ({})",
+                    entity_name(snapshot.world_seed, entity),
+                    entity.kind.label()
+                )
+            }),
+            Color::Cyan,
+            " | ",
+        );
     }
 
     if !snapshot.city.landmarks.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("Landmarks: "),
-            highlighted(
-                snapshot
-                    .city
-                    .landmarks
-                    .iter()
-                    .map(|landmark| landmark.id.name(snapshot.world_seed))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                Color::Cyan,
-            ),
-            Span::raw("."),
-        ]));
+        push_list_section(
+            &mut lines,
+            "Landmarks",
+            snapshot
+                .city
+                .landmarks
+                .iter()
+                .map(|landmark| landmark.id.name(snapshot.world_seed)),
+            Color::Cyan,
+            ", ",
+        );
     }
 
     if !snapshot.routes.is_empty() {
-        lines.push(Line::from(vec![
-            Span::raw("Routes from here: "),
-            highlighted(
-                snapshot
-                    .routes
-                    .iter()
-                    .map(|route| render_route_label(snapshot.world_seed, route))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                Color::Yellow,
-            ),
-            Span::raw("."),
-        ]));
+        push_list_section(
+            &mut lines,
+            "Routes from here",
+            snapshot
+                .routes
+                .iter()
+                .map(|route| render_route_label(snapshot.world_seed, route)),
+            Color::Yellow,
+            ", ",
+        );
     }
 
     let recent_context = build_recent_context_lines(snapshot, notices);
@@ -251,7 +250,12 @@ pub fn render_event_notice(world_seed: WorldSeed, event: &GameEvent) -> Option<S
             duration,
         } => Some(format!(
             "You travel to {} by {} on {} in {}.",
-            place_name_from_parts(world_seed, destination.id, destination.district_id, destination.kind),
+            place_name_from_parts(
+                world_seed,
+                destination.id,
+                destination.district_id,
+                destination.kind
+            ),
             transport_mode.label(),
             route.kind.label(),
             format_duration(*duration)
@@ -286,10 +290,7 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
 
     for entry in &snapshot.context_feed {
         match entry {
-            ContextFeedEntryView::System {
-                timestamp,
-                context,
-            } => {
+            ContextFeedEntryView::System { timestamp, context } => {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
@@ -304,7 +305,10 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
-                    Span::raw(clean_inline_text(&render_system_context(snapshot.world_seed, context))),
+                    Span::raw(clean_inline_text(&render_system_context(
+                        snapshot.world_seed,
+                        context,
+                    ))),
                 ]));
             }
             ContextFeedEntryView::Dialogue {
@@ -401,6 +405,22 @@ pub fn format_duration(duration: crate::domain::time::TimeDelta) -> String {
     duration.format()
 }
 
+fn push_list_section<I>(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    values: I,
+    color: Color,
+    separator: &str,
+) where
+    I: Iterator<Item = String>,
+{
+    lines.push(Line::from(vec![
+        Span::raw(format!("{label}: ")),
+        highlighted(values.collect::<Vec<_>>().join(separator), color),
+        Span::raw("."),
+    ]));
+}
+
 fn place_name(world_seed: WorldSeed, place: &crate::simulation::PlaceView) -> String {
     place_name_from_parts(world_seed, place.id, place.district_id, place.kind)
 }
@@ -431,8 +451,7 @@ mod tests {
     use crate::simulation::{
         ActorRefView, ActorView, CityView, ContextFeedEntryView, DialoguePartnerView,
         DialogueSpeakerView, DistrictView, EntityView, InteractableOption, InteractionTarget,
-        InteractionVerb, LandmarkView, PlaceView, PlayerStatusView, RouteView, UiMode,
-        UiSnapshot,
+        InteractionVerb, LandmarkView, PlaceView, PlayerStatusView, RouteView, UiMode, UiSnapshot,
     };
     use crate::world::{
         CityId, DistrictId, EntityKind, PlaceKind, RouteKind, TransportMode, TravelRoute,
@@ -507,8 +526,9 @@ mod tests {
     #[test]
     fn event_notices_render_from_typed_events() {
         let snapshot = sample_snapshot();
-        let travel_notice =
-            render_event_notice(snapshot.world_seed, &crate::domain::events::GameEvent::TravelCompleted {
+        let travel_notice = render_event_notice(
+            snapshot.world_seed,
+            &crate::domain::events::GameEvent::TravelCompleted {
                 destination: PlaceRef {
                     id: snapshot.routes[0].destination.id,
                     district_id: snapshot.routes[0].destination.district_id,
@@ -517,7 +537,8 @@ mod tests {
                 transport_mode: TransportMode::Walking,
                 route: snapshot.routes[0].route,
                 duration: TimeDelta::from_seconds(600),
-            });
+            },
+        );
         let expected = format!(
             "You travel to {} by walk on arterial road in 10m 00s.",
             place_name_from_parts(
@@ -527,10 +548,7 @@ mod tests {
                 snapshot.routes[0].destination.kind,
             )
         );
-        assert_eq!(
-            travel_notice.as_deref(),
-            Some(expected.as_str())
-        );
+        assert_eq!(travel_notice.as_deref(), Some(expected.as_str()));
     }
 
     fn sample_snapshot() -> UiSnapshot {
@@ -578,8 +596,12 @@ mod tests {
                 economy: Economy::Trade,
                 culture: Culture::CivicMinded,
                 districts: vec![
-                    DistrictView { id: market_district },
-                    DistrictView { id: station_district },
+                    DistrictView {
+                        id: market_district,
+                    },
+                    DistrictView {
+                        id: station_district,
+                    },
                 ],
                 landmarks: vec![LandmarkView {
                     id: crate::world::LandmarkId {

@@ -16,8 +16,8 @@ use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::llm::LlmBackend;
 use crate::simulation::{
-    ContextEntry, ContextEntryKind, DialogueLine, DialogueSession, GameState, OccupancyState,
-    NpcMemoryState, Speaker, UiSnapshot,
+    ContextEntry, ContextEntryKind, DialogueLine, DialogueSession, GameState, NpcMemoryState,
+    OccupancyState, Speaker, UiSnapshot,
 };
 use crate::world::{EntityId, NpcId, PlaceId, PlaceKind, TransportMode, World};
 
@@ -134,19 +134,10 @@ impl<B: LlmBackend> GameService<B> {
             return Ok(Vec::new());
         }
 
-        let Some(session) = self.state.active_dialogue.as_mut() else {
+        if self.state.active_dialogue.is_none() {
             bail!("You are not talking to anyone right now.");
-        };
-        session.transcript.push(DialogueLine {
-            speaker: Speaker::Player,
-            text: trimmed.to_string(),
-        });
-
-        let mut events = self.push_dialogue_context(
-            Speaker::Player,
-            trimmed.to_string(),
-            self.state.clock,
-        );
+        }
+        let mut events = self.record_dialogue_line(Speaker::Player, trimmed.to_string());
 
         let session_snapshot = self
             .state
@@ -167,22 +158,7 @@ impl<B: LlmBackend> GameService<B> {
         let response = self.backend.generate_dialogue(&context).await?;
         let text = response.text;
 
-        {
-            let session = self
-                .state
-                .active_dialogue
-                .as_mut()
-                .expect("dialogue should remain active while submitting");
-            session.transcript.push(DialogueLine {
-                speaker: Speaker::Npc(npc_id),
-                text: text.clone(),
-            });
-        }
-        events.extend(self.push_dialogue_context(
-            Speaker::Npc(npc_id),
-            text,
-            self.state.clock,
-        ));
+        events.extend(self.record_dialogue_line(Speaker::Npc(npc_id), text));
         self.advance_time(DIALOGUE_TIME);
         Ok(events)
     }
@@ -210,17 +186,7 @@ impl<B: LlmBackend> GameService<B> {
             anyhow::anyhow!("You cannot use {} on this route.", transport_mode.label())
         })?;
 
-        self.state.player_place_id = resolved_destination_id;
-        self.state.player_city_id = self
-            .state
-            .world
-            .place_city_id(resolved_destination_id)
-            .expect("place should belong to a city");
-        if let Some(vehicle_id) = current_vehicle_id(&self.state) {
-            self.state
-                .world
-                .move_entity(vehicle_id, resolved_destination_id);
-        }
+        self.move_player_to(resolved_destination_id);
         self.advance_time(travel_time);
         self.learn_city(self.state.player_city_id);
         let destination = self.place_ref(resolved_destination_id);
@@ -255,13 +221,7 @@ impl<B: LlmBackend> GameService<B> {
         self.state.active_dialogue = Some(DialogueSession {
             npc_id,
             started_at: self.state.clock,
-            transcript: vec![DialogueLine {
-                speaker: Speaker::Npc(npc_id),
-                text: format!(
-                    "What do you want to know about {}?",
-                    self.state.world.city_name(self.state.player_city_id)
-                ),
-            }],
+            transcript: Vec::new(),
         });
         let opening_text = format!(
             "What do you want to know about {}?",
@@ -270,11 +230,7 @@ impl<B: LlmBackend> GameService<B> {
         let mut events = vec![GameEvent::DialogueStarted {
             actor: self.npc_ref(npc_id),
         }];
-        events.extend(self.push_dialogue_context(
-            Speaker::Npc(npc_id),
-            opening_text,
-            self.state.clock,
-        ));
+        events.extend(self.record_dialogue_line(Speaker::Npc(npc_id), opening_text));
         Ok(events)
     }
 
@@ -303,9 +259,7 @@ impl<B: LlmBackend> GameService<B> {
             .place_city_id(vehicle_place_id)
             .expect("place should belong to a city");
         self.state.occupancy = OccupancyState::InVehicle(entity_id);
-        Ok(GameEvent::VehicleEntered {
-            entity: self.entity_ref(entity_id),
-        })
+        Ok(self.vehicle_event(entity_id, true))
     }
 
     fn exit_vehicle(&mut self) -> Result<GameEvent> {
@@ -313,9 +267,7 @@ impl<B: LlmBackend> GameService<B> {
             bail!("You are not in a vehicle.");
         };
         self.state.occupancy = OccupancyState::OnFoot;
-        Ok(GameEvent::VehicleExited {
-            entity: self.entity_ref(vehicle_id),
-        })
+        Ok(self.vehicle_event(vehicle_id, false))
     }
 
     fn inspect_entity(&self, entity_id: EntityId) -> Result<GameEvent> {
@@ -360,10 +312,7 @@ impl<B: LlmBackend> GameService<B> {
             kind: ContextEntryKind::System(context.clone()),
         });
         GameEvent::ContextAppended {
-            entry: ContextEvent::System {
-                timestamp,
-                context,
-            },
+            entry: ContextEvent::System { timestamp, context },
         }
     }
 
@@ -399,6 +348,40 @@ impl<B: LlmBackend> GameService<B> {
         ]
     }
 
+    fn move_player_to(&mut self, place_id: PlaceId) {
+        self.state.player_place_id = place_id;
+        self.state.player_city_id = self
+            .state
+            .world
+            .place_city_id(place_id)
+            .expect("place should belong to a city");
+        if let Some(vehicle_id) = current_vehicle_id(&self.state) {
+            self.state.world.move_entity(vehicle_id, place_id);
+        }
+    }
+
+    fn record_dialogue_line(&mut self, speaker: Speaker, text: String) -> Vec<GameEvent> {
+        self.state
+            .active_dialogue
+            .as_mut()
+            .expect("dialogue should be active while recording a line")
+            .transcript
+            .push(DialogueLine {
+                speaker: speaker.clone(),
+                text: text.clone(),
+            });
+        self.push_dialogue_context(speaker, text, self.state.clock)
+    }
+
+    fn vehicle_event(&self, entity_id: EntityId, entered: bool) -> GameEvent {
+        let entity = self.entity_ref(entity_id);
+        if entered {
+            GameEvent::VehicleEntered { entity }
+        } else {
+            GameEvent::VehicleExited { entity }
+        }
+    }
+
     fn advance_time(&mut self, duration: TimeDelta) {
         self.state.clock = self.state.clock.advance(duration);
     }
@@ -420,10 +403,7 @@ impl<B: LlmBackend> GameService<B> {
     }
 
     fn npc_memory_mut(&mut self, npc_id: NpcId) -> &mut NpcMemoryState {
-        self.state
-            .npc_memories
-            .entry(npc_id)
-            .or_default()
+        self.state.npc_memories.entry(npc_id).or_default()
     }
 
     fn current_place(&self) -> &crate::world::Place {
@@ -490,6 +470,7 @@ mod tests {
     use crate::graph_ecs::WorldEdge;
     use crate::llm::{DialogueResponse, LlmBackend, MockBackend};
     use crate::simulation::{InteractionTarget, UiMode};
+    use crate::world::NpcId;
 
     use super::GameService;
 
@@ -518,21 +499,29 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn dialogue_can_be_opened_and_closed_through_typed_commands() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = game
-            .snapshot()
+    fn nearby_npc_id<B: LlmBackend>(game: &GameService<B>) -> NpcId {
+        game.snapshot()
             .interactables
             .into_iter()
             .find_map(|option| match option.target {
                 InteractionTarget::Npc(npc_id) => Some(npc_id),
                 InteractionTarget::Entity(_) => None,
             })
-            .expect("expected a nearby npc");
+            .expect("expected a nearby npc")
+    }
+
+    async fn open_dialogue_with_nearby_npc<B: LlmBackend>(game: &mut GameService<B>) -> NpcId {
+        let npc_id = nearby_npc_id(game);
         game.apply_command(GameCommand::OpenDialogue(npc_id))
             .await
             .unwrap();
+        npc_id
+    }
+
+    #[tokio::test]
+    async fn dialogue_can_be_opened_and_closed_through_typed_commands() {
+        let mut game = GameService::new(MockBackend).unwrap();
+        open_dialogue_with_nearby_npc(&mut game).await;
         assert_eq!(game.snapshot().mode, UiMode::Dialogue);
         let leave = game
             .apply_command(GameCommand::LeaveDialogue)
@@ -561,19 +550,7 @@ mod tests {
     #[tokio::test]
     async fn dialogue_submission_uses_typed_command_path() {
         let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = game
-            .snapshot()
-            .interactables
-            .into_iter()
-            .find_map(|option| match option.target {
-                InteractionTarget::Npc(npc_id) => Some(npc_id),
-                InteractionTarget::Entity(_) => None,
-            })
-            .expect("expected a nearby npc");
-
-        game.apply_command(GameCommand::OpenDialogue(npc_id))
-            .await
-            .unwrap();
+        open_dialogue_with_nearby_npc(&mut game).await;
         let result = game
             .apply_command(GameCommand::SubmitDialogueLine("hello".to_string()))
             .await
@@ -590,19 +567,7 @@ mod tests {
     #[tokio::test]
     async fn leaving_dialogue_persists_conversation_memory() {
         let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = game
-            .snapshot()
-            .interactables
-            .into_iter()
-            .find_map(|option| match option.target {
-                InteractionTarget::Npc(npc_id) => Some(npc_id),
-                InteractionTarget::Entity(_) => None,
-            })
-            .expect("expected a nearby npc");
-
-        game.apply_command(GameCommand::OpenDialogue(npc_id))
-            .await
-            .unwrap();
+        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
         game.apply_command(GameCommand::SubmitDialogueLine(
             "tell me about work".to_string(),
         ))
@@ -620,19 +585,7 @@ mod tests {
     #[tokio::test]
     async fn leaving_dialogue_preserves_session_when_summary_fails() {
         let mut game = GameService::new(FailingSummaryBackend).unwrap();
-        let npc_id = game
-            .snapshot()
-            .interactables
-            .into_iter()
-            .find_map(|option| match option.target {
-                InteractionTarget::Npc(npc_id) => Some(npc_id),
-                InteractionTarget::Entity(_) => None,
-            })
-            .expect("expected a nearby npc");
-
-        game.apply_command(GameCommand::OpenDialogue(npc_id))
-            .await
-            .unwrap();
+        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
         let error = game
             .apply_command(GameCommand::LeaveDialogue)
             .await
@@ -651,19 +604,7 @@ mod tests {
     #[tokio::test]
     async fn leaving_dialogue_merges_conversation_memory_across_sessions() {
         let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = game
-            .snapshot()
-            .interactables
-            .into_iter()
-            .find_map(|option| match option.target {
-                InteractionTarget::Npc(npc_id) => Some(npc_id),
-                InteractionTarget::Entity(_) => None,
-            })
-            .expect("expected a nearby npc");
-
-        game.apply_command(GameCommand::OpenDialogue(npc_id))
-            .await
-            .unwrap();
+        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
         game.apply_command(GameCommand::SubmitDialogueLine(
             "tell me about work".to_string(),
         ))
@@ -731,5 +672,4 @@ mod tests {
         let err = loaded.load(invalid_path).unwrap_err();
         assert!(err.to_string().contains("world validation failed"));
     }
-
 }

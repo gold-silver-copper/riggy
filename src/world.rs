@@ -340,229 +340,17 @@ impl World {
             let mut road_lanes = Vec::new();
             let mut pedestrian_places = Vec::new();
             for (district_index, district) in city.districts.iter().enumerate() {
-                let district_name = district.id.name(seed);
-                let road_id = add_place(
+                let bundle = build_district_bundle(
                     &mut graph,
+                    &mut rng,
+                    seed,
                     *city_id,
                     district.id,
-                    PlaceKind::RoadLane,
-                    format!(
-                        "A vehicle lane in {} where deliveries, rideshares, and through-traffic stack up.",
-                        district_name
-                    ),
+                    city_id.index() == 0 && district_index == 0,
+                    district_index == 0,
                 );
-                road_lanes.push(road_id);
-
-                let left_sidewalk_id = add_place(
-                    &mut graph,
-                    *city_id,
-                    district.id,
-                    PlaceKind::SidewalkLeft,
-                    format!(
-                        "The left-side sidewalk in {} with storefront windows, signs, and steady foot traffic.",
-                        district_name
-                    ),
-                );
-                pedestrian_places.push(left_sidewalk_id);
-
-                let right_sidewalk_id = add_place(
-                    &mut graph,
-                    *city_id,
-                    district.id,
-                    PlaceKind::SidewalkRight,
-                    format!(
-                        "The right-side sidewalk in {} where bus stops, benches, and curb cuts slow the flow.",
-                        district_name
-                    ),
-                );
-                pedestrian_places.push(right_sidewalk_id);
-
-                let curb_route = TravelRoute {
-                    kind: RouteKind::Crosswalk,
-                    walking_time: TimeDelta::from_seconds(rng.random_range(8..=20)),
-                    transit_time: None,
-                    driving_time: None,
-                };
-                add_edge(
-                    &mut graph,
-                    road_id.0,
-                    left_sidewalk_id.0,
-                    WorldEdge::TravelRoute(curb_route),
-                );
-                add_edge(
-                    &mut graph,
-                    left_sidewalk_id.0,
-                    road_id.0,
-                    WorldEdge::TravelRoute(curb_route),
-                );
-                add_edge(
-                    &mut graph,
-                    road_id.0,
-                    right_sidewalk_id.0,
-                    WorldEdge::TravelRoute(curb_route),
-                );
-                add_edge(
-                    &mut graph,
-                    right_sidewalk_id.0,
-                    road_id.0,
-                    WorldEdge::TravelRoute(curb_route),
-                );
-
-                let sidewalk_crossing = TravelRoute {
-                    kind: RouteKind::Crosswalk,
-                    walking_time: TimeDelta::from_seconds(rng.random_range(15..=35)),
-                    transit_time: None,
-                    driving_time: None,
-                };
-                add_edge(
-                    &mut graph,
-                    left_sidewalk_id.0,
-                    right_sidewalk_id.0,
-                    WorldEdge::TravelRoute(sidewalk_crossing),
-                );
-                add_edge(
-                    &mut graph,
-                    right_sidewalk_id.0,
-                    left_sidewalk_id.0,
-                    WorldEdge::TravelRoute(sidewalk_crossing),
-                );
-
-                let building_id = add_place(
-                    &mut graph,
-                    *city_id,
-                    district.id,
-                    PlaceKind::BuildingInterior,
-                    format!(
-                        "An interior space in {} where people slow down, talk longer, and watch who comes through.",
-                        district_name
-                    ),
-                );
-                pedestrian_places.push(building_id);
-
-                add_edge(
-                    &mut graph,
-                    left_sidewalk_id.0,
-                    building_id.0,
-                    WorldEdge::TravelRoute(TravelRoute {
-                        kind: RouteKind::Hallway,
-                        walking_time: TimeDelta::from_seconds(rng.random_range(8..=20)),
-                        transit_time: None,
-                        driving_time: None,
-                    }),
-                );
-                add_edge(
-                    &mut graph,
-                    building_id.0,
-                    left_sidewalk_id.0,
-                    WorldEdge::TravelRoute(TravelRoute {
-                        kind: RouteKind::Hallway,
-                        walking_time: TimeDelta::from_seconds(rng.random_range(8..=20)),
-                        transit_time: None,
-                        driving_time: None,
-                    }),
-                );
-
-                if city_id.index() == 0 && district_index == 0 {
-                    let lobby_id = add_place(
-                        &mut graph,
-                        *city_id,
-                        district.id,
-                        PlaceKind::ApartmentLobby,
-                        format!(
-                            "A modest apartment lobby in {} with mailboxes, a buzzer panel, and scuffed tile from years of foot traffic.",
-                            district_name
-                        ),
-                    );
-                    pedestrian_places.push(lobby_id);
-
-                    let hall_route = TravelRoute {
-                        kind: RouteKind::Hallway,
-                        walking_time: TimeDelta::from_seconds(rng.random_range(6..=14)),
-                        transit_time: None,
-                        driving_time: None,
-                    };
-                    add_edge(
-                        &mut graph,
-                        left_sidewalk_id.0,
-                        lobby_id.0,
-                        WorldEdge::TravelRoute(hall_route),
-                    );
-                    add_edge(
-                        &mut graph,
-                        lobby_id.0,
-                        left_sidewalk_id.0,
-                        WorldEdge::TravelRoute(hall_route),
-                    );
-
-                    for _room_number in ["1A", "1B", "2A", "2B"] {
-                        let room_id = add_place(
-                            &mut graph,
-                            *city_id,
-                            district.id,
-                            PlaceKind::ApartmentRoom,
-                            format!(
-                                "A small apartment unit in {} with a narrow kitchen, thin walls, and just enough space to disappear for a while.",
-                                district_name
-                            ),
-                        );
-                        pedestrian_places.push(room_id);
-
-                        let room_route = TravelRoute {
-                            kind: RouteKind::Hallway,
-                            walking_time: TimeDelta::from_seconds(rng.random_range(4..=12)),
-                            transit_time: None,
-                            driving_time: None,
-                        };
-                        add_edge(
-                            &mut graph,
-                            lobby_id.0,
-                            room_id.0,
-                            WorldEdge::TravelRoute(room_route),
-                        );
-                        add_edge(
-                            &mut graph,
-                            room_id.0,
-                            lobby_id.0,
-                            WorldEdge::TravelRoute(room_route),
-                        );
-                    }
-                }
-
-                if district_index == 0 || rng.random_bool(0.55) {
-                    let entity_id = add_entity(
-                        &mut graph,
-                        EntityKind::Car,
-                    );
-                    add_edge(
-                        &mut graph,
-                        road_id.0,
-                        entity_id.0,
-                        WorldEdge::ContainsEntity,
-                    );
-                }
-
-                if rng.random_bool(0.18) {
-                    let entity_kind = if rng.random_bool(0.5) {
-                        EntityKind::Knife
-                    } else {
-                        EntityKind::Bag
-                    };
-                    let sidewalk_target = if rng.random_bool(0.5) {
-                        left_sidewalk_id
-                    } else {
-                        right_sidewalk_id
-                    };
-                    let entity_id = add_entity(
-                        &mut graph,
-                        entity_kind,
-                    );
-                    add_edge(
-                        &mut graph,
-                        sidewalk_target.0,
-                        entity_id.0,
-                        WorldEdge::ContainsEntity,
-                    );
-                }
+                road_lanes.push(bundle.road_id);
+                pedestrian_places.extend(bundle.pedestrian_places);
             }
 
             let hub_district = city
@@ -573,118 +361,48 @@ impl World {
                     city_id: *city_id,
                     district_index: 0,
                 });
-            let concourse_id = add_place(
-                &mut graph,
-                *city_id,
-                hub_district,
-                PlaceKind::StationConcourse,
-                "A loud indoor concourse full of departure boards, kiosks, and hurried transfers."
-                    .to_string(),
-            );
-            pedestrian_places.push(concourse_id);
-
-            let platform_id = add_place(
-                &mut graph,
-                *city_id,
-                hub_district,
-                PlaceKind::StationPlatform,
-                "Open-air platforms and curbside bays where regional departures actually leave."
-                    .to_string(),
-            );
-            pedestrian_places.push(platform_id);
-            city_hubs.push(platform_id);
-
-            let station_link = TravelRoute {
-                kind: RouteKind::Stairwell,
-                walking_time: TimeDelta::from_seconds(rng.random_range(18..=45)),
-                transit_time: None,
-                driving_time: None,
-            };
-            add_edge(
-                &mut graph,
-                concourse_id.0,
-                platform_id.0,
-                WorldEdge::TravelRoute(station_link),
-            );
-            add_edge(
-                &mut graph,
-                platform_id.0,
-                concourse_id.0,
-                WorldEdge::TravelRoute(station_link),
-            );
+            let station = build_station_bundle(&mut graph, &mut rng, *city_id, hub_district);
+            pedestrian_places.push(station.concourse_id);
+            pedestrian_places.push(station.platform_id);
+            city_hubs.push(station.platform_id);
 
             for window in road_lanes.windows(2) {
-                let route = TravelRoute {
-                    kind: RouteKind::LocalRoad,
-                    walking_time: TimeDelta::from_seconds(rng.random_range(60..=180)),
-                    transit_time: None,
-                    driving_time: Some(TimeDelta::from_seconds(rng.random_range(20..=60))),
-                };
-                add_edge(
-                    &mut graph,
-                    window[0].0,
-                    window[1].0,
-                    WorldEdge::TravelRoute(route),
+                let route = random_timed_route(
+                    &mut rng,
+                    RouteKind::LocalRoad,
+                    (60, 180),
+                    None,
+                    Some((20, 60)),
                 );
-                add_edge(
-                    &mut graph,
-                    window[1].0,
-                    window[0].0,
-                    WorldEdge::TravelRoute(route),
-                );
+                add_bidirectional_route(&mut graph, window[0].0, window[1].0, route);
             }
             if road_lanes.len() > 2 {
                 let a = road_lanes[0];
                 let b = *road_lanes.last().unwrap();
-                let route = TravelRoute {
-                    kind: RouteKind::LocalRoad,
-                    walking_time: TimeDelta::from_seconds(rng.random_range(120..=360)),
-                    transit_time: Some(TimeDelta::from_seconds(rng.random_range(60..=180))),
-                    driving_time: Some(TimeDelta::from_seconds(rng.random_range(30..=120))),
-                };
-                add_edge(&mut graph, a.0, b.0, WorldEdge::TravelRoute(route));
-                add_edge(&mut graph, b.0, a.0, WorldEdge::TravelRoute(route));
+                let route = random_timed_route(
+                    &mut rng,
+                    RouteKind::LocalRoad,
+                    (120, 360),
+                    Some((60, 180)),
+                    Some((30, 120)),
+                );
+                add_bidirectional_route(&mut graph, a.0, b.0, route);
             }
 
             for window in pedestrian_places.windows(2) {
-                let route = TravelRoute {
-                    kind: RouteKind::SideStreet,
-                    walking_time: TimeDelta::from_seconds(rng.random_range(20..=90)),
-                    transit_time: None,
-                    driving_time: None,
-                };
-                add_edge(
-                    &mut graph,
-                    window[0].0,
-                    window[1].0,
-                    WorldEdge::TravelRoute(route),
-                );
-                add_edge(
-                    &mut graph,
-                    window[1].0,
-                    window[0].0,
-                    WorldEdge::TravelRoute(route),
-                );
+                let route =
+                    random_timed_route(&mut rng, RouteKind::SideStreet, (20, 90), None, None);
+                add_bidirectional_route(&mut graph, window[0].0, window[1].0, route);
             }
 
             if let Some(station_sidewalk) = pedestrian_places.first().copied() {
-                let station_access = TravelRoute {
-                    kind: RouteKind::Hallway,
-                    walking_time: TimeDelta::from_seconds(rng.random_range(20..=60)),
-                    transit_time: None,
-                    driving_time: None,
-                };
-                add_edge(
+                let station_access =
+                    random_timed_route(&mut rng, RouteKind::Hallway, (20, 60), None, None);
+                add_bidirectional_route(
                     &mut graph,
                     station_sidewalk.0,
-                    concourse_id.0,
-                    WorldEdge::TravelRoute(station_access),
-                );
-                add_edge(
-                    &mut graph,
-                    concourse_id.0,
-                    station_sidewalk.0,
-                    WorldEdge::TravelRoute(station_access),
+                    station.concourse_id.0,
+                    station_access,
                 );
             }
         }
@@ -692,30 +410,8 @@ impl World {
         for pos in 0..target_cities {
             let next = (pos + 1) % target_cities;
             let route = random_route(&mut rng, true);
-            add_edge(
-                &mut graph,
-                city_ids[pos].0,
-                city_ids[next].0,
-                WorldEdge::TravelRoute(route),
-            );
-            add_edge(
-                &mut graph,
-                city_ids[next].0,
-                city_ids[pos].0,
-                WorldEdge::TravelRoute(route),
-            );
-            add_edge(
-                &mut graph,
-                city_hubs[pos].0,
-                city_hubs[next].0,
-                WorldEdge::TravelRoute(route),
-            );
-            add_edge(
-                &mut graph,
-                city_hubs[next].0,
-                city_hubs[pos].0,
-                WorldEdge::TravelRoute(route),
-            );
+            add_bidirectional_route(&mut graph, city_ids[pos].0, city_ids[next].0, route);
+            add_bidirectional_route(&mut graph, city_hubs[pos].0, city_hubs[next].0, route);
         }
 
         for _ in 0..(target_cities / 2) {
@@ -725,80 +421,12 @@ impl World {
                 b = rng.random_range(0..target_cities);
             }
             let route = random_route(&mut rng, false);
-            add_edge(
-                &mut graph,
-                city_ids[a].0,
-                city_ids[b].0,
-                WorldEdge::TravelRoute(route),
-            );
-            add_edge(
-                &mut graph,
-                city_ids[b].0,
-                city_ids[a].0,
-                WorldEdge::TravelRoute(route),
-            );
-            add_edge(
-                &mut graph,
-                city_hubs[a].0,
-                city_hubs[b].0,
-                WorldEdge::TravelRoute(route),
-            );
-            add_edge(
-                &mut graph,
-                city_hubs[b].0,
-                city_hubs[a].0,
-                WorldEdge::TravelRoute(route),
-            );
+            add_bidirectional_route(&mut graph, city_ids[a].0, city_ids[b].0, route);
+            add_bidirectional_route(&mut graph, city_hubs[a].0, city_hubs[b].0, route);
         }
 
         for city_id in &city_ids {
-            let district_ids = Self::city_from_graph(&graph, *city_id)
-                .districts
-                .iter()
-                .map(|district| district.id)
-                .collect::<Vec<_>>();
-            let mut possible_places = Self::city_places_from_graph(&graph, *city_id)
-                .into_iter()
-                .filter(|place_id| {
-                    Self::place_from_graph(&graph, *place_id)
-                        .kind
-                        .supports_people()
-                })
-                .collect::<Vec<_>>();
-            if city_id.index() == 0 {
-                if let Some(lobby_id) = possible_places.iter().copied().find(|place_id| {
-                    matches!(
-                        Self::place_from_graph(&graph, *place_id).kind,
-                        PlaceKind::ApartmentLobby
-                    )
-                }) {
-                    possible_places.retain(|place_id| *place_id != lobby_id);
-                    possible_places.insert(0, lobby_id);
-                }
-            }
-            let npc_count = rng.random_range(3..=5);
-            for npc_offset in 0..npc_count {
-                let mut personality_traits = TraitTag::ALL
-                    .choose_multiple(&mut rng, 2)
-                    .copied()
-                    .collect::<Vec<_>>();
-                personality_traits.sort();
-                let index = graph.add_node(WorldNode::Npc(Npc {
-                    archetype: *NpcArchetype::ALL.choose(&mut rng).unwrap(),
-                    personality_traits,
-                    goal: *GoalTag::ALL.choose(&mut rng).unwrap(),
-                    occupation: *Occupation::ALL.choose(&mut rng).unwrap(),
-                    home_district: *district_ids.choose(&mut rng).unwrap(),
-                }));
-                let npc_id = NpcId(index);
-                add_edge(&mut graph, city_id.0, npc_id.0, WorldEdge::Resident);
-                if let Some(place_id) = possible_places
-                    .get(npc_offset % possible_places.len())
-                    .copied()
-                {
-                    add_edge(&mut graph, place_id.0, npc_id.0, WorldEdge::PresentAt);
-                }
-            }
+            spawn_city_npcs(&mut graph, &mut rng, *city_id);
         }
 
         Self { seed, graph }
@@ -993,21 +621,21 @@ pub fn place_name_from_parts(
         PlaceKind::BuildingInterior => format!(
             "{} {}",
             district_name,
-            PLACE_INTERIOR_KINDS[(mix_seed(seed, &[6, id.index() as u64]) as usize)
-                % PLACE_INTERIOR_KINDS.len()]
+            PLACE_INTERIOR_KINDS
+                [(mix_seed(seed, &[6, id.index() as u64]) as usize) % PLACE_INTERIOR_KINDS.len()]
         ),
         PlaceKind::ApartmentLobby => format!("{} Apartments Lobby", district_name),
         PlaceKind::ApartmentRoom => format!(
             "{} Apartments {}",
             district_name,
-            APARTMENT_ROOM_LABELS[(mix_seed(seed, &[7, id.index() as u64]) as usize)
-                % APARTMENT_ROOM_LABELS.len()]
+            APARTMENT_ROOM_LABELS
+                [(mix_seed(seed, &[7, id.index() as u64]) as usize) % APARTMENT_ROOM_LABELS.len()]
         ),
         PlaceKind::RoadLane => format!(
             "{} {}",
             district_name,
-            PLACE_STREET_KINDS[(mix_seed(seed, &[8, id.index() as u64]) as usize)
-                % PLACE_STREET_KINDS.len()]
+            PLACE_STREET_KINDS
+                [(mix_seed(seed, &[8, id.index() as u64]) as usize) % PLACE_STREET_KINDS.len()]
         ),
         PlaceKind::SidewalkLeft => format!("{} left sidewalk", district_name),
         PlaceKind::SidewalkRight => format!("{} right sidewalk", district_name),
@@ -1024,21 +652,19 @@ pub fn entity_name_from_parts(seed: WorldSeed, id: EntityId, kind: EntityKind) -
     match kind {
         EntityKind::Car => format!(
             "{} {}",
-            VEHICLE_PREFIXES[(mix_seed(seed, &[9, id.index() as u64]) as usize)
-                % VEHICLE_PREFIXES.len()],
-            VEHICLE_MODELS[((mix_seed(seed, &[9, id.index() as u64]) >> 16) as usize)
-                % VEHICLE_MODELS.len()]
+            VEHICLE_PREFIXES
+                [(mix_seed(seed, &[9, id.index() as u64]) as usize) % VEHICLE_PREFIXES.len()],
+            VEHICLE_MODELS
+                [((mix_seed(seed, &[9, id.index() as u64]) >> 16) as usize) % VEHICLE_MODELS.len()]
         ),
-        EntityKind::Gun => GUN_NAMES[(mix_seed(seed, &[10, id.index() as u64]) as usize)
-            % GUN_NAMES.len()]
+        EntityKind::Gun => GUN_NAMES
+            [(mix_seed(seed, &[10, id.index() as u64]) as usize) % GUN_NAMES.len()]
         .to_string(),
-        EntityKind::Knife => {
-            KNIFE_NAMES[(mix_seed(seed, &[11, id.index() as u64]) as usize)
-                % KNIFE_NAMES.len()]
-            .to_string()
-        }
-        EntityKind::Bag => BAG_NAMES[(mix_seed(seed, &[12, id.index() as u64]) as usize)
-            % BAG_NAMES.len()]
+        EntityKind::Knife => KNIFE_NAMES
+            [(mix_seed(seed, &[11, id.index() as u64]) as usize) % KNIFE_NAMES.len()]
+        .to_string(),
+        EntityKind::Bag => BAG_NAMES
+            [(mix_seed(seed, &[12, id.index() as u64]) as usize) % BAG_NAMES.len()]
         .to_string(),
     }
 }
@@ -1060,9 +686,296 @@ fn add_place(
     place_id
 }
 
+fn add_bidirectional_route(
+    graph: &mut WorldGraph,
+    from: petgraph::stable_graph::NodeIndex,
+    to: petgraph::stable_graph::NodeIndex,
+    route: TravelRoute,
+) {
+    add_edge(graph, from, to, WorldEdge::TravelRoute(route));
+    add_edge(graph, to, from, WorldEdge::TravelRoute(route));
+}
+
 fn add_entity(graph: &mut WorldGraph, kind: EntityKind) -> EntityId {
     let index = graph.add_node(WorldNode::Entity(Entity { kind }));
     EntityId(index)
+}
+
+fn add_entity_to_place(graph: &mut WorldGraph, place_id: PlaceId, kind: EntityKind) -> EntityId {
+    let entity_id = add_entity(graph, kind);
+    add_edge(graph, place_id.0, entity_id.0, WorldEdge::ContainsEntity);
+    entity_id
+}
+
+struct DistrictBundle {
+    road_id: PlaceId,
+    pedestrian_places: Vec<PlaceId>,
+}
+
+struct StationBundle {
+    concourse_id: PlaceId,
+    platform_id: PlaceId,
+}
+
+fn build_district_bundle(
+    graph: &mut WorldGraph,
+    rng: &mut ChaCha8Rng,
+    seed: WorldSeed,
+    city_id: CityId,
+    district_id: DistrictId,
+    is_starting_apartment_district: bool,
+    is_primary_district: bool,
+) -> DistrictBundle {
+    let district_name = district_id.name(seed);
+    let road_id = add_place(
+        graph,
+        city_id,
+        district_id,
+        PlaceKind::RoadLane,
+        format!(
+            "A vehicle lane in {} where deliveries, rideshares, and through-traffic stack up.",
+            district_name
+        ),
+    );
+    let left_sidewalk_id = add_place(
+        graph,
+        city_id,
+        district_id,
+        PlaceKind::SidewalkLeft,
+        format!(
+            "The left-side sidewalk in {} with storefront windows, signs, and steady foot traffic.",
+            district_name
+        ),
+    );
+    let right_sidewalk_id = add_place(
+        graph,
+        city_id,
+        district_id,
+        PlaceKind::SidewalkRight,
+        format!(
+            "The right-side sidewalk in {} where bus stops, benches, and curb cuts slow the flow.",
+            district_name
+        ),
+    );
+    add_bidirectional_route(
+        graph,
+        road_id.0,
+        left_sidewalk_id.0,
+        random_timed_route(rng, RouteKind::Crosswalk, (8, 20), None, None),
+    );
+    add_bidirectional_route(
+        graph,
+        road_id.0,
+        right_sidewalk_id.0,
+        random_timed_route(rng, RouteKind::Crosswalk, (8, 20), None, None),
+    );
+    add_bidirectional_route(
+        graph,
+        left_sidewalk_id.0,
+        right_sidewalk_id.0,
+        random_timed_route(rng, RouteKind::Crosswalk, (15, 35), None, None),
+    );
+
+    let building_id = add_place(
+        graph,
+        city_id,
+        district_id,
+        PlaceKind::BuildingInterior,
+        format!(
+            "An interior space in {} where people slow down, talk longer, and watch who comes through.",
+            district_name
+        ),
+    );
+    add_bidirectional_route(
+        graph,
+        left_sidewalk_id.0,
+        building_id.0,
+        random_timed_route(rng, RouteKind::Hallway, (8, 20), None, None),
+    );
+
+    let mut pedestrian_places = vec![left_sidewalk_id, right_sidewalk_id, building_id];
+    if is_starting_apartment_district {
+        pedestrian_places.extend(add_apartment_cluster(
+            graph,
+            rng,
+            city_id,
+            district_id,
+            left_sidewalk_id,
+            &district_name,
+        ));
+    }
+
+    if is_primary_district || rng.random_bool(0.55) {
+        add_entity_to_place(graph, road_id, EntityKind::Car);
+    }
+    if rng.random_bool(0.18) {
+        let entity_kind = if rng.random_bool(0.5) {
+            EntityKind::Knife
+        } else {
+            EntityKind::Bag
+        };
+        let sidewalk_target = if rng.random_bool(0.5) {
+            left_sidewalk_id
+        } else {
+            right_sidewalk_id
+        };
+        add_entity_to_place(graph, sidewalk_target, entity_kind);
+    }
+
+    DistrictBundle {
+        road_id,
+        pedestrian_places,
+    }
+}
+
+fn add_apartment_cluster(
+    graph: &mut WorldGraph,
+    rng: &mut ChaCha8Rng,
+    city_id: CityId,
+    district_id: DistrictId,
+    sidewalk_id: PlaceId,
+    district_name: &str,
+) -> Vec<PlaceId> {
+    let lobby_id = add_place(
+        graph,
+        city_id,
+        district_id,
+        PlaceKind::ApartmentLobby,
+        format!(
+            "A modest apartment lobby in {} with mailboxes, a buzzer panel, and scuffed tile from years of foot traffic.",
+            district_name
+        ),
+    );
+    add_bidirectional_route(
+        graph,
+        sidewalk_id.0,
+        lobby_id.0,
+        random_timed_route(rng, RouteKind::Hallway, (6, 14), None, None),
+    );
+
+    let mut places = vec![lobby_id];
+    for _room_number in ["1A", "1B", "2A", "2B"] {
+        let room_id = add_place(
+            graph,
+            city_id,
+            district_id,
+            PlaceKind::ApartmentRoom,
+            format!(
+                "A small apartment unit in {} with a narrow kitchen, thin walls, and just enough space to disappear for a while.",
+                district_name
+            ),
+        );
+        add_bidirectional_route(
+            graph,
+            lobby_id.0,
+            room_id.0,
+            random_timed_route(rng, RouteKind::Hallway, (4, 12), None, None),
+        );
+        places.push(room_id);
+    }
+    places
+}
+
+fn build_station_bundle(
+    graph: &mut WorldGraph,
+    rng: &mut ChaCha8Rng,
+    city_id: CityId,
+    district_id: DistrictId,
+) -> StationBundle {
+    let concourse_id = add_place(
+        graph,
+        city_id,
+        district_id,
+        PlaceKind::StationConcourse,
+        "A loud indoor concourse full of departure boards, kiosks, and hurried transfers."
+            .to_string(),
+    );
+    let platform_id = add_place(
+        graph,
+        city_id,
+        district_id,
+        PlaceKind::StationPlatform,
+        "Open-air platforms and curbside bays where regional departures actually leave."
+            .to_string(),
+    );
+    add_bidirectional_route(
+        graph,
+        concourse_id.0,
+        platform_id.0,
+        random_timed_route(rng, RouteKind::Stairwell, (18, 45), None, None),
+    );
+    StationBundle {
+        concourse_id,
+        platform_id,
+    }
+}
+
+fn spawn_city_npcs(graph: &mut WorldGraph, rng: &mut ChaCha8Rng, city_id: CityId) {
+    let district_ids = World::city_from_graph(graph, city_id)
+        .districts
+        .iter()
+        .map(|district| district.id)
+        .collect::<Vec<_>>();
+    let mut possible_places = World::city_places_from_graph(graph, city_id)
+        .into_iter()
+        .filter(|place_id| {
+            World::place_from_graph(graph, *place_id)
+                .kind
+                .supports_people()
+        })
+        .collect::<Vec<_>>();
+    if city_id.index() == 0 {
+        if let Some(lobby_id) = possible_places.iter().copied().find(|place_id| {
+            matches!(
+                World::place_from_graph(graph, *place_id).kind,
+                PlaceKind::ApartmentLobby
+            )
+        }) {
+            possible_places.retain(|place_id| *place_id != lobby_id);
+            possible_places.insert(0, lobby_id);
+        }
+    }
+
+    let npc_count = rng.random_range(3..=5);
+    for npc_offset in 0..npc_count {
+        let mut personality_traits = TraitTag::ALL
+            .choose_multiple(rng, 2)
+            .copied()
+            .collect::<Vec<_>>();
+        personality_traits.sort();
+        let index = graph.add_node(WorldNode::Npc(Npc {
+            archetype: *NpcArchetype::ALL.choose(rng).unwrap(),
+            personality_traits,
+            goal: *GoalTag::ALL.choose(rng).unwrap(),
+            occupation: *Occupation::ALL.choose(rng).unwrap(),
+            home_district: *district_ids.choose(rng).unwrap(),
+        }));
+        let npc_id = NpcId(index);
+        add_edge(graph, city_id.0, npc_id.0, WorldEdge::Resident);
+        if let Some(place_id) = possible_places
+            .get(npc_offset % possible_places.len())
+            .copied()
+        {
+            add_edge(graph, place_id.0, npc_id.0, WorldEdge::PresentAt);
+        }
+    }
+}
+
+fn random_timed_route(
+    rng: &mut ChaCha8Rng,
+    kind: RouteKind,
+    walking: (u32, u32),
+    transit: Option<(u32, u32)>,
+    driving: Option<(u32, u32)>,
+) -> TravelRoute {
+    TravelRoute {
+        kind,
+        walking_time: TimeDelta::from_seconds(rng.random_range(walking.0..=walking.1)),
+        transit_time: transit
+            .map(|(min, max)| TimeDelta::from_seconds(rng.random_range(min..=max))),
+        driving_time: driving
+            .map(|(min, max)| TimeDelta::from_seconds(rng.random_range(min..=max))),
+    }
 }
 
 fn mix_seed(seed: WorldSeed, parts: &[u64]) -> u64 {
@@ -1080,50 +993,32 @@ fn random_route(rng: &mut ChaCha8Rng, primary_link: bool) -> TravelRoute {
             TravelRoute {
                 kind: RouteKind::ArterialRoad,
                 walking_time: TimeDelta::from_seconds(rng.random_range(45 * 60..=80 * 60)),
-                transit_time: Some(TimeDelta::from_seconds(
-                    rng.random_range(18 * 60..=35 * 60),
-                )),
-                driving_time: Some(TimeDelta::from_seconds(
-                    rng.random_range(10 * 60..=22 * 60),
-                )),
+                transit_time: Some(TimeDelta::from_seconds(rng.random_range(18 * 60..=35 * 60))),
+                driving_time: Some(TimeDelta::from_seconds(rng.random_range(10 * 60..=22 * 60))),
             }
         } else {
             TravelRoute {
                 kind: RouteKind::Highway,
-                walking_time: TimeDelta::from_seconds(
-                    rng.random_range(2 * 60 * 60..=4 * 60 * 60),
-                ),
-                transit_time: Some(TimeDelta::from_seconds(
-                    rng.random_range(45 * 60..=95 * 60),
-                )),
-                driving_time: Some(TimeDelta::from_seconds(
-                    rng.random_range(30 * 60..=70 * 60),
-                )),
+                walking_time: TimeDelta::from_seconds(rng.random_range(2 * 60 * 60..=4 * 60 * 60)),
+                transit_time: Some(TimeDelta::from_seconds(rng.random_range(45 * 60..=95 * 60))),
+                driving_time: Some(TimeDelta::from_seconds(rng.random_range(30 * 60..=70 * 60))),
             }
         }
     } else if rng.random_bool(0.5) {
         TravelRoute {
             kind: RouteKind::Highway,
-            walking_time: TimeDelta::from_seconds(
-                rng.random_range(3 * 60 * 60..=6 * 60 * 60),
-            ),
+            walking_time: TimeDelta::from_seconds(rng.random_range(3 * 60 * 60..=6 * 60 * 60)),
             transit_time: Some(TimeDelta::from_seconds(
                 rng.random_range(60 * 60..=2 * 60 * 60),
             )),
-            driving_time: Some(TimeDelta::from_seconds(
-                rng.random_range(40 * 60..=90 * 60),
-            )),
+            driving_time: Some(TimeDelta::from_seconds(rng.random_range(40 * 60..=90 * 60))),
         }
     } else {
         TravelRoute {
             kind: RouteKind::ArterialRoad,
             walking_time: TimeDelta::from_seconds(rng.random_range(60 * 60..=2 * 60 * 60)),
-            transit_time: Some(TimeDelta::from_seconds(
-                rng.random_range(25 * 60..=50 * 60),
-            )),
-            driving_time: Some(TimeDelta::from_seconds(
-                rng.random_range(15 * 60..=35 * 60),
-            )),
+            transit_time: Some(TimeDelta::from_seconds(rng.random_range(25 * 60..=50 * 60))),
+            driving_time: Some(TimeDelta::from_seconds(rng.random_range(15 * 60..=35 * 60))),
         }
     }
 }
@@ -1176,14 +1071,13 @@ const CITY_SUFFIXES: [&str; 16] = [
     "gate", "harbor", "park", "field", "square", "junction",
 ];
 const NPC_FIRST_NAMES: [&str; 24] = [
-    "Ari", "Bryn", "Cato", "Dara", "Esme", "Finn", "Galen", "Hana", "Ivo", "Jora", "Kellan",
-    "Lio", "Mara", "Niko", "Orin", "Pia", "Quin", "Rhea", "Soren", "Talia", "Una", "Vero",
-    "Wren", "Yana",
+    "Ari", "Bryn", "Cato", "Dara", "Esme", "Finn", "Galen", "Hana", "Ivo", "Jora", "Kellan", "Lio",
+    "Mara", "Niko", "Orin", "Pia", "Quin", "Rhea", "Soren", "Talia", "Una", "Vero", "Wren", "Yana",
 ];
 const NPC_LAST_NAMES: [&str; 24] = [
     "Ashdown", "Briar", "Cask", "Dunfield", "Ember", "Farrow", "Gale", "Hearth", "Ives", "Jun",
-    "Keene", "Lark", "Morrow", "Nettle", "Orchard", "Pell", "Quarry", "Reeve", "Sable",
-    "Thorne", "Vale", "Wick", "Mercer", "Cross",
+    "Keene", "Lark", "Morrow", "Nettle", "Orchard", "Pell", "Quarry", "Reeve", "Sable", "Thorne",
+    "Vale", "Wick", "Mercer", "Cross",
 ];
 const PLACE_STREET_KINDS: [&str; 6] = [
     "main street",
@@ -1203,7 +1097,14 @@ const PLACE_INTERIOR_KINDS: [&str; 6] = [
 ];
 const APARTMENT_ROOM_LABELS: [&str; 6] = ["1A", "1B", "2A", "2B", "3A", "3B"];
 const VEHICLE_PREFIXES: [&str; 8] = [
-    "Ashcrest", "Northgate", "Moonline", "Harbor", "Juniper", "Raven", "Quartz", "Lowcross",
+    "Ashcrest",
+    "Northgate",
+    "Moonline",
+    "Harbor",
+    "Juniper",
+    "Raven",
+    "Quartz",
+    "Lowcross",
 ];
 const VEHICLE_MODELS: [&str; 5] = [
     "sedan",

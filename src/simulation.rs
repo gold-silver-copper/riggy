@@ -8,8 +8,8 @@ use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
 use crate::world::{
-    CityId, DistrictId, EntityId, EntityKind, LandmarkId, NpcId, PlaceId, PlaceKind,
-    TransportMode, World,
+    CityId, DistrictId, EntityId, EntityKind, LandmarkId, NpcId, PlaceId, PlaceKind, TransportMode,
+    World,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -132,9 +132,7 @@ pub fn build_npc_dialogue_context(
     let npc = world.npc(session.npc_id);
     Ok(NpcDialogueContext {
         world_seed: world.seed,
-        clock: DialogueClock {
-            current_time,
-        },
+        clock: DialogueClock { current_time },
         city: CityContext {
             id: city_id,
             biome: city.biome,
@@ -229,7 +227,10 @@ mod tests {
         assert_eq!(context.clock.label(), "Day 1 00:00:34");
         assert_eq!(context.city.id, city_id);
         assert_eq!(context.npc.id, npc_id);
-        assert_eq!(context.memory.summary, "The player kept their word once before.");
+        assert_eq!(
+            context.memory.summary,
+            "The player kept their word once before."
+        );
         assert!(
             !context.city.districts[0]
                 .id
