@@ -152,12 +152,12 @@ Work:
 
 - replace `UiSnapshot` with typed view structs
 - remove `known_info: Vec<String>`, `people: Vec<String>`, `things: Vec<String>`, and other display-oriented bags
-- add view types such as:
-  - `PlaceView`
+- add typed snapshot summaries such as:
+  - `PlaceSummary`
   - `RouteView`
   - `ActorView`
-  - `EntityView`
-  - `ContextFeedEntryView`
+  - `EntitySummary`
+  - `ContextEntry`
 - move all prose and label formatting into a new presenter module
 
 Deliverables:

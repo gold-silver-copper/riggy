@@ -6,10 +6,11 @@ use rig::completion::{Chat, Prompt};
 use rig::message::Message;
 use rig::providers::{ollama, openai};
 
-use crate::ai::context::{DialogueTranscriptSpeaker, NpcDialogueContext};
+use crate::ai::context::NpcDialogueContext;
 use crate::ai::prompting::build_dialogue_prompt;
+use crate::domain::events::{DialogueLine, DialogueSpeaker};
 use crate::domain::memory::ConversationMemory;
-use crate::simulation::{DialogueLine, DialogueSession, Speaker};
+use crate::simulation::DialogueSession;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogueResponse {
@@ -84,7 +85,7 @@ impl LlmBackend for MockBackend {
                 .city
                 .landmarks
                 .first()
-                .map(|landmark| landmark.id.name(context.world_seed))
+                .map(|landmark| landmark.name(context.world_seed))
                 .unwrap_or_else(|| "the transit station".to_string());
             lines.push(format!(
                 "\"I might have something for you if you're reliable. Check around {} and see whether anything looks out of place.\"",
@@ -195,8 +196,8 @@ impl RigBackend {
             .transcript
             .iter()
             .map(|line| match line.speaker {
-                DialogueTranscriptSpeaker::Player => Message::user(line.text.clone()),
-                DialogueTranscriptSpeaker::Npc | DialogueTranscriptSpeaker::System => {
+                DialogueSpeaker::Player => Message::user(line.text.clone()),
+                DialogueSpeaker::Npc(_) | DialogueSpeaker::System => {
                     Message::assistant(line.text.clone())
                 }
             })
@@ -283,9 +284,9 @@ impl LlmBackend for RigBackend {
 
 fn speaker_label(line: &DialogueLine) -> String {
     match line.speaker {
-        Speaker::Player => "You".to_string(),
-        Speaker::Npc(_) => "NPC".to_string(),
-        Speaker::System => "System".to_string(),
+        DialogueSpeaker::Player => "You".to_string(),
+        DialogueSpeaker::Npc(_) => "NPC".to_string(),
+        DialogueSpeaker::System => "System".to_string(),
     }
 }
 
@@ -320,10 +321,11 @@ fn fallback_conversation_memory(session: &DialogueSession, summary: String) -> C
 #[cfg(test)]
 mod tests {
     use crate::ai::context::build_npc_dialogue_context;
+    use crate::domain::events::{DialogueLine, DialogueSpeaker};
     use crate::domain::memory::ConversationMemory;
     use crate::domain::time::GameTime;
     use crate::llm::{LlmBackend, MockBackend, fallback_conversation_memory};
-    use crate::simulation::{DialogueLine, DialogueSession, NpcMemoryState, Speaker};
+    use crate::simulation::DialogueSession;
     use crate::world::World;
 
     #[tokio::test]
@@ -331,14 +333,13 @@ mod tests {
         let world = World::generate(crate::domain::seed::WorldSeed::new(2), 16);
         let city_id = world.city_ids()[0];
         let npc_id = world.city_npcs(city_id)[0];
-        let memory = NpcMemoryState {
-            memory: ConversationMemory::default(),
-        };
+        let memory = ConversationMemory::default();
         let session = DialogueSession {
             npc_id,
             started_at: GameTime::from_seconds(0),
             transcript: vec![DialogueLine {
-                speaker: Speaker::Player,
+                timestamp: GameTime::from_seconds(0),
+                speaker: DialogueSpeaker::Player,
                 text: "Hello".to_string(),
             }],
         };
@@ -361,10 +362,8 @@ mod tests {
         let world = World::generate(crate::domain::seed::WorldSeed::new(9), 16);
         let city_id = world.city_ids()[0];
         let npc_id = world.city_npcs(city_id)[0];
-        let memory = NpcMemoryState {
-            memory: ConversationMemory {
-                summary: "The player kept their word once before.".to_string(),
-            },
+        let memory = ConversationMemory {
+            summary: "The player kept their word once before.".to_string(),
         };
         let session = DialogueSession {
             npc_id,
@@ -387,7 +386,7 @@ mod tests {
         assert_eq!(context.city.id, city_id);
         assert!(!context.city.districts.is_empty());
         assert!(!context.city.connected_cities.is_empty());
-        assert_eq!(context.memory.summary, memory.memory.summary);
+        assert_eq!(context.memory.summary, memory.summary);
     }
 
     #[test]
@@ -398,11 +397,13 @@ mod tests {
             started_at: GameTime::from_seconds(0),
             transcript: vec![
                 DialogueLine {
-                    speaker: Speaker::Player,
+                    timestamp: GameTime::from_seconds(0),
+                    speaker: DialogueSpeaker::Player,
                     text: "tell me about work".to_string(),
                 },
                 DialogueLine {
-                    speaker: Speaker::Npc(npc_id),
+                    timestamp: GameTime::from_seconds(30),
+                    speaker: DialogueSpeaker::Npc(npc_id),
                     text: "I might have a job if you're reliable.".to_string(),
                 },
             ],

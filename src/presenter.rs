@@ -1,11 +1,12 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 
-use crate::domain::events::{GameEvent, SystemContext};
+use crate::domain::events::{
+    ContextEntry, DialogueSpeaker, EntitySummary, GameEvent, PlaceSummary, SystemContext,
+};
 use crate::domain::seed::WorldSeed;
 use crate::simulation::{
-    ContextFeedEntryView, DialogueSpeakerView, InteractableOption, InteractableSubjectView,
-    InteractionVerb, RouteView, UiSnapshot,
+    InteractableOption, InteractableSubjectView, InteractionVerb, RouteView, UiSnapshot,
 };
 use crate::world::{entity_name_from_parts, place_name_from_parts};
 
@@ -95,7 +96,7 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
                 .city
                 .districts
                 .iter()
-                .map(|district| district.id.name(snapshot.world_seed)),
+                .map(|district| district.name(snapshot.world_seed)),
             Color::Green,
             ", ",
         );
@@ -155,7 +156,7 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
                 .city
                 .landmarks
                 .iter()
-                .map(|landmark| landmark.id.name(snapshot.world_seed)),
+                .map(|landmark| landmark.name(snapshot.world_seed)),
             Color::Cyan,
             ", ",
         );
@@ -235,13 +236,13 @@ pub fn render_interactable_label(world_seed: WorldSeed, option: &InteractableOpt
 
 pub fn render_event_notice(world_seed: WorldSeed, event: &GameEvent) -> Option<String> {
     match event {
-        GameEvent::DialogueStarted { actor } => Some(format!(
+        GameEvent::DialogueStarted { npc_id } => Some(format!(
             "You approach {}. Type normally to speak, or press Esc to end the conversation.",
-            actor.id.name(world_seed)
+            npc_id.name(world_seed)
         )),
         GameEvent::DialogueLineRecorded { .. } => None,
-        GameEvent::DialogueEnded { actor } => {
-            Some(format!("You step away from {}.", actor.id.name(world_seed)))
+        GameEvent::DialogueEnded { npc_id } => {
+            Some(format!("You step away from {}.", npc_id.name(world_seed)))
         }
         GameEvent::TravelCompleted {
             destination,
@@ -290,7 +291,7 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
 
     for entry in &snapshot.context_feed {
         match entry {
-            ContextFeedEntryView::System { timestamp, context } => {
+            ContextEntry::System { timestamp, context } => {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
@@ -311,21 +312,17 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
                     ))),
                 ]));
             }
-            ContextFeedEntryView::Dialogue {
-                timestamp: _,
-                speaker,
-                text,
-            } => {
+            ContextEntry::Dialogue(line) => {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
-                        dialogue_speaker_label(snapshot.world_seed, speaker),
+                        dialogue_speaker_label(snapshot.world_seed, line.speaker),
                         Style::default()
-                            .fg(dialogue_speaker_color(speaker))
+                            .fg(dialogue_speaker_color(line.speaker))
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
-                    Span::raw(clean_inline_text(text)),
+                    Span::raw(clean_inline_text(&line.text)),
                 ]));
             }
         }
@@ -373,19 +370,19 @@ fn render_system_context(world_seed: WorldSeed, context: &SystemContext) -> Stri
     }
 }
 
-fn dialogue_speaker_label(world_seed: WorldSeed, speaker: &DialogueSpeakerView) -> String {
+fn dialogue_speaker_label(world_seed: WorldSeed, speaker: DialogueSpeaker) -> String {
     match speaker {
-        DialogueSpeakerView::Player => "You".to_string(),
-        DialogueSpeakerView::Npc(actor) => actor.id.name(world_seed),
-        DialogueSpeakerView::System => "System".to_string(),
+        DialogueSpeaker::Player => "You".to_string(),
+        DialogueSpeaker::Npc(npc_id) => npc_id.name(world_seed),
+        DialogueSpeaker::System => "System".to_string(),
     }
 }
 
-fn dialogue_speaker_color(speaker: &DialogueSpeakerView) -> Color {
+fn dialogue_speaker_color(speaker: DialogueSpeaker) -> Color {
     match speaker {
-        DialogueSpeakerView::Player => Color::Yellow,
-        DialogueSpeakerView::Npc(_) => Color::Magenta,
-        DialogueSpeakerView::System => Color::Cyan,
+        DialogueSpeaker::Player => Color::Yellow,
+        DialogueSpeaker::Npc(_) => Color::Magenta,
+        DialogueSpeaker::System => Color::Cyan,
     }
 }
 
@@ -421,11 +418,11 @@ fn push_list_section<I>(
     ]));
 }
 
-fn place_name(world_seed: WorldSeed, place: &crate::simulation::PlaceView) -> String {
+fn place_name(world_seed: WorldSeed, place: &PlaceSummary) -> String {
     place_name_from_parts(world_seed, place.id, place.district_id, place.kind)
 }
 
-fn entity_name(world_seed: WorldSeed, entity: &crate::simulation::EntityView) -> String {
+fn entity_name(world_seed: WorldSeed, entity: &EntitySummary) -> String {
     entity_name_from_parts(world_seed, entity.id, entity.kind)
 }
 
@@ -443,15 +440,16 @@ mod tests {
     use super::{
         build_world_text, render_event_notice, render_interactable_label, render_route_label,
     };
-    use crate::domain::events::{PlaceRef, SystemContext};
+    use crate::domain::events::{
+        ContextEntry, DialogueLine, DialogueSpeaker, EntitySummary, PlaceSummary, SystemContext,
+    };
     use crate::domain::seed::WorldSeed;
     use crate::domain::time::{GameTime, TimeDelta};
     use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
     use crate::graph_ecs::{EntityId, NpcId, PlaceId};
     use crate::simulation::{
-        ActorRefView, ActorView, CityView, ContextFeedEntryView, DialoguePartnerView,
-        DialogueSpeakerView, DistrictView, EntityView, InteractableOption, InteractionTarget,
-        InteractionVerb, LandmarkView, PlaceView, PlayerStatusView, RouteView, UiMode, UiSnapshot,
+        ActorView, CityView, DialoguePartnerView, InteractableOption, InteractionTarget,
+        InteractionVerb, PlayerStatusView, RouteView, UiMode, UiSnapshot,
     };
     use crate::world::{
         CityId, DistrictId, EntityKind, PlaceKind, RouteKind, TransportMode, TravelRoute,
@@ -529,7 +527,7 @@ mod tests {
         let travel_notice = render_event_notice(
             snapshot.world_seed,
             &crate::domain::events::GameEvent::TravelCompleted {
-                destination: PlaceRef {
+                destination: PlaceSummary {
                     id: snapshot.routes[0].destination.id,
                     district_id: snapshot.routes[0].destination.district_id,
                     kind: snapshot.routes[0].destination.kind,
@@ -563,7 +561,7 @@ mod tests {
             city_id,
             district_index: 1,
         };
-        let route_destination = PlaceView {
+        let route_destination = PlaceSummary {
             id: PlaceId(NodeIndex::new(2)),
             district_id: station_district,
             kind: PlaceKind::StationPlatform,
@@ -573,11 +571,11 @@ mod tests {
             occupation: Occupation::Journalist,
             archetype: NpcArchetype::Watcher,
         };
-        let car = EntityView {
+        let car = EntitySummary {
             id: EntityId(NodeIndex::new(4)),
             kind: EntityKind::Car,
         };
-        let bag = EntityView {
+        let bag = EntitySummary {
             id: EntityId(NodeIndex::new(5)),
             kind: EntityKind::Bag,
         };
@@ -595,22 +593,13 @@ mod tests {
                 biome: Biome::Coastal,
                 economy: Economy::Trade,
                 culture: Culture::CivicMinded,
-                districts: vec![
-                    DistrictView {
-                        id: market_district,
-                    },
-                    DistrictView {
-                        id: station_district,
-                    },
-                ],
-                landmarks: vec![LandmarkView {
-                    id: crate::world::LandmarkId {
-                        city_id,
-                        landmark_index: 0,
-                    },
+                districts: vec![market_district, station_district],
+                landmarks: vec![crate::world::LandmarkId {
+                    city_id,
+                    landmark_index: 0,
                 }],
             },
-            place: PlaceView {
+            place: PlaceSummary {
                 id: place_id,
                 district_id: market_district,
                 kind: PlaceKind::SidewalkLeft,
@@ -652,17 +641,15 @@ mod tests {
             nearby_cars: vec![car],
             nearby_entities: vec![bag],
             context_feed: vec![
-                ContextFeedEntryView::System {
+                ContextEntry::System {
                     timestamp: GameTime::from_seconds(28_800),
                     context: SystemContext::Start,
                 },
-                ContextFeedEntryView::Dialogue {
+                ContextEntry::Dialogue(DialogueLine {
                     timestamp: GameTime::from_seconds(28_830),
-                    speaker: DialogueSpeakerView::Npc(ActorRefView {
-                        id: NpcId(NodeIndex::new(3)),
-                    }),
+                    speaker: DialogueSpeaker::Npc(NpcId(NodeIndex::new(3))),
                     text: "You should start at the station before the crowds thicken.".to_string(),
-                },
+                }),
             ],
         }
     }

@@ -1,11 +1,9 @@
-use std::collections::BTreeMap;
-
 use crate::app::query::{current_transport_mode, current_vehicle_id, reachable_car_ids};
+use crate::domain::events::{EntitySummary, PlaceSummary};
 use crate::simulation::{
-    ActorRefView, ActorView, CityView, ContextEntryKind, ContextFeedEntryView, DialoguePartnerView,
-    DialogueSpeakerView, DistrictView, EntityView, GameState, InteractableOption,
-    InteractableSubjectView, InteractionTarget, InteractionVerb, LandmarkView, PlaceView,
-    PlayerStatusView, RouteView, Speaker, UiMode, UiSnapshot,
+    ActorView, CityView, DialoguePartnerView, GameState, InteractableOption,
+    InteractableSubjectView, InteractionTarget, InteractionVerb, PlayerStatusView, RouteView,
+    UiMode, UiSnapshot,
 };
 use crate::world::EntityKind;
 
@@ -14,10 +12,6 @@ const RECENT_CONTEXT_LIMIT: usize = 64;
 pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
     let city = state.world.city(state.player_city_id);
     let place = state.world.place(state.player_place_id);
-    let dialogue_npc = state
-        .active_dialogue
-        .as_ref()
-        .map(|session| state.world.npc(session.npc_id));
     let status = PlayerStatusView {
         clock: state.clock,
         transport_mode: current_transport_mode(state),
@@ -28,54 +22,45 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
         biome: city.biome,
         economy: city.economy,
         culture: city.culture,
-        districts: city
-            .districts
-            .iter()
-            .map(|district| DistrictView { id: district.id })
-            .collect(),
-        landmarks: city
-            .landmarks
-            .iter()
-            .map(|landmark| LandmarkView { id: landmark.id })
-            .collect(),
+        districts: city.districts.iter().map(|district| district.id).collect(),
+        landmarks: city.landmarks.iter().map(|landmark| landmark.id).collect(),
     };
-    let place_view = PlaceView {
+    let place_view = PlaceSummary {
         id: state.player_place_id,
         district_id: place.district_id,
         kind: place.kind,
     };
-    let dialogue_partner = dialogue_npc.map(|npc| {
-        let npc_id = state
-            .active_dialogue
-            .as_ref()
-            .map(|session| session.npc_id)
-            .expect("dialogue partner should have active dialogue");
-        let memory = state.npc_memories.get(&npc_id);
+    let dialogue_partner = state.active_dialogue.as_ref().map(|session| {
+        let npc_id = session.npc_id;
+        let npc = state.world.npc(npc_id);
         DialoguePartnerView {
             actor: ActorView {
                 id: npc_id,
                 occupation: npc.occupation,
                 archetype: npc.archetype,
             },
-            memory: memory
-                .and_then(|entry| (!entry.memory.is_empty()).then(|| entry.memory.clone())),
+            memory: state
+                .npc_memories
+                .get(&npc_id)
+                .filter(|memory| !memory.is_empty())
+                .cloned(),
         }
     });
+    let transport_mode = current_transport_mode(state);
     let routes = state
         .world
         .place_routes(state.player_place_id)
         .iter()
         .map(|(place_id, route)| {
             let target = state.world.place(*place_id);
-            let travel_time = route.travel_time(current_transport_mode(state));
             RouteView {
-                destination: PlaceView {
+                destination: PlaceSummary {
                     id: *place_id,
                     district_id: target.district_id,
                     kind: target.kind,
                 },
                 route: *route,
-                travel_time,
+                travel_time: route.travel_time(transport_mode),
             }
         })
         .collect::<Vec<_>>();
@@ -92,58 +77,16 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
             }
         })
         .collect::<Vec<_>>();
-    let nearby_actors_by_id = nearby_actors
-        .iter()
-        .cloned()
-        .map(|actor| (actor.id, actor))
-        .collect::<BTreeMap<_, _>>();
     let nearby_cars = reachable_car_ids(state)
-        .iter()
+        .into_iter()
         .map(|entity_id| {
-            let entity = state.world.entity(*entity_id);
-            EntityView {
-                id: *entity_id,
+            let entity = state.world.entity(entity_id);
+            EntitySummary {
+                id: entity_id,
                 kind: entity.kind,
             }
         })
         .collect::<Vec<_>>();
-    let nearby_cars_by_id = nearby_cars
-        .iter()
-        .cloned()
-        .map(|entity| (entity.id, entity))
-        .collect::<BTreeMap<_, _>>();
-    let mut interactables = state
-        .world
-        .place_npcs(state.player_place_id)
-        .iter()
-        .map(|npc_id| InteractableOption {
-            target: InteractionTarget::Npc(*npc_id),
-            verb: InteractionVerb::Talk,
-            subject: InteractableSubjectView::Actor(
-                nearby_actors_by_id
-                    .get(npc_id)
-                    .cloned()
-                    .expect("nearby actor should exist for interactable npc"),
-            ),
-        })
-        .collect::<Vec<_>>();
-    interactables.extend(reachable_car_ids(state).into_iter().map(|entity_id| {
-        let is_current_car = current_vehicle_id(state) == Some(entity_id);
-        InteractableOption {
-            target: InteractionTarget::Entity(entity_id),
-            verb: if is_current_car {
-                InteractionVerb::ExitVehicle
-            } else {
-                InteractionVerb::EnterVehicle
-            },
-            subject: InteractableSubjectView::Entity(
-                nearby_cars_by_id
-                    .get(&entity_id)
-                    .cloned()
-                    .expect("nearby car should exist for interactable entity"),
-            ),
-        }
-    }));
     let nearby_entities = state
         .world
         .place_entities(state.player_place_id)
@@ -151,50 +94,52 @@ pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
         .filter(|entity_id| !matches!(state.world.entity(*entity_id).kind, EntityKind::Car))
         .map(|entity_id| {
             let entity = state.world.entity(entity_id);
-            EntityView {
+            EntitySummary {
                 id: entity_id,
                 kind: entity.kind,
             }
         })
         .collect::<Vec<_>>();
-    let nearby_entities_by_id = nearby_entities
+    let mut interactables = nearby_actors
         .iter()
         .cloned()
-        .map(|entity| (entity.id, entity))
-        .collect::<BTreeMap<_, _>>();
-    interactables.extend(nearby_entities_by_id.keys().copied().map(|entity_id| {
-        InteractableOption {
-            target: InteractionTarget::Entity(entity_id),
-            verb: InteractionVerb::Inspect,
-            subject: InteractableSubjectView::Entity(
-                nearby_entities_by_id
-                    .get(&entity_id)
-                    .cloned()
-                    .expect("nearby entity should exist for interactable entity"),
-            ),
-        }
-    }));
+        .map(|actor| InteractableOption {
+            target: InteractionTarget::Npc(actor.id),
+            verb: InteractionVerb::Talk,
+            subject: InteractableSubjectView::Actor(actor),
+        })
+        .collect::<Vec<_>>();
+    interactables.extend(
+        nearby_cars
+            .iter()
+            .copied()
+            .map(|entity| InteractableOption {
+                target: InteractionTarget::Entity(entity.id),
+                verb: if current_vehicle_id(state) == Some(entity.id) {
+                    InteractionVerb::ExitVehicle
+                } else {
+                    InteractionVerb::EnterVehicle
+                },
+                subject: InteractableSubjectView::Entity(entity),
+            }),
+    );
+    interactables.extend(
+        nearby_entities
+            .iter()
+            .copied()
+            .map(|entity| InteractableOption {
+                target: InteractionTarget::Entity(entity.id),
+                verb: InteractionVerb::Inspect,
+                subject: InteractableSubjectView::Entity(entity),
+            }),
+    );
     let context_feed = state
         .context_feed
         .iter()
         .rev()
         .take(RECENT_CONTEXT_LIMIT)
         .rev()
-        .map(|entry| match &entry.kind {
-            ContextEntryKind::System(context) => ContextFeedEntryView::System {
-                timestamp: entry.timestamp,
-                context: context.clone(),
-            },
-            ContextEntryKind::Dialogue { speaker, text } => ContextFeedEntryView::Dialogue {
-                timestamp: entry.timestamp,
-                speaker: match speaker {
-                    Speaker::Player => DialogueSpeakerView::Player,
-                    Speaker::Npc(npc_id) => DialogueSpeakerView::Npc(ActorRefView { id: *npc_id }),
-                    Speaker::System => DialogueSpeakerView::System,
-                },
-                text: text.clone(),
-            },
-        })
+        .cloned()
         .collect();
 
     UiSnapshot {

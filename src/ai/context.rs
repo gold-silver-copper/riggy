@@ -1,31 +1,22 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::domain::events::DialogueLine;
+use crate::domain::memory::ConversationMemory;
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::GameTime;
 use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
-use crate::simulation::{DialogueSession, NpcMemoryState, Speaker};
+use crate::simulation::DialogueSession;
 use crate::world::{CityId, DistrictId, LandmarkId, NpcId, World};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NpcDialogueContext {
     pub world_seed: WorldSeed,
-    pub clock: DialogueClock,
+    pub current_time: GameTime,
     pub city: CityContext,
     pub npc: NpcContext,
-    pub memory: ConversationMemoryView,
+    pub memory: ConversationMemory,
     pub turn: DialogueTurnContext,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DialogueClock {
-    pub current_time: GameTime,
-}
-
-impl DialogueClock {
-    pub fn label(&self) -> String {
-        self.current_time.format()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,30 +25,15 @@ pub struct CityContext {
     pub biome: Biome,
     pub economy: Economy,
     pub culture: Culture,
-    pub districts: Vec<DistrictContext>,
-    pub landmarks: Vec<LandmarkContext>,
-    pub connected_cities: Vec<ConnectedCityContext>,
+    pub districts: Vec<DistrictId>,
+    pub landmarks: Vec<LandmarkId>,
+    pub connected_cities: Vec<CityId>,
 }
 
 impl CityContext {
     pub fn name(&self, world_seed: WorldSeed) -> String {
         self.id.name(world_seed)
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DistrictContext {
-    pub id: DistrictId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LandmarkContext {
-    pub id: LandmarkId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConnectedCityContext {
-    pub id: CityId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -70,12 +46,6 @@ pub struct NpcContext {
     pub home_district: DistrictId,
 }
 
-impl ConnectedCityContext {
-    pub fn name(&self, world_seed: WorldSeed) -> String {
-        self.id.name(world_seed)
-    }
-}
-
 impl NpcContext {
     pub fn name(&self, world_seed: WorldSeed) -> String {
         self.id.name(world_seed)
@@ -86,35 +56,17 @@ impl NpcContext {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct ConversationMemoryView {
-    pub summary: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DialogueTurnContext {
-    pub transcript: Vec<DialogueTranscriptLine>,
+    pub transcript: Vec<DialogueLine>,
     pub player_input: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DialogueTranscriptLine {
-    pub speaker: DialogueTranscriptSpeaker,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum DialogueTranscriptSpeaker {
-    Player,
-    Npc,
-    System,
 }
 
 pub fn build_npc_dialogue_context(
     world: &World,
     current_time: GameTime,
     city_id: CityId,
-    memory: &NpcMemoryState,
+    memory: &ConversationMemory,
     session: &DialogueSession,
     player_input: String,
 ) -> Result<NpcDialogueContext> {
@@ -132,29 +84,15 @@ pub fn build_npc_dialogue_context(
     let npc = world.npc(session.npc_id);
     Ok(NpcDialogueContext {
         world_seed: world.seed,
-        clock: DialogueClock { current_time },
+        current_time,
         city: CityContext {
             id: city_id,
             biome: city.biome,
             economy: city.economy,
             culture: city.culture,
-            districts: city
-                .districts
-                .iter()
-                .map(|district| DistrictContext { id: district.id })
-                .collect(),
-            landmarks: city
-                .landmarks
-                .iter()
-                .map(|landmark| LandmarkContext { id: landmark.id })
-                .collect(),
-            connected_cities: world
-                .city_connections(city_id)
-                .iter()
-                .map(|connected_city_id| ConnectedCityContext {
-                    id: *connected_city_id,
-                })
-                .collect(),
+            districts: city.districts.iter().map(|district| district.id).collect(),
+            landmarks: city.landmarks.iter().map(|landmark| landmark.id).collect(),
+            connected_cities: world.city_connections(city_id),
         },
         npc: NpcContext {
             id: session.npc_id,
@@ -164,22 +102,9 @@ pub fn build_npc_dialogue_context(
             goal: npc.goal,
             home_district: npc.home_district,
         },
-        memory: ConversationMemoryView {
-            summary: memory.memory.summary.clone(),
-        },
+        memory: memory.clone(),
         turn: DialogueTurnContext {
-            transcript: session
-                .transcript
-                .iter()
-                .map(|line| DialogueTranscriptLine {
-                    speaker: match line.speaker {
-                        Speaker::Player => DialogueTranscriptSpeaker::Player,
-                        Speaker::Npc(_) => DialogueTranscriptSpeaker::Npc,
-                        Speaker::System => DialogueTranscriptSpeaker::System,
-                    },
-                    text: line.text.clone(),
-                })
-                .collect(),
+            transcript: session.transcript.clone(),
             player_input,
         },
     })
@@ -187,28 +112,28 @@ pub fn build_npc_dialogue_context(
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::events::{DialogueLine, DialogueSpeaker};
     use crate::domain::memory::ConversationMemory;
     use crate::domain::time::GameTime;
-    use crate::simulation::{DialogueLine, DialogueSession, NpcMemoryState, Speaker};
+    use crate::simulation::DialogueSession;
     use crate::world::World;
 
-    use super::{DialogueTranscriptSpeaker, build_npc_dialogue_context};
+    use super::build_npc_dialogue_context;
 
     #[test]
     fn builder_creates_context_from_world_state() {
         let world = World::generate(crate::domain::seed::WorldSeed::new(9), 16);
         let city_id = world.city_ids()[0];
         let npc_id = world.city_npcs(city_id)[0];
-        let memory = NpcMemoryState {
-            memory: ConversationMemory {
-                summary: "The player kept their word once before.".to_string(),
-            },
+        let memory = ConversationMemory {
+            summary: "The player kept their word once before.".to_string(),
         };
         let session = DialogueSession {
             npc_id,
             started_at: GameTime::from_seconds(4),
             transcript: vec![DialogueLine {
-                speaker: Speaker::Player,
+                timestamp: GameTime::from_seconds(4),
+                speaker: DialogueSpeaker::Player,
                 text: "hello".to_string(),
             }],
         };
@@ -223,8 +148,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(context.clock.current_time, GameTime::from_seconds(34));
-        assert_eq!(context.clock.label(), "Day 1 00:00:34");
+        assert_eq!(context.current_time, GameTime::from_seconds(34));
+        assert_eq!(context.current_time.format(), "Day 1 00:00:34");
         assert_eq!(context.city.id, city_id);
         assert_eq!(context.npc.id, npc_id);
         assert_eq!(
@@ -233,13 +158,11 @@ mod tests {
         );
         assert!(
             !context.city.districts[0]
-                .id
                 .description(context.world_seed)
                 .is_empty()
         );
         assert!(
             !context.city.landmarks[0]
-                .id
                 .name(context.world_seed)
                 .is_empty()
         );
@@ -247,10 +170,7 @@ mod tests {
         assert_eq!(context.turn.player_input, "What is this city like?");
         assert!(!context.city.connected_cities.is_empty());
         assert_eq!(context.turn.transcript.len(), 1);
-        assert_eq!(
-            context.turn.transcript[0].speaker,
-            DialogueTranscriptSpeaker::Player
-        );
+        assert_eq!(context.turn.transcript[0].speaker, DialogueSpeaker::Player);
     }
 
     #[test]
@@ -263,9 +183,7 @@ mod tests {
             .find(|candidate| *candidate != city_id)
             .expect("world should contain at least two cities");
         let npc_id = world.city_npcs(city_id)[0];
-        let memory = NpcMemoryState {
-            memory: ConversationMemory::default(),
-        };
+        let memory = ConversationMemory::default();
         let session = DialogueSession {
             npc_id,
             started_at: GameTime::from_seconds(0),

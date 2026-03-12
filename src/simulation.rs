@@ -2,26 +2,23 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::events::SystemContext;
+use crate::domain::events::{ContextEntry, DialogueLine, EntitySummary, PlaceSummary};
 use crate::domain::memory::ConversationMemory;
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
-use crate::world::{
-    CityId, DistrictId, EntityId, EntityKind, LandmarkId, NpcId, PlaceId, PlaceKind, TransportMode,
-    World,
-};
+use crate::world::{CityId, DistrictId, EntityId, LandmarkId, NpcId, TransportMode, World};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameState {
     pub world: World,
     pub clock: GameTime,
     pub player_city_id: CityId,
-    pub player_place_id: PlaceId,
+    pub player_place_id: crate::world::PlaceId,
     pub occupancy: OccupancyState,
     pub known_city_ids: Vec<CityId>,
     #[serde(default)]
-    pub npc_memories: BTreeMap<NpcId, NpcMemoryState>,
+    pub npc_memories: BTreeMap<NpcId, ConversationMemory>,
     #[serde(default)]
     pub context_feed: Vec<ContextEntry>,
     pub active_dialogue: Option<DialogueSession>,
@@ -33,42 +30,11 @@ pub enum OccupancyState {
     InVehicle(EntityId),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct NpcMemoryState {
-    #[serde(default)]
-    pub memory: ConversationMemory,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContextEntry {
-    pub timestamp: GameTime,
-    pub kind: ContextEntryKind,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ContextEntryKind {
-    System(SystemContext),
-    Dialogue { speaker: Speaker, text: String },
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DialogueSession {
     pub npc_id: NpcId,
     pub started_at: GameTime,
     pub transcript: Vec<DialogueLine>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DialogueLine {
-    pub speaker: Speaker,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum Speaker {
-    Player,
-    Npc(NpcId),
-    System,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,19 +43,19 @@ pub struct UiSnapshot {
     pub mode: UiMode,
     pub status: PlayerStatusView,
     pub city: CityView,
-    pub place: PlaceView,
+    pub place: PlaceSummary,
     pub dialogue_partner: Option<DialoguePartnerView>,
     pub routes: Vec<RouteView>,
     pub interactables: Vec<InteractableOption>,
     pub nearby_actors: Vec<ActorView>,
-    pub nearby_cars: Vec<EntityView>,
-    pub nearby_entities: Vec<EntityView>,
-    pub context_feed: Vec<ContextFeedEntryView>,
+    pub nearby_cars: Vec<EntitySummary>,
+    pub nearby_entities: Vec<EntitySummary>,
+    pub context_feed: Vec<ContextEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteView {
-    pub destination: PlaceView,
+    pub destination: PlaceSummary,
     pub route: crate::world::TravelRoute,
     pub travel_time: Option<TimeDelta>,
 }
@@ -114,25 +80,8 @@ pub struct CityView {
     pub biome: Biome,
     pub economy: Economy,
     pub culture: Culture,
-    pub districts: Vec<DistrictView>,
-    pub landmarks: Vec<LandmarkView>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DistrictView {
-    pub id: DistrictId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LandmarkView {
-    pub id: LandmarkId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaceView {
-    pub id: PlaceId,
-    pub district_id: DistrictId,
-    pub kind: PlaceKind,
+    pub districts: Vec<DistrictId>,
+    pub landmarks: Vec<LandmarkId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,40 +98,9 @@ pub struct ActorView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActorRefView {
-    pub id: NpcId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InteractableSubjectView {
     Actor(ActorView),
-    Entity(EntityView),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EntityView {
-    pub id: EntityId,
-    pub kind: EntityKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ContextFeedEntryView {
-    System {
-        timestamp: GameTime,
-        context: SystemContext,
-    },
-    Dialogue {
-        timestamp: GameTime,
-        speaker: DialogueSpeakerView,
-        text: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DialogueSpeakerView {
-    Player,
-    Npc(ActorRefView),
-    System,
+    Entity(EntitySummary),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

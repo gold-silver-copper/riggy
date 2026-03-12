@@ -14,88 +14,79 @@ pub struct CommandResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameEvent {
     DialogueStarted {
-        actor: NpcRef,
+        npc_id: NpcId,
     },
     DialogueLineRecorded {
-        line: DialogueEventLine,
+        line: DialogueLine,
     },
     DialogueEnded {
-        actor: NpcRef,
+        npc_id: NpcId,
     },
     TravelCompleted {
-        destination: PlaceRef,
+        destination: PlaceSummary,
         transport_mode: TransportMode,
         route: TravelRoute,
         duration: TimeDelta,
     },
     VehicleEntered {
-        entity: EntityRef,
+        entity: EntitySummary,
     },
     VehicleExited {
-        entity: EntityRef,
+        entity: EntitySummary,
     },
     EntityInspected {
-        entity: EntityRef,
+        entity: EntitySummary,
     },
     WaitCompleted {
         duration: TimeDelta,
         current_time: GameTime,
     },
     ContextAppended {
-        entry: ContextEvent,
+        entry: ContextEntry,
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NpcRef {
-    pub id: NpcId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlaceRef {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceSummary {
     pub id: PlaceId,
     pub district_id: DistrictId,
     pub kind: PlaceKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EntityRef {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntitySummary {
     pub id: EntityId,
     pub kind: EntityKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DialogueEventLine {
+pub struct DialogueLine {
     pub timestamp: GameTime,
-    pub speaker: DialogueSpeakerRef,
+    pub speaker: DialogueSpeaker,
     pub text: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DialogueSpeakerRef {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DialogueSpeaker {
     Player,
-    Npc(NpcRef),
+    Npc(NpcId),
     System,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ContextEvent {
+pub enum ContextEntry {
     System {
         timestamp: GameTime,
         context: SystemContext,
     },
-    Dialogue {
-        timestamp: GameTime,
-        speaker: DialogueSpeakerRef,
-        text: String,
-    },
+    Dialogue(DialogueLine),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SystemContext {
     Start,
     Travel {
-        destination: PlaceRef,
+        destination: PlaceSummary,
         transport_mode: TransportMode,
         duration: TimeDelta,
     },

@@ -9,16 +9,14 @@ use crate::app::query::{current_transport_mode, current_vehicle_id, reachable_ca
 use crate::app::read_model::build_ui_snapshot;
 use crate::domain::commands::GameCommand;
 use crate::domain::events::{
-    CommandResult, ContextEvent, DialogueEventLine, DialogueSpeakerRef, EntityRef, GameEvent,
-    NpcRef, PlaceRef, SystemContext,
+    CommandResult, ContextEntry, DialogueLine, DialogueSpeaker, EntitySummary, GameEvent,
+    PlaceSummary, SystemContext,
 };
+use crate::domain::memory::ConversationMemory;
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::llm::LlmBackend;
-use crate::simulation::{
-    ContextEntry, ContextEntryKind, DialogueLine, DialogueSession, GameState, NpcMemoryState,
-    OccupancyState, Speaker, UiSnapshot,
-};
+use crate::simulation::{DialogueSession, GameState, OccupancyState, UiSnapshot};
 use crate::world::{EntityId, NpcId, PlaceId, PlaceKind, TransportMode, World};
 
 const START_TIME: GameTime = GameTime::from_seconds(8 * 60 * 60);
@@ -79,9 +77,9 @@ impl<B: LlmBackend> GameService<B> {
                 occupancy: OccupancyState::OnFoot,
                 known_city_ids,
                 npc_memories: BTreeMap::new(),
-                context_feed: vec![ContextEntry {
+                context_feed: vec![ContextEntry::System {
                     timestamp: START_TIME,
-                    kind: ContextEntryKind::System(SystemContext::Start),
+                    context: SystemContext::Start,
                 }],
                 active_dialogue: None,
             },
@@ -137,7 +135,7 @@ impl<B: LlmBackend> GameService<B> {
         if self.state.active_dialogue.is_none() {
             bail!("You are not talking to anyone right now.");
         }
-        let mut events = self.record_dialogue_line(Speaker::Player, trimmed.to_string());
+        let mut events = self.record_dialogue_line(DialogueSpeaker::Player, trimmed.to_string());
 
         let session_snapshot = self
             .state
@@ -158,7 +156,7 @@ impl<B: LlmBackend> GameService<B> {
         let response = self.backend.generate_dialogue(&context).await?;
         let text = response.text;
 
-        events.extend(self.record_dialogue_line(Speaker::Npc(npc_id), text));
+        events.extend(self.record_dialogue_line(DialogueSpeaker::Npc(npc_id), text));
         self.advance_time(DIALOGUE_TIME);
         Ok(events)
     }
@@ -189,11 +187,11 @@ impl<B: LlmBackend> GameService<B> {
         self.move_player_to(resolved_destination_id);
         self.advance_time(travel_time);
         self.learn_city(self.state.player_city_id);
-        let destination = self.place_ref(resolved_destination_id);
+        let destination = self.place_summary(resolved_destination_id);
         let context_event = self.push_system_context(
             self.state.clock,
             SystemContext::Travel {
-                destination: destination.clone(),
+                destination,
                 transport_mode,
                 duration: travel_time,
             },
@@ -227,10 +225,8 @@ impl<B: LlmBackend> GameService<B> {
             "What do you want to know about {}?",
             self.state.world.city_name(self.state.player_city_id)
         );
-        let mut events = vec![GameEvent::DialogueStarted {
-            actor: self.npc_ref(npc_id),
-        }];
-        events.extend(self.record_dialogue_line(Speaker::Npc(npc_id), opening_text));
+        let mut events = vec![GameEvent::DialogueStarted { npc_id }];
+        events.extend(self.record_dialogue_line(DialogueSpeaker::Npc(npc_id), opening_text));
         Ok(events)
     }
 
@@ -280,7 +276,7 @@ impl<B: LlmBackend> GameService<B> {
             bail!("That entity is no longer here.");
         }
         Ok(GameEvent::EntityInspected {
-            entity: self.entity_ref(entity_id),
+            entity: self.entity_summary(entity_id),
         })
     }
 
@@ -300,52 +296,14 @@ impl<B: LlmBackend> GameService<B> {
         let npc_id = session.npc_id;
         let summary = self.backend.summarize_memory(&session).await?;
         self.state.active_dialogue.take();
-        self.npc_memory_mut(npc_id).memory.merge_update(summary);
-        Ok(GameEvent::DialogueEnded {
-            actor: self.npc_ref(npc_id),
-        })
+        self.npc_memory_mut(npc_id).merge_update(summary);
+        Ok(GameEvent::DialogueEnded { npc_id })
     }
 
     fn push_system_context(&mut self, timestamp: GameTime, context: SystemContext) -> GameEvent {
-        self.state.context_feed.push(ContextEntry {
-            timestamp,
-            kind: ContextEntryKind::System(context.clone()),
-        });
-        GameEvent::ContextAppended {
-            entry: ContextEvent::System { timestamp, context },
-        }
-    }
-
-    fn push_dialogue_context(
-        &mut self,
-        speaker: Speaker,
-        text: String,
-        timestamp: GameTime,
-    ) -> Vec<GameEvent> {
-        self.state.context_feed.push(ContextEntry {
-            timestamp,
-            kind: ContextEntryKind::Dialogue {
-                speaker: speaker.clone(),
-                text: text.clone(),
-            },
-        });
-        let speaker_ref = self.dialogue_speaker_ref(&speaker);
-        vec![
-            GameEvent::DialogueLineRecorded {
-                line: DialogueEventLine {
-                    timestamp,
-                    speaker: speaker_ref.clone(),
-                    text: text.clone(),
-                },
-            },
-            GameEvent::ContextAppended {
-                entry: ContextEvent::Dialogue {
-                    timestamp,
-                    speaker: speaker_ref,
-                    text,
-                },
-            },
-        ]
+        let entry = ContextEntry::System { timestamp, context };
+        self.state.context_feed.push(entry.clone());
+        GameEvent::ContextAppended { entry }
     }
 
     fn move_player_to(&mut self, place_id: PlaceId) {
@@ -360,21 +318,28 @@ impl<B: LlmBackend> GameService<B> {
         }
     }
 
-    fn record_dialogue_line(&mut self, speaker: Speaker, text: String) -> Vec<GameEvent> {
+    fn record_dialogue_line(&mut self, speaker: DialogueSpeaker, text: String) -> Vec<GameEvent> {
+        let line = DialogueLine {
+            timestamp: self.state.clock,
+            speaker,
+            text,
+        };
         self.state
             .active_dialogue
             .as_mut()
             .expect("dialogue should be active while recording a line")
             .transcript
-            .push(DialogueLine {
-                speaker: speaker.clone(),
-                text: text.clone(),
-            });
-        self.push_dialogue_context(speaker, text, self.state.clock)
+            .push(line.clone());
+        let entry = ContextEntry::Dialogue(line.clone());
+        self.state.context_feed.push(entry.clone());
+        vec![
+            GameEvent::DialogueLineRecorded { line },
+            GameEvent::ContextAppended { entry },
+        ]
     }
 
     fn vehicle_event(&self, entity_id: EntityId, entered: bool) -> GameEvent {
-        let entity = self.entity_ref(entity_id);
+        let entity = self.entity_summary(entity_id);
         if entered {
             GameEvent::VehicleEntered { entity }
         } else {
@@ -395,14 +360,14 @@ impl<B: LlmBackend> GameService<B> {
         self.state.known_city_ids.dedup();
     }
 
-    fn npc_memory(&self, npc_id: NpcId) -> &NpcMemoryState {
+    fn npc_memory(&self, npc_id: NpcId) -> &ConversationMemory {
         self.state
             .npc_memories
             .get(&npc_id)
-            .unwrap_or(&DEFAULT_NPC_MEMORY)
+            .unwrap_or(&DEFAULT_CONVERSATION_MEMORY)
     }
 
-    fn npc_memory_mut(&mut self, npc_id: NpcId) -> &mut NpcMemoryState {
+    fn npc_memory_mut(&mut self, npc_id: NpcId) -> &mut ConversationMemory {
         self.state.npc_memories.entry(npc_id).or_default()
     }
 
@@ -410,32 +375,20 @@ impl<B: LlmBackend> GameService<B> {
         self.state.world.place(self.state.player_place_id)
     }
 
-    fn npc_ref(&self, npc_id: NpcId) -> NpcRef {
-        NpcRef { id: npc_id }
-    }
-
-    fn place_ref(&self, place_id: PlaceId) -> PlaceRef {
+    fn place_summary(&self, place_id: PlaceId) -> PlaceSummary {
         let place = self.state.world.place(place_id);
-        PlaceRef {
+        PlaceSummary {
             id: place_id,
             district_id: place.district_id,
             kind: place.kind,
         }
     }
 
-    fn entity_ref(&self, entity_id: EntityId) -> EntityRef {
+    fn entity_summary(&self, entity_id: EntityId) -> EntitySummary {
         let entity = self.state.world.entity(entity_id);
-        EntityRef {
+        EntitySummary {
             id: entity_id,
             kind: entity.kind,
-        }
-    }
-
-    fn dialogue_speaker_ref(&self, speaker: &Speaker) -> DialogueSpeakerRef {
-        match speaker {
-            Speaker::Player => DialogueSpeakerRef::Player,
-            Speaker::Npc(npc_id) => DialogueSpeakerRef::Npc(self.npc_ref(*npc_id)),
-            Speaker::System => DialogueSpeakerRef::System,
         }
     }
 }
@@ -449,10 +402,8 @@ fn validate_world(world: &World) -> Result<()> {
     }
 }
 
-static DEFAULT_NPC_MEMORY: NpcMemoryState = NpcMemoryState {
-    memory: crate::domain::memory::ConversationMemory {
-        summary: String::new(),
-    },
+static DEFAULT_CONVERSATION_MEMORY: ConversationMemory = ConversationMemory {
+    summary: String::new(),
 };
 
 #[cfg(test)]
@@ -578,8 +529,8 @@ mod tests {
             .unwrap();
 
         let memory = game.state.npc_memories.get(&npc_id).unwrap();
-        assert!(!memory.memory.summary.is_empty());
-        assert!(memory.memory.summary.contains("tell me about work"));
+        assert!(!memory.summary.is_empty());
+        assert!(memory.summary.contains("tell me about work"));
     }
 
     #[tokio::test]
@@ -627,8 +578,8 @@ mod tests {
             .unwrap();
 
         let memory = game.state.npc_memories.get(&npc_id).unwrap();
-        assert!(memory.memory.summary.contains("tell me about work"));
-        assert!(memory.memory.summary.contains("tell me about the city"));
+        assert!(memory.summary.contains("tell me about work"));
+        assert!(memory.summary.contains("tell me about the city"));
     }
 
     #[tokio::test]
