@@ -1,9 +1,8 @@
-use petgraph::Direction::Incoming;
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 
 use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId};
 use crate::graph_ecs::{WorldEdge, WorldNode};
-use crate::world::World;
+use crate::world::{NodeKind, World};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvariantViolation {
@@ -63,11 +62,7 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
         match world.graph.node_weight(index) {
             Some(WorldNode::City(_)) => {}
             Some(WorldNode::Place(_)) => {
-                let city_count = world
-                    .graph
-                    .edges_directed(index, Incoming)
-                    .filter(|edge| matches!(edge.weight(), WorldEdge::ContainsPlace))
-                    .count();
+                let city_count = world.place_city_ids(PlaceId(index)).len();
                 match city_count {
                     1 => {}
                     0 => violations.push(InvariantViolation::PlaceMissingCity {
@@ -80,12 +75,7 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                 }
             }
             Some(WorldNode::Npc(_)) => {
-                let resident_cities = world
-                    .graph
-                    .edges_directed(index, Incoming)
-                    .filter(|edge| matches!(edge.weight(), WorldEdge::Resident))
-                    .map(|edge| CityId(edge.source()))
-                    .collect::<Vec<_>>();
+                let resident_cities = world.npc_resident_city_ids(NpcId(index));
                 match resident_cities.len() {
                     1 => {}
                     0 => violations.push(InvariantViolation::NpcMissingResidentCity {
@@ -97,12 +87,7 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                     }),
                 }
 
-                let present_at_places = world
-                    .graph
-                    .edges_directed(index, Incoming)
-                    .filter(|edge| matches!(edge.weight(), WorldEdge::PresentAt))
-                    .map(|edge| PlaceId(edge.source()))
-                    .collect::<Vec<_>>();
+                let present_at_places = world.npc_present_place_ids(NpcId(index));
                 if present_at_places.len() > 1 {
                     violations.push(InvariantViolation::NpcMultiplePresentAtPlaces {
                         npc_id: NpcId(index),
@@ -125,11 +110,7 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                 }
             }
             Some(WorldNode::Entity(_)) => {
-                let container_count = world
-                    .graph
-                    .edges_directed(index, Incoming)
-                    .filter(|edge| matches!(edge.weight(), WorldEdge::ContainsEntity))
-                    .count();
+                let container_count = world.entity_container_place_ids(EntityId(index)).len();
                 if container_count > 1 {
                     violations.push(InvariantViolation::EntityMultipleContainers {
                         entity_id: EntityId(index),
@@ -144,13 +125,12 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
     for edge in world.graph.edge_references() {
         match edge.weight() {
             WorldEdge::TravelRoute(_) => {
-                let valid = matches!(
-                    (
-                        world.graph.node_weight(edge.source()),
-                        world.graph.node_weight(edge.target())
-                    ),
-                    (Some(WorldNode::City(_)), Some(WorldNode::City(_)))
-                        | (Some(WorldNode::Place(_)), Some(WorldNode::Place(_)))
+                let valid = edge_matches_either(
+                    world,
+                    edge.source(),
+                    edge.target(),
+                    (NodeKind::City, NodeKind::City),
+                    (NodeKind::Place, NodeKind::Place),
                 );
                 if !valid {
                     violations.push(InvariantViolation::InvalidTravelRouteEndpoints {
@@ -160,13 +140,8 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                 }
             }
             WorldEdge::ContainsPlace => {
-                if !matches!(
-                    (
-                        world.graph.node_weight(edge.source()),
-                        world.graph.node_weight(edge.target())
-                    ),
-                    (Some(WorldNode::City(_)), Some(WorldNode::Place(_)))
-                ) {
+                if !edge_matches(world, edge.source(), edge.target(), NodeKind::City, NodeKind::Place)
+                {
                     violations.push(InvariantViolation::InvalidContainsPlaceEdge {
                         city_id: CityId(edge.source()),
                         target: edge.target().index(),
@@ -174,12 +149,12 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                 }
             }
             WorldEdge::ContainsEntity => {
-                if !matches!(
-                    (
-                        world.graph.node_weight(edge.source()),
-                        world.graph.node_weight(edge.target())
-                    ),
-                    (Some(WorldNode::Place(_)), Some(WorldNode::Entity(_)))
+                if !edge_matches(
+                    world,
+                    edge.source(),
+                    edge.target(),
+                    NodeKind::Place,
+                    NodeKind::Entity,
                 ) {
                     violations.push(InvariantViolation::InvalidContainsEntityEdge {
                         place_id: PlaceId(edge.source()),
@@ -188,13 +163,8 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                 }
             }
             WorldEdge::Resident => {
-                if !matches!(
-                    (
-                        world.graph.node_weight(edge.source()),
-                        world.graph.node_weight(edge.target())
-                    ),
-                    (Some(WorldNode::City(_)), Some(WorldNode::Npc(_)))
-                ) {
+                if !edge_matches(world, edge.source(), edge.target(), NodeKind::City, NodeKind::Npc)
+                {
                     violations.push(InvariantViolation::InvalidResidentEdge {
                         city_id: CityId(edge.source()),
                         target: edge.target().index(),
@@ -202,13 +172,8 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                 }
             }
             WorldEdge::PresentAt => {
-                if !matches!(
-                    (
-                        world.graph.node_weight(edge.source()),
-                        world.graph.node_weight(edge.target())
-                    ),
-                    (Some(WorldNode::Place(_)), Some(WorldNode::Npc(_)))
-                ) {
+                if !edge_matches(world, edge.source(), edge.target(), NodeKind::Place, NodeKind::Npc)
+                {
                     violations.push(InvariantViolation::InvalidPresentAtEdge {
                         place_id: PlaceId(edge.source()),
                         target: edge.target().index(),
@@ -219,4 +184,25 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
     }
 
     violations
+}
+
+fn edge_matches(
+    world: &World,
+    source: petgraph::stable_graph::NodeIndex,
+    target: petgraph::stable_graph::NodeIndex,
+    expected_source: NodeKind,
+    expected_target: NodeKind,
+) -> bool {
+    world.node_kind(source) == Some(expected_source) && world.node_kind(target) == Some(expected_target)
+}
+
+fn edge_matches_either(
+    world: &World,
+    source: petgraph::stable_graph::NodeIndex,
+    target: petgraph::stable_graph::NodeIndex,
+    a: (NodeKind, NodeKind),
+    b: (NodeKind, NodeKind),
+) -> bool {
+    edge_matches(world, source, target, a.0, a.1)
+        || edge_matches(world, source, target, b.0, b.1)
 }

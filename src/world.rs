@@ -1,4 +1,5 @@
 use petgraph::Direction::{Incoming, Outgoing};
+use petgraph::stable_graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use rand::Rng;
 use rand::prelude::IndexedRandom;
@@ -33,22 +34,30 @@ impl PartialEq for World {
 
 impl Eq for World {}
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub enum TransportMode {
-    Walking,
-    Transit,
-    Car,
+macro_rules! labeled_enum {
+    ($name:ident { $($variant:ident => $label:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            pub const fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label),+
+                }
+            }
+        }
+    };
 }
 
-impl TransportMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Walking => "walk",
-            Self::Transit => "transit",
-            Self::Car => "car",
-        }
-    }
+labeled_enum!(TransportMode {
+    Walking => "walk",
+    Transit => "transit",
+    Car => "car",
+});
 
+impl TransportMode {
     pub fn next(self) -> Self {
         match self {
             Self::Walking => Self::Transit,
@@ -66,30 +75,15 @@ impl TransportMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RouteKind {
-    Hallway,
-    Stairwell,
-    Crosswalk,
-    SideStreet,
-    LocalRoad,
-    ArterialRoad,
-    Highway,
-}
-
-impl RouteKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Hallway => "hallway",
-            Self::Stairwell => "stairwell",
-            Self::Crosswalk => "crosswalk",
-            Self::SideStreet => "side street",
-            Self::LocalRoad => "local roads",
-            Self::ArterialRoad => "arterial road",
-            Self::Highway => "highway",
-        }
-    }
-}
+labeled_enum!(RouteKind {
+    Hallway => "hallway",
+    Stairwell => "stairwell",
+    Crosswalk => "crosswalk",
+    SideStreet => "side street",
+    LocalRoad => "local roads",
+    ArterialRoad => "arterial road",
+    Highway => "highway",
+});
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TravelRoute {
@@ -213,32 +207,16 @@ pub struct Place {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PlaceKind {
-    BuildingInterior,
-    ApartmentLobby,
-    ApartmentRoom,
-    RoadLane,
-    SidewalkLeft,
-    SidewalkRight,
-    StationConcourse,
-    StationPlatform,
-}
-
-impl PlaceKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::BuildingInterior => "building interior",
-            Self::ApartmentLobby => "apartment lobby",
-            Self::ApartmentRoom => "apartment room",
-            Self::RoadLane => "road lane",
-            Self::SidewalkLeft => "left sidewalk",
-            Self::SidewalkRight => "right sidewalk",
-            Self::StationConcourse => "station concourse",
-            Self::StationPlatform => "station platform",
-        }
-    }
-}
+labeled_enum!(PlaceKind {
+    BuildingInterior => "building interior",
+    ApartmentLobby => "apartment lobby",
+    ApartmentRoom => "apartment room",
+    RoadLane => "road lane",
+    SidewalkLeft => "left sidewalk",
+    SidewalkRight => "right sidewalk",
+    StationConcourse => "station concourse",
+    StationPlatform => "station platform",
+});
 
 impl PlaceKind {
     pub fn supports_people(self) -> bool {
@@ -269,23 +247,19 @@ pub struct Entity {
     pub kind: EntityKind,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub enum EntityKind {
-    Car,
-    Gun,
-    Knife,
-    Bag,
-}
+labeled_enum!(EntityKind {
+    Car => "car",
+    Gun => "gun",
+    Knife => "knife",
+    Bag => "bag",
+});
 
-impl EntityKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Car => "car",
-            Self::Gun => "gun",
-            Self::Knife => "knife",
-            Self::Bag => "bag",
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    City,
+    Place,
+    Entity,
+    Npc,
 }
 
 impl World {
@@ -476,32 +450,35 @@ impl World {
         validate_world(self)
     }
 
+    pub fn node_kind(&self, index: NodeIndex) -> Option<NodeKind> {
+        match self.graph.node_weight(index) {
+            Some(WorldNode::City(_)) => Some(NodeKind::City),
+            Some(WorldNode::Place(_)) => Some(NodeKind::Place),
+            Some(WorldNode::Entity(_)) => Some(NodeKind::Entity),
+            Some(WorldNode::Npc(_)) => Some(NodeKind::Npc),
+            None => None,
+        }
+    }
+
     pub fn city_ids(&self) -> Vec<CityId> {
-        self.graph
-            .node_indices()
-            .filter_map(|index| match self.graph.node_weight(index) {
-                Some(WorldNode::City(_)) => Some(CityId(index)),
-                _ => None,
-            })
-            .collect()
+        collect_node_ids(&self.graph, |index, node| match node {
+            WorldNode::City(_) => Some(CityId(index)),
+            _ => None,
+        })
     }
 
     pub fn npc_ids(&self) -> Vec<NpcId> {
-        self.graph
-            .node_indices()
-            .filter_map(|index| match self.graph.node_weight(index) {
-                Some(WorldNode::Npc(_)) => Some(NpcId(index)),
-                _ => None,
-            })
-            .collect()
+        collect_node_ids(&self.graph, |index, node| match node {
+            WorldNode::Npc(_) => Some(NpcId(index)),
+            _ => None,
+        })
     }
 
     pub fn city_connections(&self, city_id: CityId) -> Vec<CityId> {
-        self.graph
-            .edges_directed(city_id.0, Outgoing)
-            .filter(|edge| matches!(edge.weight(), WorldEdge::TravelRoute(_)))
-            .map(|edge| CityId(edge.target()))
-            .collect()
+        collect_outgoing(&self.graph, city_id.0, is_travel_route, |index, node, _| match node {
+            WorldNode::City(_) => Some(CityId(index)),
+            _ => None,
+        })
     }
 
     pub fn city_npcs(&self, city_id: CityId) -> Vec<NpcId> {
@@ -513,32 +490,26 @@ impl World {
     }
 
     pub fn place_routes(&self, place_id: PlaceId) -> Vec<(PlaceId, TravelRoute)> {
-        self.graph
-            .edges_directed(place_id.0, Outgoing)
-            .filter_map(|edge| match edge.weight() {
-                WorldEdge::TravelRoute(route) => match self.graph.node_weight(edge.target()) {
-                    Some(WorldNode::Place(_)) => Some((PlaceId(edge.target()), *route)),
-                    _ => None,
-                },
+        collect_outgoing(&self.graph, place_id.0, is_travel_route, |index, node, edge| {
+            match (node, edge) {
+                (WorldNode::Place(_), WorldEdge::TravelRoute(route)) => Some((PlaceId(index), *route)),
                 _ => None,
-            })
-            .collect()
+            }
+        })
     }
 
     pub fn place_npcs(&self, place_id: PlaceId) -> Vec<NpcId> {
-        self.graph
-            .edges_directed(place_id.0, Outgoing)
-            .filter(|edge| matches!(edge.weight(), WorldEdge::PresentAt))
-            .map(|edge| NpcId(edge.target()))
-            .collect()
+        collect_outgoing(&self.graph, place_id.0, is_present_at, |index, node, _| match node {
+            WorldNode::Npc(_) => Some(NpcId(index)),
+            _ => None,
+        })
     }
 
     pub fn place_entities(&self, place_id: PlaceId) -> Vec<EntityId> {
-        self.graph
-            .edges_directed(place_id.0, Outgoing)
-            .filter(|edge| matches!(edge.weight(), WorldEdge::ContainsEntity))
-            .map(|edge| EntityId(edge.target()))
-            .collect()
+        collect_outgoing(&self.graph, place_id.0, is_contains_entity, |index, node, _| match node {
+            WorldNode::Entity(_) => Some(EntityId(index)),
+            _ => None,
+        })
     }
 
     pub fn place_cars(&self, place_id: PlaceId) -> Vec<EntityId> {
@@ -548,11 +519,41 @@ impl World {
             .collect()
     }
 
+    pub fn place_city_ids(&self, place_id: PlaceId) -> Vec<CityId> {
+        collect_incoming(&self.graph, place_id.0, is_contains_place, |index, node, _| match node {
+            WorldNode::City(_) => Some(CityId(index)),
+            _ => None,
+        })
+    }
+
     pub fn entity_place_id(&self, entity_id: EntityId) -> Option<PlaceId> {
-        self.graph
-            .edges_directed(entity_id.0, Incoming)
-            .find(|edge| matches!(edge.weight(), WorldEdge::ContainsEntity))
-            .map(|edge| PlaceId(edge.source()))
+        self.entity_container_place_ids(entity_id).into_iter().next()
+    }
+
+    pub fn entity_container_place_ids(&self, entity_id: EntityId) -> Vec<PlaceId> {
+        collect_incoming(
+            &self.graph,
+            entity_id.0,
+            is_contains_entity,
+            |index, node, _| match node {
+                WorldNode::Place(_) => Some(PlaceId(index)),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn npc_resident_city_ids(&self, npc_id: NpcId) -> Vec<CityId> {
+        collect_incoming(&self.graph, npc_id.0, is_resident, |index, node, _| match node {
+            WorldNode::City(_) => Some(CityId(index)),
+            _ => None,
+        })
+    }
+
+    pub fn npc_present_place_ids(&self, npc_id: NpcId) -> Vec<PlaceId> {
+        collect_incoming(&self.graph, npc_id.0, is_present_at, |index, node, _| match node {
+            WorldNode::Place(_) => Some(PlaceId(index)),
+            _ => None,
+        })
     }
 
     pub fn move_entity(&mut self, entity_id: EntityId, place_id: PlaceId) {
@@ -573,10 +574,7 @@ impl World {
     }
 
     pub fn place_city_id(&self, place_id: PlaceId) -> Option<CityId> {
-        self.graph
-            .edges_directed(place_id.0, Incoming)
-            .find(|edge| matches!(edge.weight(), WorldEdge::ContainsPlace))
-            .map(|edge| CityId(edge.source()))
+        self.place_city_ids(place_id).into_iter().next()
     }
 
     fn city_from_graph(graph: &WorldGraph, id: CityId) -> &City {
@@ -594,20 +592,82 @@ impl World {
     }
 
     fn city_npcs_from_graph(graph: &WorldGraph, city_id: CityId) -> Vec<NpcId> {
-        graph
-            .edges_directed(city_id.0, Outgoing)
-            .filter(|edge| matches!(edge.weight(), WorldEdge::Resident))
-            .map(|edge| NpcId(edge.target()))
-            .collect()
+        collect_outgoing(graph, city_id.0, is_resident, |index, node, _| match node {
+            WorldNode::Npc(_) => Some(NpcId(index)),
+            _ => None,
+        })
     }
 
     fn city_places_from_graph(graph: &WorldGraph, city_id: CityId) -> Vec<PlaceId> {
-        graph
-            .edges_directed(city_id.0, Outgoing)
-            .filter(|edge| matches!(edge.weight(), WorldEdge::ContainsPlace))
-            .map(|edge| PlaceId(edge.target()))
-            .collect()
+        collect_outgoing(graph, city_id.0, is_contains_place, |index, node, _| match node {
+            WorldNode::Place(_) => Some(PlaceId(index)),
+            _ => None,
+        })
     }
+}
+
+fn collect_node_ids<T>(
+    graph: &WorldGraph,
+    map: impl Fn(NodeIndex, &WorldNode) -> Option<T>,
+) -> Vec<T> {
+    graph
+        .node_indices()
+        .filter_map(|index| graph.node_weight(index).and_then(|node| map(index, node)))
+        .collect()
+}
+
+fn collect_outgoing<T>(
+    graph: &WorldGraph,
+    source: NodeIndex,
+    edge_matches: impl Fn(&WorldEdge) -> bool,
+    map: impl Fn(NodeIndex, &WorldNode, &WorldEdge) -> Option<T>,
+) -> Vec<T> {
+    graph
+        .edges_directed(source, Outgoing)
+        .filter(|edge| edge_matches(edge.weight()))
+        .filter_map(|edge| {
+            graph.node_weight(edge.target()).and_then(|node| {
+                map(edge.target(), node, edge.weight())
+            })
+        })
+        .collect()
+}
+
+fn collect_incoming<T>(
+    graph: &WorldGraph,
+    target: NodeIndex,
+    edge_matches: impl Fn(&WorldEdge) -> bool,
+    map: impl Fn(NodeIndex, &WorldNode, &WorldEdge) -> Option<T>,
+) -> Vec<T> {
+    graph
+        .edges_directed(target, Incoming)
+        .filter(|edge| edge_matches(edge.weight()))
+        .filter_map(|edge| {
+            graph.node_weight(edge.source()).and_then(|node| {
+                map(edge.source(), node, edge.weight())
+            })
+        })
+        .collect()
+}
+
+fn is_travel_route(edge: &WorldEdge) -> bool {
+    matches!(edge, WorldEdge::TravelRoute(_))
+}
+
+fn is_contains_place(edge: &WorldEdge) -> bool {
+    matches!(edge, WorldEdge::ContainsPlace)
+}
+
+fn is_contains_entity(edge: &WorldEdge) -> bool {
+    matches!(edge, WorldEdge::ContainsEntity)
+}
+
+fn is_resident(edge: &WorldEdge) -> bool {
+    matches!(edge, WorldEdge::Resident)
+}
+
+fn is_present_at(edge: &WorldEdge) -> bool {
+    matches!(edge, WorldEdge::PresentAt)
 }
 
 pub fn place_name_from_parts(
@@ -686,6 +746,27 @@ fn add_place(
     place_id
 }
 
+fn add_connected_place(
+    graph: &mut WorldGraph,
+    rng: &mut ChaCha8Rng,
+    city_id: CityId,
+    district_id: DistrictId,
+    from: PlaceId,
+    kind: PlaceKind,
+    description: String,
+    route_kind: RouteKind,
+    walking: (u32, u32),
+) -> PlaceId {
+    let place_id = add_place(graph, city_id, district_id, kind, description);
+    add_bidirectional_route(
+        graph,
+        from.0,
+        place_id.0,
+        random_timed_route(rng, route_kind, walking, None, None),
+    );
+    place_id
+}
+
 fn add_bidirectional_route(
     graph: &mut WorldGraph,
     from: petgraph::stable_graph::NodeIndex,
@@ -737,37 +818,33 @@ fn build_district_bundle(
             district_name
         ),
     );
-    let left_sidewalk_id = add_place(
+    let left_sidewalk_id = add_connected_place(
         graph,
+        rng,
         city_id,
         district_id,
+        road_id,
         PlaceKind::SidewalkLeft,
         format!(
             "The left-side sidewalk in {} with storefront windows, signs, and steady foot traffic.",
             district_name
         ),
+        RouteKind::Crosswalk,
+        (8, 20),
     );
-    let right_sidewalk_id = add_place(
+    let right_sidewalk_id = add_connected_place(
         graph,
+        rng,
         city_id,
         district_id,
+        road_id,
         PlaceKind::SidewalkRight,
         format!(
             "The right-side sidewalk in {} where bus stops, benches, and curb cuts slow the flow.",
             district_name
         ),
-    );
-    add_bidirectional_route(
-        graph,
-        road_id.0,
-        left_sidewalk_id.0,
-        random_timed_route(rng, RouteKind::Crosswalk, (8, 20), None, None),
-    );
-    add_bidirectional_route(
-        graph,
-        road_id.0,
-        right_sidewalk_id.0,
-        random_timed_route(rng, RouteKind::Crosswalk, (8, 20), None, None),
+        RouteKind::Crosswalk,
+        (8, 20),
     );
     add_bidirectional_route(
         graph,
@@ -776,21 +853,19 @@ fn build_district_bundle(
         random_timed_route(rng, RouteKind::Crosswalk, (15, 35), None, None),
     );
 
-    let building_id = add_place(
+    let building_id = add_connected_place(
         graph,
+        rng,
         city_id,
         district_id,
+        left_sidewalk_id,
         PlaceKind::BuildingInterior,
         format!(
             "An interior space in {} where people slow down, talk longer, and watch who comes through.",
             district_name
         ),
-    );
-    add_bidirectional_route(
-        graph,
-        left_sidewalk_id.0,
-        building_id.0,
-        random_timed_route(rng, RouteKind::Hallway, (8, 20), None, None),
+        RouteKind::Hallway,
+        (8, 20),
     );
 
     let mut pedestrian_places = vec![left_sidewalk_id, right_sidewalk_id, building_id];
@@ -836,40 +911,36 @@ fn add_apartment_cluster(
     sidewalk_id: PlaceId,
     district_name: &str,
 ) -> Vec<PlaceId> {
-    let lobby_id = add_place(
+    let lobby_id = add_connected_place(
         graph,
+        rng,
         city_id,
         district_id,
+        sidewalk_id,
         PlaceKind::ApartmentLobby,
         format!(
             "A modest apartment lobby in {} with mailboxes, a buzzer panel, and scuffed tile from years of foot traffic.",
             district_name
         ),
-    );
-    add_bidirectional_route(
-        graph,
-        sidewalk_id.0,
-        lobby_id.0,
-        random_timed_route(rng, RouteKind::Hallway, (6, 14), None, None),
+        RouteKind::Hallway,
+        (6, 14),
     );
 
     let mut places = vec![lobby_id];
-    for _room_number in ["1A", "1B", "2A", "2B"] {
-        let room_id = add_place(
+    for _ in 0..4 {
+        let room_id = add_connected_place(
             graph,
+            rng,
             city_id,
             district_id,
+            lobby_id,
             PlaceKind::ApartmentRoom,
             format!(
                 "A small apartment unit in {} with a narrow kitchen, thin walls, and just enough space to disappear for a while.",
                 district_name
             ),
-        );
-        add_bidirectional_route(
-            graph,
-            lobby_id.0,
-            room_id.0,
-            random_timed_route(rng, RouteKind::Hallway, (4, 12), None, None),
+            RouteKind::Hallway,
+            (4, 12),
         );
         places.push(room_id);
     }
@@ -890,19 +961,17 @@ fn build_station_bundle(
         "A loud indoor concourse full of departure boards, kiosks, and hurried transfers."
             .to_string(),
     );
-    let platform_id = add_place(
+    let platform_id = add_connected_place(
         graph,
+        rng,
         city_id,
         district_id,
+        concourse_id,
         PlaceKind::StationPlatform,
         "Open-air platforms and curbside bays where regional departures actually leave."
             .to_string(),
-    );
-    add_bidirectional_route(
-        graph,
-        concourse_id.0,
-        platform_id.0,
-        random_timed_route(rng, RouteKind::Stairwell, (18, 45), None, None),
+        RouteKind::Stairwell,
+        (18, 45),
     );
     StationBundle {
         concourse_id,
@@ -1175,12 +1244,7 @@ mod tests {
     fn validator_detects_npc_present_outside_resident_city() {
         let mut world = World::generate(crate::domain::seed::WorldSeed::new(5), 16);
         let npc_id = world.npc_ids()[0];
-        let resident_city_id = world
-            .graph
-            .edges_directed(npc_id.0, Incoming)
-            .find(|edge| matches!(edge.weight(), WorldEdge::Resident))
-            .map(|edge| crate::graph_ecs::CityId(edge.source()))
-            .expect("npc should have resident city");
+        let resident_city_id = world.npc_resident_city_ids(npc_id)[0];
         let present_edge_id = world
             .graph
             .edges_directed(npc_id.0, Incoming)

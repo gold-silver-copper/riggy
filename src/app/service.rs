@@ -580,14 +580,7 @@ mod tests {
     async fn load_rejects_invalid_world_snapshot() {
         let mut game = GameService::new(MockBackend).unwrap();
         let npc_id = game.state.world.npc_ids()[0];
-        let resident_city_id = game
-            .state
-            .world
-            .graph
-            .edges_directed(npc_id.0, petgraph::Direction::Incoming)
-            .find(|edge| matches!(edge.weight(), WorldEdge::Resident))
-            .map(|edge| crate::graph_ecs::CityId(edge.source()))
-            .expect("npc should have resident city");
+        let resident_city_id = game.state.world.npc_resident_city_ids(npc_id)[0];
         let present_edge_id = game
             .state
             .world
