@@ -146,9 +146,11 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
         .interactables
         .iter()
         .filter_map(|interactable| match interactable {
-            Interactable::Inspect(entity) => {
-                Some(format!("{} ({})", formatter.entity(entity), entity.kind.label()))
-            }
+            Interactable::Inspect(entity) => Some(format!(
+                "{} ({})",
+                formatter.entity(entity),
+                entity.kind.label()
+            )),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -237,7 +239,11 @@ pub fn render_interactable_label(world_seed: WorldSeed, interactable: &Interacta
             format!("{} - exit vehicle", formatter.entity(entity))
         }
         Interactable::Inspect(entity) => {
-            format!("{} - inspect {}", formatter.entity(entity), entity.kind.label())
+            format!(
+                "{} - inspect {}",
+                formatter.entity(entity),
+                entity.kind.label()
+            )
         }
     }
 }
@@ -497,7 +503,17 @@ mod tests {
         )));
         assert!(rendered.contains(&snapshot.city.id.name(snapshot.world_seed)));
         assert!(rendered.contains("Current conversation:"));
-        assert!(rendered.contains(&snapshot.dialogue_partner.as_ref().unwrap().actor.id.name(snapshot.world_seed)));
+        assert!(
+            rendered.contains(
+                &snapshot
+                    .dialogue_partner
+                    .as_ref()
+                    .unwrap()
+                    .actor
+                    .id
+                    .name(snapshot.world_seed)
+            )
+        );
         assert!(rendered.contains("Routes from here:"));
         assert!(rendered.contains("Recent Context"));
     }

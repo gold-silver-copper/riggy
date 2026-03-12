@@ -10,7 +10,6 @@ use crate::ai::context::NpcDialogueContext;
 use crate::ai::prompting::build_dialogue_prompt;
 use crate::domain::events::{DialogueLine, DialogueSpeaker};
 use crate::domain::memory::ConversationMemory;
-use crate::simulation::DialogueSession;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DialogueResponse {
@@ -21,7 +20,7 @@ pub struct DialogueResponse {
 pub trait LlmBackend {
     async fn generate_dialogue(&self, context: &NpcDialogueContext) -> Result<DialogueResponse>;
 
-    async fn summarize_memory(&self, session: &DialogueSession) -> Result<ConversationMemory>;
+    async fn summarize_memory(&self, transcript: &[DialogueLine]) -> Result<ConversationMemory>;
 
     fn name(&self) -> &'static str;
 }
@@ -53,10 +52,10 @@ impl LlmBackend for AnyBackend {
         }
     }
 
-    async fn summarize_memory(&self, session: &DialogueSession) -> Result<ConversationMemory> {
+    async fn summarize_memory(&self, transcript: &[DialogueLine]) -> Result<ConversationMemory> {
         match self {
-            Self::Mock(backend) => backend.summarize_memory(session).await,
-            Self::Rig(backend) => backend.summarize_memory(session).await,
+            Self::Mock(backend) => backend.summarize_memory(transcript).await,
+            Self::Rig(backend) => backend.summarize_memory(transcript).await,
         }
     }
 
@@ -124,9 +123,9 @@ impl LlmBackend for MockBackend {
         })
     }
 
-    async fn summarize_memory(&self, session: &DialogueSession) -> Result<ConversationMemory> {
+    async fn summarize_memory(&self, transcript: &[DialogueLine]) -> Result<ConversationMemory> {
         Ok(ConversationMemory {
-            summary: fallback_summary(session),
+            summary: fallback_summary(transcript),
         }
         .normalized())
     }
@@ -258,18 +257,17 @@ impl LlmBackend for RigBackend {
         })
     }
 
-    async fn summarize_memory(&self, session: &DialogueSession) -> Result<ConversationMemory> {
-        let transcript = session
-            .transcript
+    async fn summarize_memory(&self, transcript: &[DialogueLine]) -> Result<ConversationMemory> {
+        let transcript_text = transcript
             .iter()
             .map(|line| format!("{}: {}", speaker_label(line), line.text))
             .collect::<Vec<_>>()
             .join("\n");
 
         let summary = self
-            .prompt_memory_summary_text(&transcript)
+            .prompt_memory_summary_text(&transcript_text)
             .await
-            .unwrap_or_else(|_| fallback_summary(session));
+            .unwrap_or_else(|_| fallback_summary(transcript));
 
         Ok(ConversationMemory { summary }.normalized())
     }
@@ -294,9 +292,8 @@ const DIALOGUE_PREAMBLE: &str = "You are roleplaying a resident of a procedurall
 const MEMORY_PREAMBLE: &str =
     "Summarize conversations for a text game. Keep only durable memory of what was discussed.";
 
-fn fallback_summary(session: &DialogueSession) -> String {
-    let summary = session
-        .transcript
+fn fallback_summary(transcript: &[DialogueLine]) -> String {
+    let summary = transcript
         .iter()
         .rev()
         .take(6)
@@ -313,8 +310,11 @@ fn fallback_summary(session: &DialogueSession) -> String {
 }
 
 #[cfg(test)]
-fn fallback_conversation_memory(session: &DialogueSession, summary: String) -> ConversationMemory {
-    let _ = session;
+fn fallback_conversation_memory(
+    transcript: &[DialogueLine],
+    summary: String,
+) -> ConversationMemory {
+    let _ = transcript;
     ConversationMemory { summary }.normalized()
 }
 
@@ -325,30 +325,33 @@ mod tests {
     use crate::domain::memory::ConversationMemory;
     use crate::domain::time::GameTime;
     use crate::llm::{LlmBackend, MockBackend, fallback_conversation_memory};
-    use crate::simulation::DialogueSession;
     use crate::world::World;
 
     #[tokio::test]
     async fn mock_backend_generates_dialogue() {
-        let world = World::generate(crate::domain::seed::WorldSeed::new(2), 16);
+        let mut world = World::generate(crate::domain::seed::WorldSeed::new(2), 16);
         let city_id = world.city_ids()[0];
         let npc_id = world.city_npcs(city_id)[0];
+        let player_id = world.player_id().expect("world should contain a player");
         let memory = ConversationMemory::default();
-        let session = DialogueSession {
-            npc_id,
-            started_at: GameTime::from_seconds(0),
-            transcript: vec![DialogueLine {
+        let place_id = world.city_places(city_id)[0];
+        let process_id =
+            world.start_dialogue_process(player_id, npc_id, place_id, GameTime::from_seconds(0));
+        world.append_dialogue_utterance(
+            process_id,
+            player_id,
+            DialogueLine {
                 timestamp: GameTime::from_seconds(0),
                 speaker: DialogueSpeaker::Player,
                 text: "Hello".to_string(),
-            }],
-        };
+            },
+        );
         let context = build_npc_dialogue_context(
             &world,
             GameTime::from_seconds(0),
             city_id,
             &memory,
-            &session,
+            process_id,
             "Hello there.".to_string(),
         )
         .unwrap();
@@ -359,24 +362,23 @@ mod tests {
 
     #[test]
     fn context_contains_npc_and_city_state() {
-        let world = World::generate(crate::domain::seed::WorldSeed::new(9), 16);
+        let mut world = World::generate(crate::domain::seed::WorldSeed::new(9), 16);
         let city_id = world.city_ids()[0];
         let npc_id = world.city_npcs(city_id)[0];
+        let player_id = world.player_id().expect("world should contain a player");
         let memory = ConversationMemory {
             summary: "The player kept their word once before.".to_string(),
         };
-        let session = DialogueSession {
-            npc_id,
-            started_at: GameTime::from_seconds(4),
-            transcript: Vec::new(),
-        };
+        let place_id = world.city_places(city_id)[0];
+        let process_id =
+            world.start_dialogue_process(player_id, npc_id, place_id, GameTime::from_seconds(4));
 
         let context = build_npc_dialogue_context(
             &world,
             GameTime::from_seconds(34),
             city_id,
             &memory,
-            &session,
+            process_id,
             "What is this city like?".to_string(),
         )
         .unwrap();
@@ -392,24 +394,20 @@ mod tests {
     #[test]
     fn fallback_conversation_memory_preserves_summary() {
         let npc_id = crate::world::NpcId(petgraph::stable_graph::NodeIndex::new(2));
-        let session = DialogueSession {
-            npc_id,
-            started_at: GameTime::from_seconds(0),
-            transcript: vec![
-                DialogueLine {
-                    timestamp: GameTime::from_seconds(0),
-                    speaker: DialogueSpeaker::Player,
-                    text: "tell me about work".to_string(),
-                },
-                DialogueLine {
-                    timestamp: GameTime::from_seconds(30),
-                    speaker: DialogueSpeaker::Npc(npc_id),
-                    text: "I might have a job if you're reliable.".to_string(),
-                },
-            ],
-        };
+        let transcript = vec![
+            DialogueLine {
+                timestamp: GameTime::from_seconds(0),
+                speaker: DialogueSpeaker::Player,
+                text: "tell me about work".to_string(),
+            },
+            DialogueLine {
+                timestamp: GameTime::from_seconds(30),
+                speaker: DialogueSpeaker::Npc(npc_id),
+                text: "I might have a job if you're reliable.".to_string(),
+            },
+        ];
 
-        let memory = fallback_conversation_memory(&session, "Fallback summary".to_string());
+        let memory = fallback_conversation_memory(&transcript, "Fallback summary".to_string());
         assert_eq!(memory.summary, "Fallback summary");
     }
 }

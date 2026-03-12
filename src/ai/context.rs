@@ -7,8 +7,7 @@ use crate::domain::memory::ConversationMemory;
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::GameTime;
 use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
-use crate::simulation::DialogueSession;
-use crate::world::{CityId, DistrictId, LandmarkId, NpcId, World};
+use crate::world::{CityId, DistrictId, LandmarkId, NpcId, ProcessId, World};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NpcDialogueContext {
@@ -68,16 +67,19 @@ pub fn build_npc_dialogue_context(
     current_time: GameTime,
     city_id: CityId,
     memory: &ConversationMemory,
-    session: &DialogueSession,
+    process_id: ProcessId,
     player_input: String,
 ) -> Result<NpcDialogueContext> {
+    let npc_id = world
+        .dialogue_npc_id(process_id)
+        .ok_or_else(|| anyhow::anyhow!("dialogue context process is missing an NPC participant"))?;
     if !world.city_ids().contains(&city_id) {
         bail!("dialogue context city does not exist");
     }
-    if !world.npc_ids().contains(&session.npc_id) {
+    if !world.npc_ids().contains(&npc_id) {
         bail!("dialogue context npc does not exist");
     }
-    if !world.city_npcs(city_id).contains(&session.npc_id) {
+    if !world.city_npcs(city_id).contains(&npc_id) {
         bail!("dialogue context npc does not belong to the provided city");
     }
 
@@ -85,10 +87,10 @@ pub fn build_npc_dialogue_context(
         world_seed: world.seed,
         current_time,
         city: city_context(world, city_id),
-        npc: npc_context(world, session.npc_id),
+        npc: npc_context(world, npc_id),
         memory: memory.clone(),
         turn: DialogueTurnContext {
-            transcript: session.transcript.clone(),
+            transcript: world.dialogue_lines(process_id),
             player_input,
         },
     })
@@ -99,7 +101,6 @@ mod tests {
     use crate::domain::events::{DialogueLine, DialogueSpeaker};
     use crate::domain::memory::ConversationMemory;
     use crate::domain::time::GameTime;
-    use crate::simulation::DialogueSession;
     use crate::world::World;
 
     use super::build_npc_dialogue_context;
@@ -109,25 +110,30 @@ mod tests {
         let world = World::generate(crate::domain::seed::WorldSeed::new(9), 16);
         let city_id = world.city_ids()[0];
         let npc_id = world.city_npcs(city_id)[0];
+        let player_id = world.player_id().expect("world should contain a player");
         let memory = ConversationMemory {
             summary: "The player kept their word once before.".to_string(),
         };
-        let session = DialogueSession {
-            npc_id,
-            started_at: GameTime::from_seconds(4),
-            transcript: vec![DialogueLine {
+        let mut world = world;
+        let place_id = world.city_places(city_id)[0];
+        let process_id =
+            world.start_dialogue_process(player_id, npc_id, place_id, GameTime::from_seconds(4));
+        world.append_dialogue_utterance(
+            process_id,
+            player_id,
+            DialogueLine {
                 timestamp: GameTime::from_seconds(4),
                 speaker: DialogueSpeaker::Player,
                 text: "hello".to_string(),
-            }],
-        };
+            },
+        );
 
         let context = build_npc_dialogue_context(
             &world,
             GameTime::from_seconds(34),
             city_id,
             &memory,
-            &session,
+            process_id,
             "What is this city like?".to_string(),
         )
         .unwrap();
@@ -167,19 +173,19 @@ mod tests {
             .find(|candidate| *candidate != city_id)
             .expect("world should contain at least two cities");
         let npc_id = world.city_npcs(city_id)[0];
+        let player_id = world.player_id().expect("world should contain a player");
         let memory = ConversationMemory::default();
-        let session = DialogueSession {
-            npc_id,
-            started_at: GameTime::from_seconds(0),
-            transcript: Vec::new(),
-        };
+        let mut world = world;
+        let place_id = world.city_places(city_id)[0];
+        let process_id =
+            world.start_dialogue_process(player_id, npc_id, place_id, GameTime::from_seconds(0));
 
         let error = build_npc_dialogue_context(
             &world,
             GameTime::from_seconds(90),
             other_city_id,
             &memory,
-            &session,
+            process_id,
             "hello".to_string(),
         )
         .unwrap_err();

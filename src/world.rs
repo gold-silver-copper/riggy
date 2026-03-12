@@ -7,11 +7,15 @@ use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::invariants::{InvariantViolation, validate_world};
+use crate::domain::memory::ConversationMemory;
+use crate::domain::records::{ContextEntry, DialogueLine, DialogueSpeaker, SystemContext};
 use crate::domain::seed::WorldSeed;
-use crate::domain::time::TimeDelta;
+use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
-pub use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId};
-use crate::graph_ecs::{WorldEdge, WorldGraph, WorldNode, add_edge, edge_snapshot};
+use crate::graph_ecs::{
+    BfoClass, RelationKind, WorldEdge, WorldGraph, WorldNode, add_edge, edge_snapshot,
+};
+pub use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId, PlayerId, ProcessId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct World {
@@ -235,10 +239,6 @@ impl PlaceKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Npc {
-    pub archetype: NpcArchetype,
-    pub personality_traits: Vec<TraitTag>,
-    pub goal: GoalTag,
-    pub occupation: Occupation,
     pub home_district: DistrictId,
 }
 
@@ -247,6 +247,9 @@ pub struct Entity {
     pub kind: EntityKind,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Player;
+
 labeled_enum!(EntityKind {
     Car => "car",
     Gun => "gun",
@@ -254,12 +257,98 @@ labeled_enum!(EntityKind {
     Bag => "bag",
 });
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeKind {
-    City,
-    Place,
-    Entity,
-    Npc,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DependentContinuant {
+    Role(RoleNode),
+    Disposition(DispositionNode),
+    Quality(QualityNode),
+}
+
+impl DependentContinuant {
+    pub const fn bfo_class(&self) -> BfoClass {
+        match self {
+            Self::Role(_) => BfoClass::Role,
+            Self::Disposition(_) => BfoClass::Disposition,
+            Self::Quality(_) => BfoClass::Quality,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleNode {
+    pub kind: RoleKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DispositionNode {
+    pub kind: DispositionKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QualityNode {
+    pub kind: QualityKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RoleKind {
+    Occupation(Occupation),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DispositionKind {
+    Trait(TraitTag),
+    Goal(GoalTag),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum QualityKind {
+    Archetype(NpcArchetype),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpcProfile {
+    pub occupation: Occupation,
+    pub archetype: NpcArchetype,
+    pub traits: Vec<TraitTag>,
+    pub goal: GoalTag,
+    pub home_district: DistrictId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InformationContent {
+    ConversationMemory {
+        summary: String,
+    },
+    DialogueRecord(DialogueLine),
+    ContextRecord(ContextEntry),
+    CityKnowledge {
+        city_id: CityId,
+        discovered_at: GameTime,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Occurrent {
+    pub kind: OccurrentKind,
+    pub started_at: GameTime,
+    pub ended_at: Option<GameTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TemporalRegion {
+    pub current_time: GameTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OccurrentKind {
+    Dialogue,
+    Travel {
+        transport_mode: TransportMode,
+        duration: TimeDelta,
+    },
+    Waiting {
+        duration: TimeDelta,
+    },
 }
 
 impl World {
@@ -267,6 +356,9 @@ impl World {
         let mut rng = ChaCha8Rng::seed_from_u64(seed.raw());
         let target_cities = city_count.clamp(16, 24);
         let mut graph = WorldGraph::default();
+        graph.add_node(WorldNode::TemporalRegion(TemporalRegion {
+            current_time: GameTime::from_seconds(0),
+        }));
         let mut city_ids = Vec::with_capacity(target_cities);
         let mut city_hubs = Vec::with_capacity(target_cities);
 
@@ -403,6 +495,8 @@ impl World {
             spawn_city_npcs(&mut graph, &mut rng, *city_id);
         }
 
+        graph.add_node(WorldNode::Player(Player));
+
         Self { seed, graph }
     }
 
@@ -418,6 +512,47 @@ impl World {
         match self.graph.node_weight(id.0) {
             Some(WorldNode::Npc(npc)) => npc,
             _ => panic!("invalid npc id {:?}", id),
+        }
+    }
+
+    pub fn npc_profile(&self, id: NpcId) -> NpcProfile {
+        let npc = self.npc(id);
+        let mut occupation = None;
+        let mut archetype = None;
+        let mut goal = None;
+        let mut traits = Vec::new();
+
+        for dependent in collect_incoming(
+            &self.graph,
+            id.0,
+            RelationKind::SpecificallyDependsOn,
+            |_, node, _| match node {
+                WorldNode::DependentContinuant(node) => Some(node.clone()),
+                _ => None,
+            },
+        ) {
+            match dependent {
+                DependentContinuant::Role(role) => match role.kind {
+                    RoleKind::Occupation(value) => occupation = Some(value),
+                },
+                DependentContinuant::Disposition(disposition) => match disposition.kind {
+                    DispositionKind::Trait(value) => traits.push(value),
+                    DispositionKind::Goal(value) => goal = Some(value),
+                },
+                DependentContinuant::Quality(quality) => match quality.kind {
+                    QualityKind::Archetype(value) => archetype = Some(value),
+                },
+            }
+        }
+
+        traits.sort();
+
+        NpcProfile {
+            occupation: occupation.expect("npc should have occupation role"),
+            archetype: archetype.expect("npc should have archetype quality"),
+            traits,
+            goal: goal.expect("npc should have goal disposition"),
+            home_district: npc.home_district,
         }
     }
 
@@ -450,13 +585,159 @@ impl World {
         validate_world(self)
     }
 
-    pub fn node_kind(&self, index: NodeIndex) -> Option<NodeKind> {
-        match self.graph.node_weight(index) {
-            Some(WorldNode::City(_)) => Some(NodeKind::City),
-            Some(WorldNode::Place(_)) => Some(NodeKind::Place),
-            Some(WorldNode::Entity(_)) => Some(NodeKind::Entity),
-            Some(WorldNode::Npc(_)) => Some(NodeKind::Npc),
-            None => None,
+    pub fn bfo_class(&self, index: NodeIndex) -> Option<BfoClass> {
+        self.graph.node_weight(index).map(WorldNode::bfo_class)
+    }
+
+    pub fn current_time(&self) -> GameTime {
+        let index = self
+            .current_time_node_index()
+            .expect("world graph should contain a current time node");
+        let Some(WorldNode::TemporalRegion(region)) = self.graph.node_weight(index) else {
+            unreachable!("current time node should always be a temporal region");
+        };
+        region.current_time
+    }
+
+    pub fn set_current_time(&mut self, current_time: GameTime) {
+        if let Some(index) = self.current_time_node_index() {
+            let Some(WorldNode::TemporalRegion(region)) = self.graph.node_weight_mut(index) else {
+                unreachable!("current time node should always be a temporal region");
+            };
+            region.current_time = current_time;
+            return;
+        }
+
+        self.graph
+            .add_node(WorldNode::TemporalRegion(TemporalRegion { current_time }));
+    }
+
+    pub fn player_id(&self) -> Option<PlayerId> {
+        collect_node_ids(&self.graph, |index, node| match node {
+            WorldNode::Player(_) => Some(PlayerId(index)),
+            _ => None,
+        })
+        .into_iter()
+        .next()
+    }
+
+    pub fn ensure_player(&mut self) -> PlayerId {
+        if let Some(player_id) = self.player_id() {
+            return player_id;
+        }
+        let index = self.graph.add_node(WorldNode::Player(Player));
+        PlayerId(index)
+    }
+
+    pub fn place_player_ids(&self, place_id: PlaceId) -> Vec<PlayerId> {
+        collect_outgoing(
+            &self.graph,
+            place_id.0,
+            RelationKind::Occupies,
+            |index, node, _| match node {
+                WorldNode::Player(_) => Some(PlayerId(index)),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn player_place_id(&self, player_id: PlayerId) -> Option<PlaceId> {
+        collect_incoming(
+            &self.graph,
+            player_id.0,
+            RelationKind::Occupies,
+            |index, node, _| match node {
+                WorldNode::Place(_) => Some(PlaceId(index)),
+                _ => None,
+            },
+        )
+        .into_iter()
+        .next()
+    }
+
+    pub fn player_city_id(&self, player_id: PlayerId) -> Option<CityId> {
+        self.player_place_id(player_id)
+            .and_then(|place_id| self.place_city_id(place_id))
+    }
+
+    pub fn active_dialogue_process_ids(&self, player_id: PlayerId) -> Vec<ProcessId> {
+        let mut ids = collect_incoming(
+            &self.graph,
+            player_id.0,
+            RelationKind::HasParticipant,
+            |index, node, _| match node {
+                WorldNode::Occurrent(Occurrent {
+                    kind: OccurrentKind::Dialogue,
+                    ended_at: None,
+                    ..
+                }) => Some(ProcessId(index)),
+                _ => None,
+            },
+        );
+        ids.sort_unstable();
+        ids
+    }
+
+    pub fn active_dialogue_process_id(&self, player_id: PlayerId) -> Option<ProcessId> {
+        self.active_dialogue_process_ids(player_id)
+            .into_iter()
+            .next()
+    }
+
+    pub fn active_dialogue_npc_id(&self, player_id: PlayerId) -> Option<NpcId> {
+        self.active_dialogue_process_id(player_id)
+            .and_then(|process_id| self.dialogue_npc_id(process_id))
+    }
+
+    pub fn player_vehicle_id(&self, player_id: PlayerId) -> Option<EntityId> {
+        collect_incoming(
+            &self.graph,
+            player_id.0,
+            RelationKind::Contains,
+            |index, node, edge| match (node, edge) {
+                (WorldNode::Entity(_), WorldEdge::ContainsPlayer) => Some(EntityId(index)),
+                _ => None,
+            },
+        )
+        .into_iter()
+        .next()
+    }
+
+    pub fn move_player(&mut self, player_id: PlayerId, place_id: PlaceId) {
+        let existing = self
+            .graph
+            .edges_directed(player_id.0, Incoming)
+            .find(|edge| matches!(edge.weight(), WorldEdge::PresentAt))
+            .map(|edge| edge.id());
+        if let Some(edge_id) = existing {
+            self.graph.remove_edge(edge_id);
+        }
+        add_edge(
+            &mut self.graph,
+            place_id.0,
+            player_id.0,
+            WorldEdge::PresentAt,
+        );
+    }
+
+    pub fn board_player_vehicle(&mut self, player_id: PlayerId, vehicle_id: EntityId) {
+        self.leave_player_vehicle(player_id);
+        add_edge(
+            &mut self.graph,
+            vehicle_id.0,
+            player_id.0,
+            WorldEdge::ContainsPlayer,
+        );
+    }
+
+    pub fn leave_player_vehicle(&mut self, player_id: PlayerId) {
+        let existing = self
+            .graph
+            .edges_directed(player_id.0, Incoming)
+            .find(|edge| matches!(edge.weight(), WorldEdge::ContainsPlayer))
+            .map(|edge| edge.id());
+        if let Some(edge_id) = existing {
+            self.graph.remove_edge(edge_id);
         }
     }
 
@@ -475,10 +756,15 @@ impl World {
     }
 
     pub fn city_connections(&self, city_id: CityId) -> Vec<CityId> {
-        collect_outgoing(&self.graph, city_id.0, is_travel_route, |index, node, _| match node {
-            WorldNode::City(_) => Some(CityId(index)),
-            _ => None,
-        })
+        collect_outgoing(
+            &self.graph,
+            city_id.0,
+            RelationKind::ConnectedTo,
+            |index, node, _| match node {
+                WorldNode::City(_) => Some(CityId(index)),
+                _ => None,
+            },
+        )
     }
 
     pub fn city_npcs(&self, city_id: CityId) -> Vec<NpcId> {
@@ -490,26 +776,41 @@ impl World {
     }
 
     pub fn place_routes(&self, place_id: PlaceId) -> Vec<(PlaceId, TravelRoute)> {
-        collect_outgoing(&self.graph, place_id.0, is_travel_route, |index, node, edge| {
-            match (node, edge) {
-                (WorldNode::Place(_), WorldEdge::TravelRoute(route)) => Some((PlaceId(index), *route)),
+        collect_outgoing(
+            &self.graph,
+            place_id.0,
+            RelationKind::ConnectedTo,
+            |index, node, edge| match (node, edge) {
+                (WorldNode::Place(_), WorldEdge::TravelRoute(route)) => {
+                    Some((PlaceId(index), *route))
+                }
                 _ => None,
-            }
-        })
+            },
+        )
     }
 
     pub fn place_npcs(&self, place_id: PlaceId) -> Vec<NpcId> {
-        collect_outgoing(&self.graph, place_id.0, is_present_at, |index, node, _| match node {
-            WorldNode::Npc(_) => Some(NpcId(index)),
-            _ => None,
-        })
+        collect_outgoing(
+            &self.graph,
+            place_id.0,
+            RelationKind::Occupies,
+            |index, node, _| match node {
+                WorldNode::Npc(_) => Some(NpcId(index)),
+                _ => None,
+            },
+        )
     }
 
     pub fn place_entities(&self, place_id: PlaceId) -> Vec<EntityId> {
-        collect_outgoing(&self.graph, place_id.0, is_contains_entity, |index, node, _| match node {
-            WorldNode::Entity(_) => Some(EntityId(index)),
-            _ => None,
-        })
+        collect_outgoing(
+            &self.graph,
+            place_id.0,
+            RelationKind::Contains,
+            |index, node, _| match node {
+                WorldNode::Entity(_) => Some(EntityId(index)),
+                _ => None,
+            },
+        )
     }
 
     pub fn place_cars(&self, place_id: PlaceId) -> Vec<EntityId> {
@@ -520,21 +821,28 @@ impl World {
     }
 
     pub fn place_city_ids(&self, place_id: PlaceId) -> Vec<CityId> {
-        collect_incoming(&self.graph, place_id.0, is_contains_place, |index, node, _| match node {
-            WorldNode::City(_) => Some(CityId(index)),
-            _ => None,
-        })
+        collect_incoming(
+            &self.graph,
+            place_id.0,
+            RelationKind::Contains,
+            |index, node, _| match node {
+                WorldNode::City(_) => Some(CityId(index)),
+                _ => None,
+            },
+        )
     }
 
     pub fn entity_place_id(&self, entity_id: EntityId) -> Option<PlaceId> {
-        self.entity_container_place_ids(entity_id).into_iter().next()
+        self.entity_container_place_ids(entity_id)
+            .into_iter()
+            .next()
     }
 
     pub fn entity_container_place_ids(&self, entity_id: EntityId) -> Vec<PlaceId> {
         collect_incoming(
             &self.graph,
             entity_id.0,
-            is_contains_entity,
+            RelationKind::Contains,
             |index, node, _| match node {
                 WorldNode::Place(_) => Some(PlaceId(index)),
                 _ => None,
@@ -543,17 +851,310 @@ impl World {
     }
 
     pub fn npc_resident_city_ids(&self, npc_id: NpcId) -> Vec<CityId> {
-        collect_incoming(&self.graph, npc_id.0, is_resident, |index, node, _| match node {
-            WorldNode::City(_) => Some(CityId(index)),
-            _ => None,
-        })
+        collect_incoming(
+            &self.graph,
+            npc_id.0,
+            RelationKind::ResidentOf,
+            |index, node, _| match node {
+                WorldNode::City(_) => Some(CityId(index)),
+                _ => None,
+            },
+        )
     }
 
     pub fn npc_present_place_ids(&self, npc_id: NpcId) -> Vec<PlaceId> {
-        collect_incoming(&self.graph, npc_id.0, is_present_at, |index, node, _| match node {
-            WorldNode::Place(_) => Some(PlaceId(index)),
-            _ => None,
-        })
+        collect_incoming(
+            &self.graph,
+            npc_id.0,
+            RelationKind::Occupies,
+            |index, node, _| match node {
+                WorldNode::Place(_) => Some(PlaceId(index)),
+                _ => None,
+            },
+        )
+    }
+
+    pub fn npc_conversation_memory(&self, npc_id: NpcId) -> Option<ConversationMemory> {
+        collect_incoming(
+            &self.graph,
+            npc_id.0,
+            RelationKind::IsAbout,
+            |_, node, _| match node {
+                WorldNode::InformationContent(InformationContent::ConversationMemory {
+                    summary,
+                }) => Some(ConversationMemory {
+                    summary: summary.clone(),
+                }),
+                _ => None,
+            },
+        )
+        .into_iter()
+        .next()
+    }
+
+    pub fn merge_npc_conversation_memory(&mut self, npc_id: NpcId, update: ConversationMemory) {
+        let update = update.normalized();
+        if update.is_empty() {
+            return;
+        }
+
+        if let Some(node_id) = self.graph.node_indices().find(|index| {
+            matches!(
+                self.graph.node_weight(*index),
+                Some(WorldNode::InformationContent(
+                    InformationContent::ConversationMemory { .. }
+                ))
+            ) && self
+                .graph
+                .edges_connecting(*index, npc_id.0)
+                .any(|edge| matches!(edge.weight(), WorldEdge::IsAbout))
+        }) {
+            let Some(WorldNode::InformationContent(info)) = self.graph.node_weight_mut(node_id)
+            else {
+                unreachable!("conversation memory node should exist");
+            };
+            let InformationContent::ConversationMemory { summary } = info else {
+                unreachable!("conversation memory node should exist");
+            };
+            let mut memory = ConversationMemory {
+                summary: std::mem::take(summary),
+            };
+            memory.merge_update(update);
+            *summary = memory.summary;
+            return;
+        }
+
+        let index = self.graph.add_node(WorldNode::InformationContent(
+            InformationContent::ConversationMemory {
+                summary: update.summary,
+            },
+        ));
+        add_edge(&mut self.graph, index, npc_id.0, WorldEdge::IsAbout);
+    }
+
+    pub fn discovered_city_ids(&self, player_id: PlayerId) -> Vec<CityId> {
+        let mut ids = collect_incoming(
+            &self.graph,
+            player_id.0,
+            RelationKind::IsAbout,
+            |_, node, _| match node {
+                WorldNode::InformationContent(InformationContent::CityKnowledge {
+                    city_id,
+                    ..
+                }) => Some(*city_id),
+                _ => None,
+            },
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    pub fn discover_city(&mut self, player_id: PlayerId, city_id: CityId, discovered_at: GameTime) {
+        let exists = self.graph.node_indices().any(|index| {
+            matches!(
+                self.graph.node_weight(index),
+                Some(WorldNode::InformationContent(InformationContent::CityKnowledge { city_id: existing, .. }))
+                    if *existing == city_id
+            ) && self
+                .graph
+                .edges_connecting(index, player_id.0)
+                .any(|edge| matches!(edge.weight(), WorldEdge::IsAbout))
+        });
+        if exists {
+            return;
+        }
+        let info_id = self.graph.add_node(WorldNode::InformationContent(
+            InformationContent::CityKnowledge {
+                city_id,
+                discovered_at,
+            },
+        ));
+        add_edge(&mut self.graph, info_id, player_id.0, WorldEdge::IsAbout);
+        add_edge(&mut self.graph, info_id, city_id.0, WorldEdge::IsAbout);
+    }
+
+    pub fn dialogue_npc_id(&self, process_id: ProcessId) -> Option<NpcId> {
+        collect_outgoing(
+            &self.graph,
+            process_id.0,
+            RelationKind::HasParticipant,
+            |index, node, _| match node {
+                WorldNode::Npc(_) => Some(NpcId(index)),
+                _ => None,
+            },
+        )
+        .into_iter()
+        .next()
+    }
+
+    pub fn dialogue_lines(&self, process_id: ProcessId) -> Vec<DialogueLine> {
+        let mut lines = collect_outgoing(
+            &self.graph,
+            process_id.0,
+            RelationKind::HasOutput,
+            |index, node, _| match node {
+                WorldNode::InformationContent(InformationContent::DialogueRecord(line)) => {
+                    Some((index.index(), line.clone()))
+                }
+                _ => None,
+            },
+        );
+        lines.sort_by_key(|(index, line)| (line.timestamp, *index));
+        lines.into_iter().map(|(_, line)| line).collect()
+    }
+
+    pub fn start_dialogue_process(
+        &mut self,
+        player_id: PlayerId,
+        npc_id: NpcId,
+        place_id: PlaceId,
+        started_at: GameTime,
+    ) -> ProcessId {
+        let index = self.graph.add_node(WorldNode::Occurrent(Occurrent {
+            kind: OccurrentKind::Dialogue,
+            started_at,
+            ended_at: None,
+        }));
+        add_edge(
+            &mut self.graph,
+            index,
+            player_id.0,
+            WorldEdge::HasParticipant,
+        );
+        add_edge(&mut self.graph, index, npc_id.0, WorldEdge::HasParticipant);
+        add_edge(&mut self.graph, index, place_id.0, WorldEdge::OccursIn);
+        ProcessId(index)
+    }
+
+    pub fn append_dialogue_utterance(
+        &mut self,
+        process_id: ProcessId,
+        player_id: PlayerId,
+        line: DialogueLine,
+    ) {
+        let speaker = line.speaker;
+        let info_id = self.graph.add_node(WorldNode::InformationContent(
+            InformationContent::DialogueRecord(line),
+        ));
+        add_edge(&mut self.graph, info_id, player_id.0, WorldEdge::IsAbout);
+        add_edge(&mut self.graph, process_id.0, info_id, WorldEdge::HasOutput);
+        add_edge(&mut self.graph, info_id, process_id.0, WorldEdge::IsAbout);
+        if let DialogueSpeaker::Npc(npc_id) = speaker {
+            add_edge(&mut self.graph, info_id, npc_id.0, WorldEdge::IsAbout);
+        }
+    }
+
+    pub fn append_context_entry(&mut self, player_id: PlayerId, entry: ContextEntry) {
+        let info_id = self.graph.add_node(WorldNode::InformationContent(
+            InformationContent::ContextRecord(entry.clone()),
+        ));
+        add_edge(&mut self.graph, info_id, player_id.0, WorldEdge::IsAbout);
+        match entry {
+            ContextEntry::System {
+                context: SystemContext::Travel { destination, .. },
+                ..
+            } => add_edge(
+                &mut self.graph,
+                info_id,
+                destination.id.0,
+                WorldEdge::IsAbout,
+            ),
+            ContextEntry::System {
+                context: SystemContext::Start,
+                ..
+            }
+            | ContextEntry::Dialogue(_) => {}
+        }
+    }
+
+    pub fn recent_context_entries(&self, player_id: PlayerId, limit: usize) -> Vec<ContextEntry> {
+        let mut entries = collect_incoming(
+            &self.graph,
+            player_id.0,
+            RelationKind::IsAbout,
+            |_, node, _| match node {
+                WorldNode::InformationContent(InformationContent::ContextRecord(entry)) => {
+                    Some(entry.clone())
+                }
+                WorldNode::InformationContent(InformationContent::DialogueRecord(line)) => {
+                    Some(ContextEntry::Dialogue(line.clone()))
+                }
+                _ => None,
+            },
+        );
+        entries.sort_by_key(context_entry_timestamp);
+        let len = entries.len();
+        entries
+            .into_iter()
+            .skip(len.saturating_sub(limit))
+            .collect()
+    }
+
+    pub fn end_process(&mut self, process_id: ProcessId, ended_at: GameTime) {
+        let Some(WorldNode::Occurrent(process)) = self.graph.node_weight_mut(process_id.0) else {
+            panic!("invalid process id {:?}", process_id);
+        };
+        process.ended_at = Some(ended_at);
+    }
+
+    pub fn record_travel_process(
+        &mut self,
+        player_id: PlayerId,
+        destination_id: PlaceId,
+        transport_mode: TransportMode,
+        duration: TimeDelta,
+        ended_at: GameTime,
+    ) -> ProcessId {
+        let started_at =
+            GameTime::from_seconds(ended_at.seconds().saturating_sub(duration.seconds()));
+        let index = self.graph.add_node(WorldNode::Occurrent(Occurrent {
+            kind: OccurrentKind::Travel {
+                transport_mode,
+                duration,
+            },
+            started_at,
+            ended_at: Some(ended_at),
+        }));
+        add_edge(
+            &mut self.graph,
+            index,
+            player_id.0,
+            WorldEdge::HasParticipant,
+        );
+        add_edge(
+            &mut self.graph,
+            index,
+            destination_id.0,
+            WorldEdge::OccursIn,
+        );
+        ProcessId(index)
+    }
+
+    pub fn record_waiting_process(
+        &mut self,
+        player_id: PlayerId,
+        place_id: PlaceId,
+        duration: TimeDelta,
+        ended_at: GameTime,
+    ) -> ProcessId {
+        let started_at =
+            GameTime::from_seconds(ended_at.seconds().saturating_sub(duration.seconds()));
+        let index = self.graph.add_node(WorldNode::Occurrent(Occurrent {
+            kind: OccurrentKind::Waiting { duration },
+            started_at,
+            ended_at: Some(ended_at),
+        }));
+        add_edge(
+            &mut self.graph,
+            index,
+            player_id.0,
+            WorldEdge::HasParticipant,
+        );
+        add_edge(&mut self.graph, index, place_id.0, WorldEdge::OccursIn);
+        ProcessId(index)
     }
 
     pub fn move_entity(&mut self, entity_id: EntityId, place_id: PlaceId) {
@@ -592,17 +1193,36 @@ impl World {
     }
 
     fn city_npcs_from_graph(graph: &WorldGraph, city_id: CityId) -> Vec<NpcId> {
-        collect_outgoing(graph, city_id.0, is_resident, |index, node, _| match node {
-            WorldNode::Npc(_) => Some(NpcId(index)),
-            _ => None,
-        })
+        collect_outgoing(
+            graph,
+            city_id.0,
+            RelationKind::ResidentOf,
+            |index, node, _| match node {
+                WorldNode::Npc(_) => Some(NpcId(index)),
+                _ => None,
+            },
+        )
     }
 
     fn city_places_from_graph(graph: &WorldGraph, city_id: CityId) -> Vec<PlaceId> {
-        collect_outgoing(graph, city_id.0, is_contains_place, |index, node, _| match node {
-            WorldNode::Place(_) => Some(PlaceId(index)),
+        collect_outgoing(
+            graph,
+            city_id.0,
+            RelationKind::Contains,
+            |index, node, _| match node {
+                WorldNode::Place(_) => Some(PlaceId(index)),
+                _ => None,
+            },
+        )
+    }
+
+    fn current_time_node_index(&self) -> Option<NodeIndex> {
+        collect_node_ids(&self.graph, |index, node| match node {
+            WorldNode::TemporalRegion(_) => Some(index),
             _ => None,
         })
+        .into_iter()
+        .next()
     }
 }
 
@@ -619,16 +1239,16 @@ fn collect_node_ids<T>(
 fn collect_outgoing<T>(
     graph: &WorldGraph,
     source: NodeIndex,
-    edge_matches: impl Fn(&WorldEdge) -> bool,
+    relation_kind: RelationKind,
     map: impl Fn(NodeIndex, &WorldNode, &WorldEdge) -> Option<T>,
 ) -> Vec<T> {
     graph
         .edges_directed(source, Outgoing)
-        .filter(|edge| edge_matches(edge.weight()))
+        .filter(|edge| edge.weight().relation_kind() == relation_kind)
         .filter_map(|edge| {
-            graph.node_weight(edge.target()).and_then(|node| {
-                map(edge.target(), node, edge.weight())
-            })
+            graph
+                .node_weight(edge.target())
+                .and_then(|node| map(edge.target(), node, edge.weight()))
         })
         .collect()
 }
@@ -636,38 +1256,25 @@ fn collect_outgoing<T>(
 fn collect_incoming<T>(
     graph: &WorldGraph,
     target: NodeIndex,
-    edge_matches: impl Fn(&WorldEdge) -> bool,
+    relation_kind: RelationKind,
     map: impl Fn(NodeIndex, &WorldNode, &WorldEdge) -> Option<T>,
 ) -> Vec<T> {
     graph
         .edges_directed(target, Incoming)
-        .filter(|edge| edge_matches(edge.weight()))
+        .filter(|edge| edge.weight().relation_kind() == relation_kind)
         .filter_map(|edge| {
-            graph.node_weight(edge.source()).and_then(|node| {
-                map(edge.source(), node, edge.weight())
-            })
+            graph
+                .node_weight(edge.source())
+                .and_then(|node| map(edge.source(), node, edge.weight()))
         })
         .collect()
 }
 
-fn is_travel_route(edge: &WorldEdge) -> bool {
-    matches!(edge, WorldEdge::TravelRoute(_))
-}
-
-fn is_contains_place(edge: &WorldEdge) -> bool {
-    matches!(edge, WorldEdge::ContainsPlace)
-}
-
-fn is_contains_entity(edge: &WorldEdge) -> bool {
-    matches!(edge, WorldEdge::ContainsEntity)
-}
-
-fn is_resident(edge: &WorldEdge) -> bool {
-    matches!(edge, WorldEdge::Resident)
-}
-
-fn is_present_at(edge: &WorldEdge) -> bool {
-    matches!(edge, WorldEdge::PresentAt)
+fn context_entry_timestamp(entry: &ContextEntry) -> GameTime {
+    match entry {
+        ContextEntry::System { timestamp, .. } => *timestamp,
+        ContextEntry::Dialogue(line) => line.timestamp,
+    }
 }
 
 pub fn place_name_from_parts(
@@ -1012,21 +1619,82 @@ fn spawn_city_npcs(graph: &mut WorldGraph, rng: &mut ChaCha8Rng, city_id: CityId
             .copied()
             .collect::<Vec<_>>();
         personality_traits.sort();
-        let index = graph.add_node(WorldNode::Npc(Npc {
-            archetype: *NpcArchetype::ALL.choose(rng).unwrap(),
-            personality_traits,
-            goal: *GoalTag::ALL.choose(rng).unwrap(),
-            occupation: *Occupation::ALL.choose(rng).unwrap(),
+        let occupation = *Occupation::ALL.choose(rng).unwrap();
+        let archetype = *NpcArchetype::ALL.choose(rng).unwrap();
+        let goal = *GoalTag::ALL.choose(rng).unwrap();
+        let npc = Npc {
             home_district: *district_ids.choose(rng).unwrap(),
-        }));
+        };
+        let index = graph.add_node(WorldNode::Npc(npc.clone()));
         let npc_id = NpcId(index);
         add_edge(graph, city_id.0, npc_id.0, WorldEdge::Resident);
+        add_npc_dependent_continuants(
+            graph,
+            npc_id,
+            occupation,
+            archetype,
+            goal,
+            &personality_traits,
+        );
         if let Some(place_id) = possible_places
             .get(npc_offset % possible_places.len())
             .copied()
         {
             add_edge(graph, place_id.0, npc_id.0, WorldEdge::PresentAt);
         }
+    }
+}
+
+fn add_npc_dependent_continuants(
+    graph: &mut WorldGraph,
+    npc_id: NpcId,
+    occupation: Occupation,
+    archetype: NpcArchetype,
+    goal: GoalTag,
+    traits: &[TraitTag],
+) {
+    let occupation_id = graph.add_node(WorldNode::DependentContinuant(DependentContinuant::Role(
+        RoleNode {
+            kind: RoleKind::Occupation(occupation),
+        },
+    )));
+    add_edge(
+        graph,
+        occupation_id,
+        npc_id.0,
+        WorldEdge::SpecificallyDependsOn,
+    );
+    add_edge(graph, occupation_id, npc_id.0, WorldEdge::InheresIn);
+
+    let archetype_id = graph.add_node(WorldNode::DependentContinuant(
+        DependentContinuant::Quality(QualityNode {
+            kind: QualityKind::Archetype(archetype),
+        }),
+    ));
+    add_edge(
+        graph,
+        archetype_id,
+        npc_id.0,
+        WorldEdge::SpecificallyDependsOn,
+    );
+    add_edge(graph, archetype_id, npc_id.0, WorldEdge::InheresIn);
+
+    let goal_id = graph.add_node(WorldNode::DependentContinuant(
+        DependentContinuant::Disposition(DispositionNode {
+            kind: DispositionKind::Goal(goal),
+        }),
+    ));
+    add_edge(graph, goal_id, npc_id.0, WorldEdge::SpecificallyDependsOn);
+    add_edge(graph, goal_id, npc_id.0, WorldEdge::InheresIn);
+
+    for trait_tag in traits {
+        let trait_id = graph.add_node(WorldNode::DependentContinuant(
+            DependentContinuant::Disposition(DispositionNode {
+                kind: DispositionKind::Trait(*trait_tag),
+            }),
+        ));
+        add_edge(graph, trait_id, npc_id.0, WorldEdge::SpecificallyDependsOn);
+        add_edge(graph, trait_id, npc_id.0, WorldEdge::InheresIn);
     }
 }
 

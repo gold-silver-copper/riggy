@@ -1,40 +1,15 @@
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
-use crate::domain::events::{ContextEntry, DialogueLine, EntitySummary, PlaceSummary};
+use crate::domain::events::{EntitySummary, PlaceSummary};
 use crate::domain::memory::ConversationMemory;
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
-use crate::world::{CityId, DistrictId, EntityId, LandmarkId, NpcId, TransportMode, World};
+use crate::world::{CityId, DistrictId, LandmarkId, NpcId, TransportMode, World};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameState {
     pub world: World,
-    pub clock: GameTime,
-    pub player_city_id: CityId,
-    pub player_place_id: crate::world::PlaceId,
-    pub occupancy: OccupancyState,
-    pub known_city_ids: Vec<CityId>,
-    #[serde(default)]
-    pub npc_memories: BTreeMap<NpcId, ConversationMemory>,
-    #[serde(default)]
-    pub context_feed: Vec<ContextEntry>,
-    pub active_dialogue: Option<DialogueSession>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum OccupancyState {
-    OnFoot,
-    InVehicle(EntityId),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DialogueSession {
-    pub npc_id: NpcId,
-    pub started_at: GameTime,
-    pub transcript: Vec<DialogueLine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +22,7 @@ pub struct UiSnapshot {
     pub dialogue_partner: Option<DialoguePartnerView>,
     pub routes: Vec<RouteView>,
     pub interactables: Vec<Interactable>,
-    pub context_feed: Vec<ContextEntry>,
+    pub context_feed: Vec<crate::domain::records::ContextEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

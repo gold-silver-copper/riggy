@@ -1,8 +1,11 @@
+use petgraph::stable_graph::NodeIndex;
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 
-use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId};
-use crate::graph_ecs::{WorldEdge, WorldNode};
-use crate::world::{NodeKind, World};
+use crate::domain::ontology::{bfo_class_allowed, relation_spec, relation_specs};
+use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId, PlayerId, ProcessId};
+use crate::graph_ecs::{RelationKind, WorldEdge, WorldNode};
+use crate::world::OccurrentKind;
+use crate::world::World;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvariantViolation {
@@ -24,6 +27,10 @@ pub enum InvariantViolation {
         npc_id: NpcId,
         count: usize,
     },
+    PlayerMultiplePresentAtPlaces {
+        player_id: PlayerId,
+        count: usize,
+    },
     NpcPresentOutsideResidentCity {
         npc_id: NpcId,
         resident_city_id: CityId,
@@ -31,6 +38,25 @@ pub enum InvariantViolation {
     },
     EntityMultipleContainers {
         entity_id: EntityId,
+        count: usize,
+    },
+    PlayerMultipleContainers {
+        player_id: PlayerId,
+        count: usize,
+    },
+    CurrentTimeMissing,
+    CurrentTimeMultiple {
+        count: usize,
+    },
+    PlayerMultipleActiveDialogues {
+        player_id: PlayerId,
+        count: usize,
+    },
+    DialogueMissingNpcParticipant {
+        process_id: ProcessId,
+    },
+    DialogueMultipleNpcParticipants {
+        process_id: ProcessId,
         count: usize,
     },
     InvalidTravelRouteEndpoints {
@@ -53,10 +79,35 @@ pub enum InvariantViolation {
         place_id: PlaceId,
         target: usize,
     },
+    InvalidOntologyRelation {
+        relation: RelationKind,
+        from: usize,
+        to: usize,
+    },
+    MissingSymmetricRelation {
+        relation: RelationKind,
+        from: usize,
+        to: usize,
+    },
 }
 
 pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
     let mut violations = Vec::new();
+    let current_time_count = world
+        .graph
+        .node_indices()
+        .filter(|index| {
+            matches!(
+                world.graph.node_weight(*index),
+                Some(WorldNode::TemporalRegion(_))
+            )
+        })
+        .count();
+    match current_time_count {
+        1 => {}
+        0 => violations.push(InvariantViolation::CurrentTimeMissing),
+        count => violations.push(InvariantViolation::CurrentTimeMultiple { count }),
+    }
 
     for index in world.graph.node_indices() {
         match world.graph.node_weight(index) {
@@ -68,10 +119,7 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                     0 => violations.push(InvariantViolation::PlaceMissingCity {
                         place_id: PlaceId(index),
                     }),
-                    count => violations.push(InvariantViolation::PlaceMultipleCities {
-                        place_id: PlaceId(index),
-                        count,
-                    }),
+                    _ => {}
                 }
             }
             Some(WorldNode::Npc(_)) => {
@@ -81,19 +129,10 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                     0 => violations.push(InvariantViolation::NpcMissingResidentCity {
                         npc_id: NpcId(index),
                     }),
-                    count => violations.push(InvariantViolation::NpcMultipleResidentCities {
-                        npc_id: NpcId(index),
-                        count,
-                    }),
+                    _ => {}
                 }
 
                 let present_at_places = world.npc_present_place_ids(NpcId(index));
-                if present_at_places.len() > 1 {
-                    violations.push(InvariantViolation::NpcMultiplePresentAtPlaces {
-                        npc_id: NpcId(index),
-                        count: present_at_places.len(),
-                    });
-                }
                 if let (Some(resident_city_id), Some(present_place_id)) = (
                     resident_cities.first().copied(),
                     present_at_places.first().copied(),
@@ -109,13 +148,46 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                     }
                 }
             }
-            Some(WorldNode::Entity(_)) => {
-                let container_count = world.entity_container_place_ids(EntityId(index)).len();
-                if container_count > 1 {
-                    violations.push(InvariantViolation::EntityMultipleContainers {
-                        entity_id: EntityId(index),
-                        count: container_count,
+            Some(WorldNode::Entity(_))
+            | Some(WorldNode::DependentContinuant(_))
+            | Some(WorldNode::InformationContent(_))
+            | Some(WorldNode::TemporalRegion(_)) => {}
+            Some(WorldNode::Player(_)) => {
+                let active_dialogues = world.active_dialogue_process_ids(PlayerId(index));
+                if active_dialogues.len() > 1 {
+                    violations.push(InvariantViolation::PlayerMultipleActiveDialogues {
+                        player_id: PlayerId(index),
+                        count: active_dialogues.len(),
                     });
+                }
+            }
+            Some(WorldNode::Occurrent(process)) => {
+                if matches!(process.kind, OccurrentKind::Dialogue) {
+                    let npc_count = world
+                        .graph
+                        .edges_directed(index, petgraph::Direction::Outgoing)
+                        .filter(|edge| {
+                            edge.weight().relation_kind() == RelationKind::HasParticipant
+                        })
+                        .filter(|edge| {
+                            matches!(
+                                world.graph.node_weight(edge.target()),
+                                Some(WorldNode::Npc(_))
+                            )
+                        })
+                        .count();
+                    match npc_count {
+                        1 => {}
+                        0 => violations.push(InvariantViolation::DialogueMissingNpcParticipant {
+                            process_id: ProcessId(index),
+                        }),
+                        count => {
+                            violations.push(InvariantViolation::DialogueMultipleNpcParticipants {
+                                process_id: ProcessId(index),
+                                count,
+                            })
+                        }
+                    }
                 }
             }
             None => {}
@@ -123,86 +195,175 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
     }
 
     for edge in world.graph.edge_references() {
-        match edge.weight() {
-            WorldEdge::TravelRoute(_) => {
-                let valid = edge_matches_either(
-                    world,
-                    edge.source(),
-                    edge.target(),
-                    (NodeKind::City, NodeKind::City),
-                    (NodeKind::Place, NodeKind::Place),
-                );
-                if !valid {
-                    violations.push(InvariantViolation::InvalidTravelRouteEndpoints {
-                        from: edge.source().index(),
-                        to: edge.target().index(),
-                    });
-                }
-            }
-            WorldEdge::ContainsPlace => {
-                if !edge_matches(world, edge.source(), edge.target(), NodeKind::City, NodeKind::Place)
-                {
-                    violations.push(InvariantViolation::InvalidContainsPlaceEdge {
-                        city_id: CityId(edge.source()),
-                        target: edge.target().index(),
-                    });
-                }
-            }
-            WorldEdge::ContainsEntity => {
-                if !edge_matches(
-                    world,
-                    edge.source(),
-                    edge.target(),
-                    NodeKind::Place,
-                    NodeKind::Entity,
-                ) {
-                    violations.push(InvariantViolation::InvalidContainsEntityEdge {
-                        place_id: PlaceId(edge.source()),
-                        target: edge.target().index(),
-                    });
-                }
-            }
-            WorldEdge::Resident => {
-                if !edge_matches(world, edge.source(), edge.target(), NodeKind::City, NodeKind::Npc)
-                {
-                    violations.push(InvariantViolation::InvalidResidentEdge {
-                        city_id: CityId(edge.source()),
-                        target: edge.target().index(),
-                    });
-                }
-            }
-            WorldEdge::PresentAt => {
-                if !edge_matches(world, edge.source(), edge.target(), NodeKind::Place, NodeKind::Npc)
-                {
-                    violations.push(InvariantViolation::InvalidPresentAtEdge {
-                        place_id: PlaceId(edge.source()),
-                        target: edge.target().index(),
-                    });
-                }
-            }
+        if !relation_endpoints_are_valid(world, edge.weight(), edge.source(), edge.target()) {
+            violations.push(invalid_edge_violation(
+                edge.weight(),
+                edge.source(),
+                edge.target(),
+            ));
+        }
+        let spec = relation_spec(edge.weight().relation_kind());
+        if spec.symmetric && !has_symmetric_peer(world, edge.weight(), edge.source(), edge.target())
+        {
+            violations.push(InvariantViolation::MissingSymmetricRelation {
+                relation: spec.kind,
+                from: edge.source().index(),
+                to: edge.target().index(),
+            });
+        }
+    }
+
+    for spec in relation_specs() {
+        if let Some(max_incoming) = spec.target_max_incoming {
+            violations.extend(validate_target_cardinality(world, spec.kind, max_incoming));
         }
     }
 
     violations
 }
 
-fn edge_matches(
+fn relation_endpoints_are_valid(
     world: &World,
-    source: petgraph::stable_graph::NodeIndex,
-    target: petgraph::stable_graph::NodeIndex,
-    expected_source: NodeKind,
-    expected_target: NodeKind,
+    edge: &WorldEdge,
+    source: NodeIndex,
+    target: NodeIndex,
 ) -> bool {
-    world.node_kind(source) == Some(expected_source) && world.node_kind(target) == Some(expected_target)
+    let Some(source_class) = world.bfo_class(source) else {
+        return false;
+    };
+    let Some(target_class) = world.bfo_class(target) else {
+        return false;
+    };
+    let spec = relation_spec(edge.relation_kind());
+    bfo_class_allowed(source_class, spec.source) && bfo_class_allowed(target_class, spec.target)
 }
 
-fn edge_matches_either(
+fn has_symmetric_peer(
     world: &World,
-    source: petgraph::stable_graph::NodeIndex,
-    target: petgraph::stable_graph::NodeIndex,
-    a: (NodeKind, NodeKind),
-    b: (NodeKind, NodeKind),
+    edge: &WorldEdge,
+    source: NodeIndex,
+    target: NodeIndex,
 ) -> bool {
-    edge_matches(world, source, target, a.0, a.1)
-        || edge_matches(world, source, target, b.0, b.1)
+    world
+        .graph
+        .edges_connecting(target, source)
+        .any(|candidate| candidate.weight() == edge)
+}
+
+fn invalid_edge_violation(
+    edge: &WorldEdge,
+    source: NodeIndex,
+    target: NodeIndex,
+) -> InvariantViolation {
+    match edge {
+        WorldEdge::TravelRoute(_) => InvariantViolation::InvalidTravelRouteEndpoints {
+            from: source.index(),
+            to: target.index(),
+        },
+        WorldEdge::ContainsPlace => InvariantViolation::InvalidContainsPlaceEdge {
+            city_id: CityId(source),
+            target: target.index(),
+        },
+        WorldEdge::ContainsEntity => InvariantViolation::InvalidContainsEntityEdge {
+            place_id: PlaceId(source),
+            target: target.index(),
+        },
+        WorldEdge::ContainsPlayer => InvariantViolation::InvalidOntologyRelation {
+            relation: edge.relation_kind(),
+            from: source.index(),
+            to: target.index(),
+        },
+        WorldEdge::Resident => InvariantViolation::InvalidResidentEdge {
+            city_id: CityId(source),
+            target: target.index(),
+        },
+        WorldEdge::PresentAt => InvariantViolation::InvalidPresentAtEdge {
+            place_id: PlaceId(source),
+            target: target.index(),
+        },
+        WorldEdge::SpecificallyDependsOn
+        | WorldEdge::InheresIn
+        | WorldEdge::IsAbout
+        | WorldEdge::HasParticipant
+        | WorldEdge::OccursIn
+        | WorldEdge::HasOutput => InvariantViolation::InvalidOntologyRelation {
+            relation: edge.relation_kind(),
+            from: source.index(),
+            to: target.index(),
+        },
+    }
+}
+
+fn validate_target_cardinality(
+    world: &World,
+    relation: RelationKind,
+    max_incoming: usize,
+) -> Vec<InvariantViolation> {
+    let mut violations = Vec::new();
+
+    for index in world.graph.node_indices() {
+        let count = world
+            .graph
+            .edges_directed(index, petgraph::Direction::Incoming)
+            .filter(|edge| edge.weight().relation_kind() == relation)
+            .count();
+        if count <= max_incoming {
+            continue;
+        }
+        match relation {
+            RelationKind::Contains => match world.graph.node_weight(index) {
+                Some(WorldNode::Place(_)) => {
+                    violations.push(InvariantViolation::PlaceMultipleCities {
+                        place_id: PlaceId(index),
+                        count,
+                    });
+                }
+                Some(WorldNode::Entity(_)) => {
+                    violations.push(InvariantViolation::EntityMultipleContainers {
+                        entity_id: EntityId(index),
+                        count,
+                    });
+                }
+                Some(WorldNode::Player(_)) => {
+                    violations.push(InvariantViolation::PlayerMultipleContainers {
+                        player_id: PlayerId(index),
+                        count,
+                    });
+                }
+                _ => {}
+            },
+            RelationKind::Occupies => match world.graph.node_weight(index) {
+                Some(WorldNode::Npc(_)) => {
+                    violations.push(InvariantViolation::NpcMultiplePresentAtPlaces {
+                        npc_id: NpcId(index),
+                        count,
+                    });
+                }
+                Some(WorldNode::Player(_)) => {
+                    violations.push(InvariantViolation::PlayerMultiplePresentAtPlaces {
+                        player_id: PlayerId(index),
+                        count,
+                    });
+                }
+                _ => {}
+            },
+            RelationKind::ResidentOf => {
+                if matches!(world.graph.node_weight(index), Some(WorldNode::Npc(_))) {
+                    violations.push(InvariantViolation::NpcMultipleResidentCities {
+                        npc_id: NpcId(index),
+                        count,
+                    });
+                }
+            }
+            RelationKind::ConnectedTo
+            | RelationKind::SpecificallyDependsOn
+            | RelationKind::InheresIn
+            | RelationKind::IsAbout
+            | RelationKind::HasParticipant
+            | RelationKind::OccursIn
+            | RelationKind::HasOutput => {}
+        }
+    }
+
+    violations
 }

@@ -1,7 +1,9 @@
 use crate::ai::context::{CityContext, NpcContext};
-use crate::app::query::{current_transport_mode, current_vehicle_id, reachable_car_ids};
+use crate::app::query::{
+    active_dialogue_npc_id, current_place_id, current_transport_mode, current_vehicle_id,
+    reachable_car_ids,
+};
 use crate::domain::events::{EntitySummary, PlaceSummary};
-use crate::domain::memory::ConversationMemory;
 use crate::simulation::{
     ActorView, CityView, DialoguePartnerView, GameState, Interactable, RouteView,
 };
@@ -25,11 +27,11 @@ pub fn entity_summary(world: &World, entity_id: EntityId) -> EntitySummary {
 }
 
 pub fn actor_view(world: &World, npc_id: NpcId) -> ActorView {
-    let npc = world.npc(npc_id);
+    let profile = world.npc_profile(npc_id);
     ActorView {
         id: npc_id,
-        occupation: npc.occupation,
-        archetype: npc.archetype,
+        occupation: profile.occupation,
+        archetype: profile.archetype,
     }
 }
 
@@ -46,16 +48,9 @@ pub fn city_view(world: &World, city_id: CityId) -> CityView {
 }
 
 pub fn dialogue_partner_view(state: &GameState) -> Option<DialoguePartnerView> {
-    state.active_dialogue.as_ref().map(|session| {
-        let npc_id = session.npc_id;
-        DialoguePartnerView {
-            actor: actor_view(&state.world, npc_id),
-            memory: state
-                .npc_memories
-                .get(&npc_id)
-                .filter(|memory| !memory.is_empty())
-                .cloned(),
-        }
+    active_dialogue_npc_id(state).map(|npc_id| DialoguePartnerView {
+        actor: actor_view(&state.world, npc_id),
+        memory: state.world.npc_conversation_memory(npc_id),
     })
 }
 
@@ -63,7 +58,7 @@ pub fn route_views(state: &GameState) -> Vec<RouteView> {
     let transport_mode = current_transport_mode(state);
     state
         .world
-        .place_routes(state.player_place_id)
+        .place_routes(current_place_id(state))
         .iter()
         .map(|(place_id, route)| RouteView {
             destination: place_summary(&state.world, *place_id),
@@ -76,26 +71,22 @@ pub fn route_views(state: &GameState) -> Vec<RouteView> {
 pub fn interactables(state: &GameState) -> Vec<Interactable> {
     let mut interactables = state
         .world
-        .place_npcs(state.player_place_id)
+        .place_npcs(current_place_id(state))
         .into_iter()
         .map(|npc_id| Interactable::Talk(actor_view(&state.world, npc_id)))
         .collect::<Vec<_>>();
-    interactables.extend(
-        reachable_car_ids(state)
-            .into_iter()
-            .map(|entity_id| {
-                let entity = entity_summary(&state.world, entity_id);
-                if current_vehicle_id(state) == Some(entity.id) {
-                    Interactable::ExitVehicle(entity)
-                } else {
-                    Interactable::EnterVehicle(entity)
-                }
-            }),
-    );
+    interactables.extend(reachable_car_ids(state).into_iter().map(|entity_id| {
+        let entity = entity_summary(&state.world, entity_id);
+        if current_vehicle_id(state) == Some(entity.id) {
+            Interactable::ExitVehicle(entity)
+        } else {
+            Interactable::EnterVehicle(entity)
+        }
+    }));
     interactables.extend(
         state
             .world
-            .place_entities(state.player_place_id)
+            .place_entities(current_place_id(state))
             .into_iter()
             .filter(|entity_id| !matches!(state.world.entity(*entity_id).kind, EntityKind::Car))
             .map(|entity_id| Interactable::Inspect(entity_summary(&state.world, entity_id))),
@@ -117,20 +108,13 @@ pub fn city_context(world: &World, city_id: CityId) -> CityContext {
 }
 
 pub fn npc_context(world: &World, npc_id: NpcId) -> NpcContext {
-    let npc = world.npc(npc_id);
+    let profile = world.npc_profile(npc_id);
     NpcContext {
         id: npc_id,
-        archetype: npc.archetype,
-        occupation: npc.occupation,
-        traits: npc.personality_traits.clone(),
-        goal: npc.goal,
-        home_district: npc.home_district,
+        archetype: profile.archetype,
+        occupation: profile.occupation,
+        traits: profile.traits,
+        goal: profile.goal,
+        home_district: profile.home_district,
     }
-}
-
-pub fn conversation_memory<'a>(
-    memories: &'a std::collections::BTreeMap<NpcId, ConversationMemory>,
-    npc_id: NpcId,
-) -> Option<&'a ConversationMemory> {
-    memories.get(&npc_id).filter(|memory| !memory.is_empty())
 }

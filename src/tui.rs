@@ -86,15 +86,17 @@ impl ListMenuKind {
                 .get(index)
                 .filter(|route| route.travel_time.is_some())
                 .map(|route| GameCommand::TravelTo(route.destination.id)),
-            Self::Interact => snapshot
-                .interactables
-                .get(index)
-                .map(|interactable| match interactable {
-                    Interactable::Talk(actor) => GameCommand::OpenDialogue(actor.id),
-                    Interactable::EnterVehicle(entity) => GameCommand::EnterVehicle(entity.id),
-                    Interactable::ExitVehicle(_) => GameCommand::ExitVehicle,
-                    Interactable::Inspect(entity) => GameCommand::InspectEntity(entity.id),
-                }),
+            Self::Interact => {
+                snapshot
+                    .interactables
+                    .get(index)
+                    .map(|interactable| match interactable {
+                        Interactable::Talk(actor) => GameCommand::OpenDialogue(actor.id),
+                        Interactable::EnterVehicle(entity) => GameCommand::EnterVehicle(entity.id),
+                        Interactable::ExitVehicle(_) => GameCommand::ExitVehicle,
+                        Interactable::Inspect(entity) => GameCommand::InspectEntity(entity.id),
+                    })
+            }
         }
     }
 }
@@ -224,7 +226,7 @@ impl App {
                 let Event::Key(key) = event::read()? else {
                     continue;
                 };
-                if key.kind != KeyEventKind::Press {
+                if !is_actionable_key_event(key) {
                     continue;
                 }
                 if self.handle_key(key, &game, &snapshot)? {
@@ -262,19 +264,25 @@ impl App {
         snapshot: &UiSnapshot,
     ) -> Result<bool> {
         match key.code {
-            KeyCode::Char('g') if snapshot.mode == UiMode::Explore => {
+            KeyCode::Char(ch)
+                if snapshot.mode == UiMode::Explore && ch.eq_ignore_ascii_case(&'g') =>
+            {
                 self.state = UiState::ListMenu(ListMenuState {
                     kind: ListMenuKind::Travel,
                     selected: 0,
                 });
             }
-            KeyCode::Char('e') if snapshot.mode == UiMode::Explore => {
+            KeyCode::Char(ch)
+                if snapshot.mode == UiMode::Explore && ch.eq_ignore_ascii_case(&'e') =>
+            {
                 self.state = UiState::ListMenu(ListMenuState {
                     kind: ListMenuKind::Interact,
                     selected: 0,
                 });
             }
-            KeyCode::Char('w') if snapshot.mode == UiMode::Explore => {
+            KeyCode::Char(ch)
+                if snapshot.mode == UiMode::Explore && ch.eq_ignore_ascii_case(&'w') =>
+            {
                 self.state = UiState::WaitMenu;
             }
             KeyCode::Char(ch)
@@ -642,6 +650,10 @@ impl App {
     }
 }
 
+fn is_actionable_key_event(key: KeyEvent) -> bool {
+    !matches!(key.kind, KeyEventKind::Release)
+}
+
 fn cycle_selection(selected: &mut usize, len: usize, forward: bool) {
     if len == 0 {
         *selected = 0;
@@ -665,4 +677,104 @@ fn selected_style() -> Style {
         .fg(Color::Black)
         .bg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crossterm::event::{KeyEventState, KeyModifiers};
+    use tokio::sync::Mutex;
+
+    use crate::app::service::GameService;
+    use crate::llm::MockBackend;
+
+    use super::{
+        App, KeyCode, KeyEvent, KeyEventKind, ListMenuKind, UiState, is_actionable_key_event,
+    };
+
+    #[test]
+    fn actionable_key_events_ignore_release_only() {
+        let press = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        let repeat = KeyEvent {
+            code: KeyCode::Char('g'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: KeyEventState::NONE,
+        };
+        let release = KeyEvent {
+            code: KeyCode::Char('g'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        };
+
+        assert!(is_actionable_key_event(press));
+        assert!(is_actionable_key_event(repeat));
+        assert!(!is_actionable_key_event(release));
+    }
+
+    #[tokio::test]
+    async fn explore_keys_open_the_expected_overlays() {
+        let game = Arc::new(Mutex::new(GameService::new(MockBackend).unwrap()));
+        let snapshot = {
+            let game = game.lock().await;
+            game.snapshot()
+        };
+        let mut app = App::new();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            &game,
+            &snapshot,
+        )
+        .unwrap();
+        assert!(matches!(
+            app.state,
+            UiState::ListMenu(ref menu) if menu.kind == ListMenuKind::Travel
+        ));
+
+        app.state = UiState::Idle;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+            &game,
+            &snapshot,
+        )
+        .unwrap();
+        assert!(matches!(
+            app.state,
+            UiState::ListMenu(ref menu) if menu.kind == ListMenuKind::Interact
+        ));
+
+        app.state = UiState::Idle;
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            &game,
+            &snapshot,
+        )
+        .unwrap();
+        assert!(matches!(app.state, UiState::WaitMenu));
+    }
+
+    #[tokio::test]
+    async fn uppercase_explore_keys_also_open_overlays() {
+        let game = Arc::new(Mutex::new(GameService::new(MockBackend).unwrap()));
+        let snapshot = {
+            let game = game.lock().await;
+            game.snapshot()
+        };
+        let mut app = App::new();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+            &game,
+            &snapshot,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            app.state,
+            UiState::ListMenu(ref menu) if menu.kind == ListMenuKind::Travel
+        ));
+    }
 }
