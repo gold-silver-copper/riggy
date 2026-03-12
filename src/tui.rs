@@ -20,9 +20,7 @@ use crate::presenter::{
     build_world_text, build_world_title, format_duration, render_event_notice,
     render_interactable_label, render_route_label,
 };
-use crate::simulation::{
-    InteractableOption, InteractionTarget, InteractionVerb, RouteView, UiMode, UiSnapshot,
-};
+use crate::simulation::{InteractionTarget, InteractionVerb, UiMode, UiSnapshot};
 
 const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
 const NOTICE_HISTORY_LIMIT: usize = 48;
@@ -37,587 +35,105 @@ pub async fn run<B: LlmBackend + Clone + 'static>(game: GameService<B>) -> Resul
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Normal,
-    Input,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Menu {
-    None,
+enum ListMenuKind {
     Travel,
     Interact,
-    Wait,
 }
 
-struct App {
-    mode: Mode,
-    menu: Menu,
-    input: String,
-    cursor: usize,
-    menu_state: ListState,
-    notices: Vec<String>,
-    wait_duration: TimeDelta,
-    spinner_frame: usize,
-    pending: Option<PendingCommand>,
-}
-
-struct PendingCommand {
-    enter_input_on_success: bool,
-    rx: oneshot::Receiver<anyhow::Result<CommandResult>>,
-}
-
-enum ActiveListMenu<'a> {
-    Travel {
-        world_seed: crate::domain::seed::WorldSeed,
-        routes: &'a [RouteView],
-    },
-    Interact {
-        world_seed: crate::domain::seed::WorldSeed,
-        options: &'a [InteractableOption],
-    },
-}
-
-impl<'a> ActiveListMenu<'a> {
-    fn from(snapshot: &'a UiSnapshot, menu: Menu) -> Option<Self> {
-        match menu {
-            Menu::Travel => Some(Self::Travel {
-                world_seed: snapshot.world_seed,
-                routes: &snapshot.routes,
-            }),
-            Menu::Interact => Some(Self::Interact {
-                world_seed: snapshot.world_seed,
-                options: &snapshot.interactables,
-            }),
-            Menu::None | Menu::Wait => None,
+impl ListMenuKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Travel => "Travel",
+            Self::Interact => "Interact",
         }
     }
 
-    fn title(&self) -> &'static str {
+    fn hint(self) -> Line<'static> {
         match self {
-            Self::Travel { .. } => "Travel",
-            Self::Interact { .. } => "Interact",
+            Self::Travel => Line::from("Up/Down route  Enter travel  Esc back  Ctrl+C quit"),
+            Self::Interact => Line::from("Up/Down target  Enter interact  Esc back  Ctrl+C quit"),
         }
     }
 
-    fn hint(&self) -> Line<'static> {
+    fn len(self, snapshot: &UiSnapshot) -> usize {
         match self {
-            Self::Travel { .. } => Line::from("Up/Down route  Enter travel  Esc back  Ctrl+C quit"),
-            Self::Interact { .. } => {
-                Line::from("Up/Down target  Enter interact  Esc back  Ctrl+C quit")
-            }
+            Self::Travel => snapshot.routes.len(),
+            Self::Interact => snapshot.interactables.len(),
         }
     }
 
-    fn len(&self) -> usize {
+    fn items(self, snapshot: &UiSnapshot) -> Vec<ListItem<'static>> {
         match self {
-            Self::Travel { routes, .. } => routes.len(),
-            Self::Interact { options, .. } => options.len(),
+            Self::Travel => list_items(
+                snapshot
+                    .routes
+                    .iter()
+                    .map(|route| render_route_label(snapshot.world_seed, route)),
+            ),
+            Self::Interact => list_items(
+                snapshot
+                    .interactables
+                    .iter()
+                    .map(|option| render_interactable_label(snapshot.world_seed, option)),
+            ),
         }
     }
 
-    fn items(&self) -> Vec<ListItem<'static>> {
+    fn action(self, snapshot: &UiSnapshot, index: usize) -> Option<GameCommand> {
         match self {
-            Self::Travel { world_seed, routes } => {
-                if routes.is_empty() {
-                    vec![ListItem::new("Nothing available.")]
-                } else {
-                    routes
-                        .iter()
-                        .map(|route| ListItem::new(render_route_label(*world_seed, route)))
-                        .collect()
-                }
-            }
-            Self::Interact {
-                world_seed,
-                options,
-            } => {
-                if options.is_empty() {
-                    vec![ListItem::new("Nothing available.")]
-                } else {
-                    options
-                        .iter()
-                        .map(|option| ListItem::new(render_interactable_label(*world_seed, option)))
-                        .collect()
-                }
-            }
-        }
-    }
-
-    fn action(&self, index: usize) -> Option<GameCommand> {
-        match self {
-            Self::Travel { routes, .. } => routes
+            Self::Travel => snapshot
+                .routes
                 .get(index)
                 .filter(|route| route.travel_time.is_some())
                 .map(|route| GameCommand::TravelTo(route.destination.id)),
-            Self::Interact { options, .. } => options.get(index).map(|option| match option.verb {
-                InteractionVerb::Talk => match option.target {
-                    InteractionTarget::Npc(npc_id) => GameCommand::OpenDialogue(npc_id),
-                    InteractionTarget::Entity(_) => unreachable!("talk verb only targets npcs"),
-                },
-                InteractionVerb::EnterVehicle => match option.target {
-                    InteractionTarget::Entity(entity_id) => GameCommand::EnterVehicle(entity_id),
-                    InteractionTarget::Npc(_) => {
-                        unreachable!("enter vehicle only targets entities")
-                    }
-                },
-                InteractionVerb::ExitVehicle => GameCommand::ExitVehicle,
-                InteractionVerb::Inspect => match option.target {
-                    InteractionTarget::Entity(entity_id) => GameCommand::InspectEntity(entity_id),
-                    InteractionTarget::Npc(_) => unreachable!("inspect only targets entities"),
-                },
-            }),
+            Self::Interact => snapshot
+                .interactables
+                .get(index)
+                .map(|option| match option.verb {
+                    InteractionVerb::Talk => match option.target {
+                        InteractionTarget::Npc(npc_id) => GameCommand::OpenDialogue(npc_id),
+                        InteractionTarget::Entity(_) => {
+                            unreachable!("talk verb only targets npcs")
+                        }
+                    },
+                    InteractionVerb::EnterVehicle => match option.target {
+                        InteractionTarget::Entity(entity_id) => {
+                            GameCommand::EnterVehicle(entity_id)
+                        }
+                        InteractionTarget::Npc(_) => {
+                            unreachable!("enter vehicle only targets entities")
+                        }
+                    },
+                    InteractionVerb::ExitVehicle => GameCommand::ExitVehicle,
+                    InteractionVerb::Inspect => match option.target {
+                        InteractionTarget::Entity(entity_id) => {
+                            GameCommand::InspectEntity(entity_id)
+                        }
+                        InteractionTarget::Npc(_) => {
+                            unreachable!("inspect only targets entities")
+                        }
+                    },
+                }),
         }
     }
 }
 
-impl App {
-    fn new() -> Self {
-        let mut menu_state = ListState::default();
-        menu_state.select(Some(0));
-        Self {
-            mode: Mode::Normal,
-            menu: Menu::None,
-            input: String::new(),
-            cursor: 0,
-            menu_state,
-            notices: Vec::new(),
-            wait_duration: TimeDelta::from_minutes(1),
-            spinner_frame: 0,
-            pending: None,
-        }
+fn list_items(items: impl Iterator<Item = String>) -> Vec<ListItem<'static>> {
+    let items = items.map(ListItem::new).collect::<Vec<_>>();
+    if items.is_empty() {
+        vec![ListItem::new("Nothing available.")]
+    } else {
+        items
     }
+}
 
-    async fn run<B: LlmBackend + Clone + 'static>(
-        &mut self,
-        terminal: &mut DefaultTerminal,
-        game: GameService<B>,
-    ) -> Result<()> {
-        let game = Arc::new(Mutex::new(game));
-        loop {
-            if let Some(should_quit) = self.poll_pending(&game).await? {
-                if should_quit {
-                    break;
-                }
-            }
+#[derive(Default)]
+struct DialogueInputState {
+    input: String,
+    cursor: usize,
+}
 
-            let (snapshot, backend_name) = {
-                let game = game.lock().await;
-                (game.snapshot(), game.backend_name())
-            };
-            self.sync_menu(&snapshot);
-            terminal.draw(|frame| self.render(frame, &snapshot, backend_name))?;
-            self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
-
-            if event::poll(Duration::from_millis(50))? {
-                let Event::Key(key) = event::read()? else {
-                    continue;
-                };
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                let should_quit = if self.pending.is_some() {
-                    self.handle_pending_key(key)?
-                } else {
-                    match self.mode {
-                        Mode::Normal => self.handle_normal_key(key, &game, &snapshot).await?,
-                        Mode::Input => self.handle_input_key(key, &game, &snapshot).await?,
-                    }
-                };
-
-                if should_quit {
-                    break;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_pending_key(&mut self, key: KeyEvent) -> Result<bool> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    async fn handle_normal_key<B: LlmBackend + Clone + 'static>(
-        &mut self,
-        key: KeyEvent,
-        game: &Arc<Mutex<GameService<B>>>,
-        snapshot: &UiSnapshot,
-    ) -> Result<bool> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Ok(true);
-        }
-
-        match key.code {
-            KeyCode::Char('g') if snapshot.mode == UiMode::Explore => self.open_menu(Menu::Travel),
-            KeyCode::Char('e') if snapshot.mode == UiMode::Explore => {
-                self.open_menu(Menu::Interact)
-            }
-            KeyCode::Char('w') if snapshot.mode == UiMode::Explore => self.menu = Menu::Wait,
-            KeyCode::Char(ch)
-                if snapshot.mode == UiMode::Dialogue
-                    && self.menu == Menu::None
-                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.mode = Mode::Input;
-                self.insert_char(ch);
-            }
-            KeyCode::Esc => {
-                if self.menu != Menu::None {
-                    self.menu = Menu::None;
-                } else if snapshot.mode == UiMode::Dialogue {
-                    return self.execute_action(game, GameCommand::LeaveDialogue, false);
-                }
-            }
-            KeyCode::Left if self.menu == Menu::Wait => self.adjust_wait(-1),
-            KeyCode::Right if self.menu == Menu::Wait => self.adjust_wait(1),
-            KeyCode::Down if self.menu == Menu::Wait => self.adjust_wait(-60),
-            KeyCode::Up if self.menu == Menu::Wait => self.adjust_wait(60),
-            KeyCode::Down if ActiveListMenu::from(snapshot, self.menu).is_some() => {
-                self.next_item(snapshot)
-            }
-            KeyCode::Up if ActiveListMenu::from(snapshot, self.menu).is_some() => {
-                self.previous_item(snapshot)
-            }
-            KeyCode::Enter => {
-                if let Some(action) = self.selected_menu_action(snapshot) {
-                    let enter_input = matches!(action, GameCommand::OpenDialogue(_));
-                    return self.execute_action(game, action, enter_input);
-                } else if snapshot.mode == UiMode::Dialogue {
-                    self.mode = Mode::Input;
-                }
-            }
-            _ => {}
-        }
-        Ok(false)
-    }
-
-    async fn handle_input_key<B: LlmBackend + Clone + 'static>(
-        &mut self,
-        key: KeyEvent,
-        game: &Arc<Mutex<GameService<B>>>,
-        snapshot: &UiSnapshot,
-    ) -> Result<bool> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Ok(true);
-        }
-
-        match key.code {
-            KeyCode::Esc => {
-                if snapshot.mode == UiMode::Dialogue {
-                    self.input.clear();
-                    self.cursor = 0;
-                    return self.execute_action(game, GameCommand::LeaveDialogue, false);
-                }
-                self.input.clear();
-                self.cursor = 0;
-                self.mode = Mode::Normal;
-            }
-            KeyCode::Enter => {
-                let submitted = std::mem::take(&mut self.input);
-                self.cursor = 0;
-                if submitted.trim().is_empty() {
-                    self.mode = Mode::Normal;
-                } else {
-                    return self.execute_action(
-                        game,
-                        GameCommand::SubmitDialogueLine(submitted.trim().to_string()),
-                        true,
-                    );
-                }
-            }
-            KeyCode::Backspace => self.delete_char(),
-            KeyCode::Left => self.move_cursor_left(),
-            KeyCode::Right => self.move_cursor_right(),
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_char(ch)
-            }
-            _ => {}
-        }
-        Ok(false)
-    }
-
-    fn execute_action<B: LlmBackend + Clone + 'static>(
-        &mut self,
-        game: &Arc<Mutex<GameService<B>>>,
-        action: GameCommand,
-        enter_input_on_success: bool,
-    ) -> Result<bool> {
-        let (tx, rx) = oneshot::channel();
-        let game = Arc::clone(game);
-        self.pending = Some(PendingCommand {
-            enter_input_on_success,
-            rx,
-        });
-        self.mode = Mode::Normal;
-        spawn_local(async move {
-            let result = {
-                let mut game = game.lock().await;
-                game.apply_command(action).await
-            };
-            let _ = tx.send(result);
-        });
-        Ok(false)
-    }
-
-    async fn poll_pending<B: LlmBackend + Clone + 'static>(
-        &mut self,
-        game: &Arc<Mutex<GameService<B>>>,
-    ) -> Result<Option<bool>> {
-        let Some(mut pending) = self.pending.take() else {
-            return Ok(None);
-        };
-        match pending.rx.try_recv() {
-            Ok(result) => {
-                let should_quit = match result {
-                    Ok(CommandResult {
-                        events,
-                        should_quit,
-                    }) => {
-                        let world_seed = {
-                            let game = game.lock().await;
-                            game.snapshot().world_seed
-                        };
-                        for event in &events {
-                            if let Some(text) = render_event_notice(world_seed, event) {
-                                self.push_notice(text);
-                            }
-                        }
-                        should_quit
-                    }
-                    Err(error) => {
-                        self.push_notice(format!("Action failed: {error:#}"));
-                        false
-                    }
-                };
-                let in_dialogue = {
-                    let game = game.lock().await;
-                    game.snapshot().mode == UiMode::Dialogue
-                };
-                self.mode = if pending.enter_input_on_success && in_dialogue {
-                    Mode::Input
-                } else {
-                    Mode::Normal
-                };
-                if !in_dialogue {
-                    self.menu = Menu::None;
-                }
-                Ok(Some(should_quit))
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                self.pending = Some(pending);
-                Ok(Some(false))
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                self.push_notice("The last action did not finish cleanly.".to_string());
-                Ok(Some(false))
-            }
-        }
-    }
-
-    fn render(&mut self, frame: &mut Frame, snapshot: &UiSnapshot, backend_name: &str) {
-        let layout = Layout::vertical([Constraint::Min(12), Constraint::Length(1)]);
-        let [world_area, command_area] = frame.area().layout(&layout);
-
-        frame.render_widget(self.world_paragraph(snapshot), world_area);
-        self.render_overlay(frame, snapshot, world_area);
-        frame.render_widget(self.command_bar(snapshot, backend_name), command_area);
-
-        if self.mode == Mode::Input && self.pending.is_none() {
-            let area = self.overlay_area(world_area, 72, 6);
-            frame.set_cursor_position(Position::new(area.x + self.cursor as u16 + 1, area.y + 2));
-        }
-    }
-
-    fn world_paragraph(&self, snapshot: &UiSnapshot) -> Paragraph<'static> {
-        let mode_label = match snapshot.mode {
-            UiMode::Explore => "Explore",
-            UiMode::Dialogue => "Dialogue",
-        };
-        let mut title = build_world_title(snapshot).spans;
-        title.push(Span::raw("  "));
-        title.push(Span::styled(
-            format!("[{}]", mode_label),
-            Style::default().fg(Color::Cyan),
-        ));
-        Paragraph::new(build_world_text(snapshot, &self.notices))
-            .block(Block::bordered().title(Line::from(title)))
-            .wrap(Wrap { trim: false })
-    }
-
-    fn render_overlay(&mut self, frame: &mut Frame, snapshot: &UiSnapshot, world_area: Rect) {
-        if self.pending.is_some() {
-            let area = self.overlay_area(world_area, 54, 5);
-            frame.render_widget(Clear, area);
-            frame.render_widget(self.pending_widget(), area);
-            return;
-        }
-
-        match self.mode {
-            Mode::Input => {
-                let area = self.overlay_area(world_area, 72, 6);
-                frame.render_widget(Clear, area);
-                frame.render_widget(self.input_widget(snapshot.mode == UiMode::Dialogue), area);
-            }
-            Mode::Normal => match self.menu {
-                Menu::None => {}
-                Menu::Wait => {
-                    let area = self.overlay_area(world_area, 38, 5);
-                    frame.render_widget(Clear, area);
-                    frame.render_widget(self.wait_widget(), area);
-                }
-                Menu::Travel | Menu::Interact => {
-                    let Some(menu) = ActiveListMenu::from(snapshot, self.menu) else {
-                        return;
-                    };
-                    let items = menu.items();
-                    let height = items.len().min(8) as u16 + 2;
-                    let area = self.overlay_area(world_area, 76, height.max(4));
-                    let list = List::new(items)
-                        .block(Block::bordered().title(menu.title()))
-                        .highlight_style(selected_style())
-                        .highlight_symbol("› ");
-                    frame.render_widget(Clear, area);
-                    frame.render_stateful_widget(list, area, &mut self.menu_state);
-                }
-            },
-        }
-    }
-
-    fn input_widget(&self, in_dialogue: bool) -> Paragraph<'_> {
-        let title = if in_dialogue { "Conversation" } else { "Input" };
-        let lines = vec![
-            Line::from("Type your reply. Press Enter to send or Esc to close."),
-            Line::from(self.input.as_str()),
-        ];
-        Paragraph::new(lines)
-            .style(Style::default().fg(Color::Yellow))
-            .alignment(Alignment::Left)
-            .block(self.context_block().title(title))
-    }
-
-    fn pending_widget(&self) -> Paragraph<'static> {
-        let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    spinner,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" Waiting for the world to respond..."),
-            ]),
-            Line::from(""),
-            Line::from(
-                "Dialogue and world commands run in the background. The UI will stay responsive while this finishes.",
-            ),
-        ])
-        .block(self.context_block().title("Working"))
-        .wrap(Wrap { trim: false })
-    }
-
-    fn command_bar(&self, snapshot: &UiSnapshot, backend_name: &str) -> Line<'static> {
-        if self.pending.is_some() {
-            return Line::from(vec![
-                "Ctrl+C".bold(),
-                " quit  ".into(),
-                Span::raw(format!("Waiting on {}...", backend_name)),
-            ]);
-        }
-
-        match self.mode {
-            Mode::Input => match snapshot.mode {
-                UiMode::Dialogue => {
-                    Line::from("Enter send  Esc leave dialogue  Left/Right move  Ctrl+C quit")
-                }
-                UiMode::Explore => {
-                    Line::from("Enter send  Esc close  Left/Right move  Ctrl+C quit")
-                }
-            },
-            Mode::Normal => match self.menu {
-                Menu::Travel | Menu::Interact => ActiveListMenu::from(snapshot, self.menu)
-                    .expect("list menu should exist")
-                    .hint(),
-                Menu::Wait => {
-                    Line::from("Left/Right +/-1s  Up/Down +/-1m  Enter wait  Esc back  Ctrl+C quit")
-                }
-                Menu::None => match snapshot.mode {
-                    UiMode::Explore => Line::from("g travel  e interact  w wait  Ctrl+C quit"),
-                    UiMode::Dialogue => Line::from("Type reply  Esc leave dialogue  Ctrl+C quit"),
-                },
-            },
-        }
-    }
-
-    fn selected_menu_action(&self, snapshot: &UiSnapshot) -> Option<GameCommand> {
-        let index = self.menu_state.selected().unwrap_or(0);
-        match self.menu {
-            Menu::Travel | Menu::Interact => {
-                ActiveListMenu::from(snapshot, self.menu).and_then(|menu| menu.action(index))
-            }
-            Menu::Wait => Some(GameCommand::Wait(self.wait_duration)),
-            Menu::None => None,
-        }
-    }
-
-    fn sync_menu(&mut self, snapshot: &UiSnapshot) {
-        let len = ActiveListMenu::from(snapshot, self.menu)
-            .map(|menu| menu.len())
-            .unwrap_or(0);
-        if len == 0 {
-            self.menu_state.select(Some(0));
-        } else {
-            let current = self.menu_state.selected().unwrap_or(0).min(len - 1);
-            self.menu_state.select(Some(current));
-        }
-    }
-
-    fn next_item(&mut self, snapshot: &UiSnapshot) {
-        let len = ActiveListMenu::from(snapshot, self.menu)
-            .map(|menu| menu.len())
-            .unwrap_or(0);
-        if len == 0 {
-            return;
-        }
-        let next = match self.menu_state.selected() {
-            Some(index) if index + 1 < len => index + 1,
-            _ => 0,
-        };
-        self.menu_state.select(Some(next));
-    }
-
-    fn previous_item(&mut self, snapshot: &UiSnapshot) {
-        let len = ActiveListMenu::from(snapshot, self.menu)
-            .map(|menu| menu.len())
-            .unwrap_or(0);
-        if len == 0 {
-            return;
-        }
-        let previous = match self.menu_state.selected() {
-            Some(0) | None => len - 1,
-            Some(index) => index - 1,
-        };
-        self.menu_state.select(Some(previous));
-    }
-
-    fn open_menu(&mut self, menu: Menu) {
-        self.menu = menu;
-        self.menu_state.select(Some(0));
-    }
-
-    fn push_notice(&mut self, text: String) {
-        self.notices.push(text);
-        if self.notices.len() > NOTICE_HISTORY_LIMIT {
-            let extra = self.notices.len() - NOTICE_HISTORY_LIMIT;
-            self.notices.drain(0..extra);
-        }
-    }
-
+impl DialogueInputState {
     fn insert_char(&mut self, ch: char) {
         let byte_index = self.byte_index();
         self.input.insert(byte_index, ch);
@@ -647,25 +163,447 @@ impl App {
         self.cursor = (self.cursor + 1).min(self.input.chars().count());
     }
 
+    fn take_trimmed(&mut self) -> Option<String> {
+        let submitted = std::mem::take(&mut self.input);
+        self.cursor = 0;
+        let trimmed = submitted.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
     fn byte_index(&self) -> usize {
         self.input
             .char_indices()
-            .map(|(i, _)| i)
+            .map(|(index, _)| index)
             .nth(self.cursor)
             .unwrap_or(self.input.len())
     }
+}
 
-    fn context_block(&self) -> Block<'static> {
-        let title = match self.mode {
-            Mode::Input => "Conversation",
-            Mode::Normal => match self.menu {
-                Menu::Travel => "Travel",
-                Menu::Interact => "Interact",
-                Menu::Wait => "Wait",
-                Menu::None => "Menu",
-            },
+struct ListMenuState {
+    kind: ListMenuKind,
+    selected: usize,
+}
+
+struct PendingState {
+    resume_input_on_success: bool,
+    rx: oneshot::Receiver<anyhow::Result<CommandResult>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiStateKind {
+    Idle,
+    ListMenu,
+    WaitMenu,
+    DialogueInput,
+    Pending,
+}
+
+enum UiState {
+    Idle,
+    ListMenu(ListMenuState),
+    WaitMenu,
+    DialogueInput(DialogueInputState),
+    Pending(PendingState),
+}
+
+struct App {
+    state: UiState,
+    notices: Vec<String>,
+    wait_duration: TimeDelta,
+    spinner_frame: usize,
+}
+
+impl App {
+    fn new() -> Self {
+        Self {
+            state: UiState::Idle,
+            notices: Vec::new(),
+            wait_duration: TimeDelta::from_minutes(1),
+            spinner_frame: 0,
+        }
+    }
+
+    async fn run<B: LlmBackend + Clone + 'static>(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        game: GameService<B>,
+    ) -> Result<()> {
+        let game = Arc::new(Mutex::new(game));
+        loop {
+            if let Some(should_quit) = self.poll_pending(&game).await? {
+                if should_quit {
+                    break;
+                }
+            }
+
+            let (snapshot, backend_name) = {
+                let game = game.lock().await;
+                (game.snapshot(), game.backend_name())
+            };
+            self.sync_state(&snapshot);
+            terminal.draw(|frame| self.render(frame, &snapshot, backend_name))?;
+            self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+
+            if event::poll(Duration::from_millis(50))? {
+                let Event::Key(key) = event::read()? else {
+                    continue;
+                };
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if self.handle_key(key, &game, &snapshot)? {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_key<B: LlmBackend + Clone + 'static>(
+        &mut self,
+        key: KeyEvent,
+        game: &Arc<Mutex<GameService<B>>>,
+        snapshot: &UiSnapshot,
+    ) -> Result<bool> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return Ok(true);
+        }
+
+        match self.state_kind() {
+            UiStateKind::Pending => Ok(false),
+            UiStateKind::Idle => self.handle_idle_key(key, game, snapshot),
+            UiStateKind::ListMenu => self.handle_list_menu_key(key, game, snapshot),
+            UiStateKind::WaitMenu => self.handle_wait_key(key, game),
+            UiStateKind::DialogueInput => self.handle_dialogue_input_key(key, game),
+        }
+    }
+
+    fn state_kind(&self) -> UiStateKind {
+        match self.state {
+            UiState::Idle => UiStateKind::Idle,
+            UiState::ListMenu(_) => UiStateKind::ListMenu,
+            UiState::WaitMenu => UiStateKind::WaitMenu,
+            UiState::DialogueInput(_) => UiStateKind::DialogueInput,
+            UiState::Pending(_) => UiStateKind::Pending,
+        }
+    }
+
+    fn handle_idle_key<B: LlmBackend + Clone + 'static>(
+        &mut self,
+        key: KeyEvent,
+        game: &Arc<Mutex<GameService<B>>>,
+        snapshot: &UiSnapshot,
+    ) -> Result<bool> {
+        match key.code {
+            KeyCode::Char('g') if snapshot.mode == UiMode::Explore => {
+                self.state = UiState::ListMenu(ListMenuState {
+                    kind: ListMenuKind::Travel,
+                    selected: 0,
+                });
+            }
+            KeyCode::Char('e') if snapshot.mode == UiMode::Explore => {
+                self.state = UiState::ListMenu(ListMenuState {
+                    kind: ListMenuKind::Interact,
+                    selected: 0,
+                });
+            }
+            KeyCode::Char('w') if snapshot.mode == UiMode::Explore => {
+                self.state = UiState::WaitMenu;
+            }
+            KeyCode::Char(ch)
+                if snapshot.mode == UiMode::Dialogue
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let mut input = DialogueInputState::default();
+                input.insert_char(ch);
+                self.state = UiState::DialogueInput(input);
+            }
+            KeyCode::Enter if snapshot.mode == UiMode::Dialogue => {
+                self.state = UiState::DialogueInput(DialogueInputState::default());
+            }
+            KeyCode::Esc if snapshot.mode == UiMode::Dialogue => {
+                return self.execute_action(game, GameCommand::LeaveDialogue, false);
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_list_menu_key<B: LlmBackend + Clone + 'static>(
+        &mut self,
+        key: KeyEvent,
+        game: &Arc<Mutex<GameService<B>>>,
+        snapshot: &UiSnapshot,
+    ) -> Result<bool> {
+        let UiState::ListMenu(menu) = &mut self.state else {
+            return Ok(false);
         };
-        Block::bordered().title(title)
+        match key.code {
+            KeyCode::Esc => self.state = UiState::Idle,
+            KeyCode::Down => cycle_selection(&mut menu.selected, menu.kind.len(snapshot), true),
+            KeyCode::Up => cycle_selection(&mut menu.selected, menu.kind.len(snapshot), false),
+            KeyCode::Enter => {
+                if let Some(action) = menu.kind.action(snapshot, menu.selected) {
+                    let resume_input = matches!(action, GameCommand::OpenDialogue(_));
+                    return self.execute_action(game, action, resume_input);
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_wait_key<B: LlmBackend + Clone + 'static>(
+        &mut self,
+        key: KeyEvent,
+        game: &Arc<Mutex<GameService<B>>>,
+    ) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => self.state = UiState::Idle,
+            KeyCode::Left => self.adjust_wait(-1),
+            KeyCode::Right => self.adjust_wait(1),
+            KeyCode::Down => self.adjust_wait(-60),
+            KeyCode::Up => self.adjust_wait(60),
+            KeyCode::Enter => {
+                return self.execute_action(game, GameCommand::Wait(self.wait_duration), false);
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_dialogue_input_key<B: LlmBackend + Clone + 'static>(
+        &mut self,
+        key: KeyEvent,
+        game: &Arc<Mutex<GameService<B>>>,
+    ) -> Result<bool> {
+        let UiState::DialogueInput(input) = &mut self.state else {
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Esc => {
+                return self.execute_action(game, GameCommand::LeaveDialogue, false);
+            }
+            KeyCode::Enter => {
+                if let Some(submitted) = input.take_trimmed() {
+                    return self.execute_action(
+                        game,
+                        GameCommand::SubmitDialogueLine(submitted),
+                        true,
+                    );
+                }
+                self.state = UiState::Idle;
+            }
+            KeyCode::Backspace => input.delete_char(),
+            KeyCode::Left => input.move_cursor_left(),
+            KeyCode::Right => input.move_cursor_right(),
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                input.insert_char(ch)
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn execute_action<B: LlmBackend + Clone + 'static>(
+        &mut self,
+        game: &Arc<Mutex<GameService<B>>>,
+        action: GameCommand,
+        resume_input_on_success: bool,
+    ) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        let game = Arc::clone(game);
+        self.state = UiState::Pending(PendingState {
+            resume_input_on_success,
+            rx,
+        });
+        spawn_local(async move {
+            let result = {
+                let mut game = game.lock().await;
+                game.apply_command(action).await
+            };
+            let _ = tx.send(result);
+        });
+        Ok(false)
+    }
+
+    async fn poll_pending<B: LlmBackend + Clone + 'static>(
+        &mut self,
+        game: &Arc<Mutex<GameService<B>>>,
+    ) -> Result<Option<bool>> {
+        let UiState::Pending(mut pending) = std::mem::replace(&mut self.state, UiState::Idle)
+        else {
+            return Ok(None);
+        };
+
+        match pending.rx.try_recv() {
+            Ok(result) => {
+                let should_quit = match result {
+                    Ok(CommandResult {
+                        events,
+                        should_quit,
+                    }) => {
+                        let world_seed = {
+                            let game = game.lock().await;
+                            game.snapshot().world_seed
+                        };
+                        for event in &events {
+                            if let Some(text) = render_event_notice(world_seed, event) {
+                                self.push_notice(text);
+                            }
+                        }
+                        should_quit
+                    }
+                    Err(error) => {
+                        self.push_notice(format!("Action failed: {error:#}"));
+                        false
+                    }
+                };
+                let in_dialogue = {
+                    let game = game.lock().await;
+                    game.snapshot().mode == UiMode::Dialogue
+                };
+                self.state = if pending.resume_input_on_success && in_dialogue {
+                    UiState::DialogueInput(DialogueInputState::default())
+                } else {
+                    UiState::Idle
+                };
+                Ok(Some(should_quit))
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.state = UiState::Pending(pending);
+                Ok(Some(false))
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.push_notice("The last action did not finish cleanly.".to_string());
+                Ok(Some(false))
+            }
+        }
+    }
+
+    fn sync_state(&mut self, snapshot: &UiSnapshot) {
+        let reset_to_idle = match &mut self.state {
+            UiState::Idle | UiState::Pending(_) => false,
+            UiState::WaitMenu => snapshot.mode != UiMode::Explore,
+            UiState::DialogueInput(_) => snapshot.mode != UiMode::Dialogue,
+            UiState::ListMenu(menu) => {
+                if snapshot.mode != UiMode::Explore {
+                    true
+                } else {
+                    let len = menu.kind.len(snapshot);
+                    menu.selected = if len == 0 {
+                        0
+                    } else {
+                        menu.selected.min(len - 1)
+                    };
+                    false
+                }
+            }
+        };
+
+        if reset_to_idle {
+            self.state = UiState::Idle;
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame, snapshot: &UiSnapshot, backend_name: &str) {
+        let layout = Layout::vertical([Constraint::Min(12), Constraint::Length(1)]);
+        let [world_area, command_area] = frame.area().layout(&layout);
+
+        frame.render_widget(self.world_paragraph(snapshot), world_area);
+        self.render_overlay(frame, snapshot, world_area);
+        frame.render_widget(self.command_bar(snapshot, backend_name), command_area);
+
+        if let UiState::DialogueInput(input) = &self.state {
+            let area = self.overlay_area(world_area, 72, 6);
+            frame.set_cursor_position(Position::new(area.x + input.cursor as u16 + 1, area.y + 2));
+        }
+    }
+
+    fn world_paragraph(&self, snapshot: &UiSnapshot) -> Paragraph<'static> {
+        let mode_label = match snapshot.mode {
+            UiMode::Explore => "Explore",
+            UiMode::Dialogue => "Dialogue",
+        };
+        let mut title = build_world_title(snapshot).spans;
+        title.push(Span::raw("  "));
+        title.push(Span::styled(
+            format!("[{}]", mode_label),
+            Style::default().fg(Color::Cyan),
+        ));
+        Paragraph::new(build_world_text(snapshot, &self.notices))
+            .block(Block::bordered().title(Line::from(title)))
+            .wrap(Wrap { trim: false })
+    }
+
+    fn render_overlay(&mut self, frame: &mut Frame, snapshot: &UiSnapshot, world_area: Rect) {
+        match &self.state {
+            UiState::Idle => {}
+            UiState::Pending(_) => {
+                let area = self.overlay_area(world_area, 54, 5);
+                frame.render_widget(Clear, area);
+                frame.render_widget(self.pending_widget(), area);
+            }
+            UiState::DialogueInput(input) => {
+                let area = self.overlay_area(world_area, 72, 6);
+                frame.render_widget(Clear, area);
+                frame.render_widget(self.input_widget(&input.input), area);
+            }
+            UiState::WaitMenu => {
+                let area = self.overlay_area(world_area, 38, 5);
+                frame.render_widget(Clear, area);
+                frame.render_widget(self.wait_widget(), area);
+            }
+            UiState::ListMenu(menu) => {
+                let items = menu.kind.items(snapshot);
+                let height = items.len().min(8) as u16 + 2;
+                let area = self.overlay_area(world_area, 76, height.max(4));
+                let list = List::new(items)
+                    .block(Block::bordered().title(menu.kind.title()))
+                    .highlight_style(selected_style())
+                    .highlight_symbol("› ");
+                let mut state = ListState::default();
+                state.select(Some(menu.selected));
+                frame.render_widget(Clear, area);
+                frame.render_stateful_widget(list, area, &mut state);
+            }
+        }
+    }
+
+    fn input_widget<'a>(&self, input: &'a str) -> Paragraph<'a> {
+        Paragraph::new(vec![
+            Line::from("Type your reply. Press Enter to send or Esc to leave."),
+            Line::from(input),
+        ])
+        .style(Style::default().fg(Color::Yellow))
+        .alignment(Alignment::Left)
+        .block(Block::bordered().title("Conversation"))
+    }
+
+    fn pending_widget(&self) -> Paragraph<'static> {
+        let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    spinner,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" Waiting for the world to respond..."),
+            ]),
+            Line::from(""),
+            Line::from(
+                "Dialogue and world commands run in the background. The UI will stay responsive while this finishes.",
+            ),
+        ])
+        .block(Block::bordered().title("Working"))
+        .wrap(Wrap { trim: false })
     }
 
     fn wait_widget(&self) -> Paragraph<'static> {
@@ -682,7 +620,36 @@ impl App {
                 ),
             ]),
         ])
-        .block(self.context_block())
+        .block(Block::bordered().title("Wait"))
+    }
+
+    fn command_bar(&self, snapshot: &UiSnapshot, backend_name: &str) -> Line<'static> {
+        match &self.state {
+            UiState::Pending(_) => Line::from(vec![
+                "Ctrl+C".bold(),
+                " quit  ".into(),
+                Span::raw(format!("Waiting on {}...", backend_name)),
+            ]),
+            UiState::DialogueInput(_) => {
+                Line::from("Enter send  Esc leave dialogue  Left/Right move  Ctrl+C quit")
+            }
+            UiState::ListMenu(menu) => menu.kind.hint(),
+            UiState::WaitMenu => {
+                Line::from("Left/Right +/-1s  Up/Down +/-1m  Enter wait  Esc back  Ctrl+C quit")
+            }
+            UiState::Idle => match snapshot.mode {
+                UiMode::Explore => Line::from("g travel  e interact  w wait  Ctrl+C quit"),
+                UiMode::Dialogue => Line::from("Type reply  Esc leave dialogue  Ctrl+C quit"),
+            },
+        }
+    }
+
+    fn push_notice(&mut self, text: String) {
+        self.notices.push(text);
+        if self.notices.len() > NOTICE_HISTORY_LIMIT {
+            let extra = self.notices.len() - NOTICE_HISTORY_LIMIT;
+            self.notices.drain(0..extra);
+        }
     }
 
     fn adjust_wait(&mut self, delta: i64) {
@@ -710,6 +677,24 @@ impl App {
         ]);
         let [_, center, _] = mid.layout(&horizontal);
         center
+    }
+}
+
+fn cycle_selection(selected: &mut usize, len: usize, forward: bool) {
+    if len == 0 {
+        *selected = 0;
+    } else if forward {
+        *selected = if *selected + 1 < len {
+            *selected + 1
+        } else {
+            0
+        };
+    } else {
+        *selected = if *selected == 0 {
+            len - 1
+        } else {
+            *selected - 1
+        };
     }
 }
 
