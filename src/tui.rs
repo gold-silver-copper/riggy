@@ -1,8 +1,17 @@
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use crossterm::execute;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled};
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -26,11 +35,31 @@ const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
 const NOTICE_HISTORY_LIMIT: usize = 48;
 
 pub async fn run<B: LlmBackend + Clone + 'static>(game: GameService<B>) -> Result<()> {
+    let raw_mode_was_enabled = is_raw_mode_enabled().unwrap_or(false);
+    if !raw_mode_was_enabled {
+        enable_raw_mode()?;
+    }
     let mut terminal = ratatui::init();
+    let _ = execute!(
+        std::io::stdout(),
+        EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    );
     let mut app = App::new();
     let local = LocalSet::new();
     let result = local.run_until(app.run(&mut terminal, game)).await;
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        PopKeyboardEnhancementFlags
+    );
     ratatui::restore();
+    if !raw_mode_was_enabled {
+        let _ = disable_raw_mode();
+    }
     result
 }
 
@@ -189,6 +218,7 @@ struct App {
     notices: Vec<String>,
     wait_duration: TimeDelta,
     spinner_frame: usize,
+    input_debug: InputDebugLogger,
 }
 
 impl App {
@@ -198,6 +228,7 @@ impl App {
             notices: Vec::new(),
             wait_duration: TimeDelta::from_minutes(1),
             spinner_frame: 0,
+            input_debug: InputDebugLogger::from_env(),
         }
     }
 
@@ -206,10 +237,17 @@ impl App {
         terminal: &mut DefaultTerminal,
         game: GameService<B>,
     ) -> Result<()> {
+        self.input_debug.log(format!(
+            "tui start raw_mode_enabled={} pid={} term={:?}",
+            is_raw_mode_enabled().unwrap_or(false),
+            std::process::id(),
+            std::env::var("TERM").ok()
+        ));
         let game = Arc::new(Mutex::new(game));
         loop {
             if let Some(should_quit) = self.poll_pending(&game).await? {
                 if should_quit {
+                    self.input_debug.log("poll_pending requested quit");
                     break;
                 }
             }
@@ -219,22 +257,54 @@ impl App {
                 (game.snapshot(), game.backend_name())
             };
             self.sync_state(&snapshot);
+            self.input_debug.log(format!(
+                "draw mode={:?} state={} routes={} interactables={} notices={}",
+                snapshot.mode,
+                self.state_label(),
+                snapshot.routes.len(),
+                snapshot.interactables.len(),
+                self.notices.len()
+            ));
             terminal.draw(|frame| self.render(frame, &snapshot, backend_name))?;
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
 
             if event::poll(Duration::from_millis(50))? {
-                let Event::Key(key) = event::read()? else {
-                    continue;
-                };
-                if !is_actionable_key_event(key) {
-                    continue;
-                }
-                if self.handle_key(key, &game, &snapshot)? {
-                    break;
+                match event::read()? {
+                    Event::Key(key) => {
+                        self.input_debug.log(format!(
+                            "event key={key:?} state={} mode={:?}",
+                            self.state_label(),
+                            snapshot.mode
+                        ));
+                        if !is_actionable_key_event(key) {
+                            self.input_debug.log("ignored non-actionable key event");
+                            continue;
+                        }
+                        if self.handle_key(key, &game, &snapshot)? {
+                            self.input_debug.log("handle_key requested quit");
+                            break;
+                        }
+                    }
+                    Event::Paste(text) => {
+                        self.input_debug.log(format!(
+                            "event paste={text:?} state={} mode={:?}",
+                            self.state_label(),
+                            snapshot.mode
+                        ));
+                        if self.handle_paste(text, &game, &snapshot)? {
+                            self.input_debug.log("handle_paste requested quit");
+                            break;
+                        }
+                    }
+                    other => self.input_debug.log(format!(
+                        "event other={other:?} state={}",
+                        self.state_label()
+                    )),
                 }
             }
         }
 
+        self.input_debug.log("tui stop");
         Ok(())
     }
 
@@ -245,6 +315,7 @@ impl App {
         snapshot: &UiSnapshot,
     ) -> Result<bool> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.input_debug.log("ctrl-c quit");
             return Ok(true);
         }
 
@@ -264,26 +335,16 @@ impl App {
         snapshot: &UiSnapshot,
     ) -> Result<bool> {
         match key.code {
-            KeyCode::Char(ch)
-                if snapshot.mode == UiMode::Explore && ch.eq_ignore_ascii_case(&'g') =>
-            {
-                self.state = UiState::ListMenu(ListMenuState {
-                    kind: ListMenuKind::Travel,
-                    selected: 0,
-                });
-            }
-            KeyCode::Char(ch)
-                if snapshot.mode == UiMode::Explore && ch.eq_ignore_ascii_case(&'e') =>
-            {
-                self.state = UiState::ListMenu(ListMenuState {
-                    kind: ListMenuKind::Interact,
-                    selected: 0,
-                });
-            }
-            KeyCode::Char(ch)
-                if snapshot.mode == UiMode::Explore && ch.eq_ignore_ascii_case(&'w') =>
-            {
-                self.state = UiState::WaitMenu;
+            KeyCode::Char(ch) if snapshot.mode == UiMode::Explore => {
+                if self.try_open_explore_overlay(ch) {
+                    self.input_debug.log(format!(
+                        "idle explore shortcut opened overlay key={ch:?} state={}",
+                        self.state_label()
+                    ));
+                    return Ok(false);
+                }
+                self.input_debug
+                    .log(format!("idle explore char ignored key={ch:?}"));
             }
             KeyCode::Char(ch)
                 if snapshot.mode == UiMode::Dialogue
@@ -292,15 +353,71 @@ impl App {
                 let mut input = DialogueInputState::default();
                 input.insert_char(ch);
                 self.state = UiState::DialogueInput(input);
+                self.input_debug
+                    .log(format!("dialogue input opened with char key={ch:?}"));
             }
             KeyCode::Enter if snapshot.mode == UiMode::Dialogue => {
                 self.state = UiState::DialogueInput(DialogueInputState::default());
+                self.input_debug.log("dialogue input opened with enter");
             }
             KeyCode::Esc if snapshot.mode == UiMode::Dialogue => {
+                self.input_debug.log("idle dialogue esc leave");
                 return self.execute_action(game, GameCommand::LeaveDialogue, false);
+            }
+            _ => self
+                .input_debug
+                .log(format!("idle key ignored key={:?}", key.code)),
+        }
+        Ok(false)
+    }
+
+    fn handle_paste<B: LlmBackend + Clone + 'static>(
+        &mut self,
+        text: String,
+        game: &Arc<Mutex<GameService<B>>>,
+        snapshot: &UiSnapshot,
+    ) -> Result<bool> {
+        if text.is_empty() {
+            self.input_debug.log("paste ignored empty");
+            return Ok(false);
+        }
+
+        match &mut self.state {
+            UiState::Idle if snapshot.mode == UiMode::Explore => {
+                if text.chars().count() == 1
+                    && self.try_open_explore_overlay(text.chars().next().unwrap())
+                {
+                    self.input_debug
+                        .log(format!("paste opened explore overlay text={text:?}"));
+                    return Ok(false);
+                }
+            }
+            UiState::DialogueInput(input) => {
+                for ch in text.chars() {
+                    input.insert_char(ch);
+                }
+                self.input_debug
+                    .log(format!("paste appended to dialogue input text={text:?}"));
+                return Ok(false);
+            }
+            UiState::Idle if snapshot.mode == UiMode::Dialogue => {
+                let mut input = DialogueInputState::default();
+                for ch in text.chars() {
+                    input.insert_char(ch);
+                }
+                self.state = UiState::DialogueInput(input);
+                self.input_debug
+                    .log(format!("paste opened dialogue input text={text:?}"));
+                return Ok(false);
             }
             _ => {}
         }
+
+        let _ = game;
+        self.input_debug.log(format!(
+            "paste ignored text={text:?} state={}",
+            self.state_label()
+        ));
         Ok(false)
     }
 
@@ -314,16 +431,34 @@ impl App {
             return Ok(false);
         };
         match key.code {
-            KeyCode::Esc => self.state = UiState::Idle,
-            KeyCode::Down => cycle_selection(&mut menu.selected, menu.kind.len(snapshot), true),
-            KeyCode::Up => cycle_selection(&mut menu.selected, menu.kind.len(snapshot), false),
+            KeyCode::Esc => {
+                self.state = UiState::Idle;
+                self.input_debug.log("list menu closed");
+            }
+            KeyCode::Down => {
+                cycle_selection(&mut menu.selected, menu.kind.len(snapshot), true);
+                self.input_debug
+                    .log(format!("list menu moved down selected={}", menu.selected));
+            }
+            KeyCode::Up => {
+                cycle_selection(&mut menu.selected, menu.kind.len(snapshot), false);
+                self.input_debug
+                    .log(format!("list menu moved up selected={}", menu.selected));
+            }
             KeyCode::Enter => {
                 if let Some(action) = menu.kind.action(snapshot, menu.selected) {
                     let resume_input = matches!(action, GameCommand::OpenDialogue(_));
+                    self.input_debug.log(format!(
+                        "list menu execute selected={} action={action:?}",
+                        menu.selected
+                    ));
                     return self.execute_action(game, action, resume_input);
                 }
+                self.input_debug.log("list menu enter had no action");
             }
-            _ => {}
+            _ => self
+                .input_debug
+                .log(format!("list menu key ignored key={:?}", key.code)),
         }
         Ok(false)
     }
@@ -334,15 +469,48 @@ impl App {
         game: &Arc<Mutex<GameService<B>>>,
     ) -> Result<bool> {
         match key.code {
-            KeyCode::Esc => self.state = UiState::Idle,
-            KeyCode::Left => self.adjust_wait(-1),
-            KeyCode::Right => self.adjust_wait(1),
-            KeyCode::Down => self.adjust_wait(-60),
-            KeyCode::Up => self.adjust_wait(60),
+            KeyCode::Esc => {
+                self.state = UiState::Idle;
+                self.input_debug.log("wait menu closed");
+            }
+            KeyCode::Left => {
+                self.adjust_wait(-1);
+                self.input_debug.log(format!(
+                    "wait menu left duration={}",
+                    format_duration(self.wait_duration)
+                ));
+            }
+            KeyCode::Right => {
+                self.adjust_wait(1);
+                self.input_debug.log(format!(
+                    "wait menu right duration={}",
+                    format_duration(self.wait_duration)
+                ));
+            }
+            KeyCode::Down => {
+                self.adjust_wait(-60);
+                self.input_debug.log(format!(
+                    "wait menu down duration={}",
+                    format_duration(self.wait_duration)
+                ));
+            }
+            KeyCode::Up => {
+                self.adjust_wait(60);
+                self.input_debug.log(format!(
+                    "wait menu up duration={}",
+                    format_duration(self.wait_duration)
+                ));
+            }
             KeyCode::Enter => {
+                self.input_debug.log(format!(
+                    "wait menu execute duration={}",
+                    format_duration(self.wait_duration)
+                ));
                 return self.execute_action(game, GameCommand::Wait(self.wait_duration), false);
             }
-            _ => {}
+            _ => self
+                .input_debug
+                .log(format!("wait menu key ignored key={:?}", key.code)),
         }
         Ok(false)
     }
@@ -357,10 +525,13 @@ impl App {
         };
         match key.code {
             KeyCode::Esc => {
+                self.input_debug.log("dialogue input esc leave");
                 return self.execute_action(game, GameCommand::LeaveDialogue, false);
             }
             KeyCode::Enter => {
                 if let Some(submitted) = input.take_trimmed() {
+                    self.input_debug
+                        .log(format!("dialogue submit text={submitted:?}"));
                     return self.execute_action(
                         game,
                         GameCommand::SubmitDialogueLine(submitted),
@@ -368,14 +539,31 @@ impl App {
                     );
                 }
                 self.state = UiState::Idle;
+                self.input_debug.log("dialogue input enter empty -> idle");
             }
-            KeyCode::Backspace => input.delete_char(),
-            KeyCode::Left => input.move_cursor_left(),
-            KeyCode::Right => input.move_cursor_right(),
+            KeyCode::Backspace => {
+                input.delete_char();
+                self.input_debug
+                    .log(format!("dialogue backspace text={:?}", input.input));
+            }
+            KeyCode::Left => {
+                input.move_cursor_left();
+                self.input_debug
+                    .log(format!("dialogue cursor left cursor={}", input.cursor));
+            }
+            KeyCode::Right => {
+                input.move_cursor_right();
+                self.input_debug
+                    .log(format!("dialogue cursor right cursor={}", input.cursor));
+            }
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.insert_char(ch)
+                input.insert_char(ch);
+                self.input_debug
+                    .log(format!("dialogue char key={ch:?} text={:?}", input.input));
             }
-            _ => {}
+            _ => self
+                .input_debug
+                .log(format!("dialogue key ignored key={:?}", key.code)),
         }
         Ok(false)
     }
@@ -388,6 +576,9 @@ impl App {
     ) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
         let game = Arc::clone(game);
+        self.input_debug.log(format!(
+            "execute action={action:?} resume_input_on_success={resume_input_on_success}"
+        ));
         self.state = UiState::Pending(PendingState {
             resume_input_on_success,
             rx,
@@ -406,9 +597,12 @@ impl App {
         &mut self,
         game: &Arc<Mutex<GameService<B>>>,
     ) -> Result<Option<bool>> {
+        if !matches!(self.state, UiState::Pending(_)) {
+            return Ok(None);
+        }
         let UiState::Pending(mut pending) = std::mem::replace(&mut self.state, UiState::Idle)
         else {
-            return Ok(None);
+            unreachable!("pending state should have been checked above");
         };
 
         match pending.rx.try_recv() {
@@ -427,9 +621,15 @@ impl App {
                                 self.push_notice(text);
                             }
                         }
+                        self.input_debug.log(format!(
+                            "pending finished ok events={} should_quit={should_quit}",
+                            events.len()
+                        ));
                         should_quit
                     }
                     Err(error) => {
+                        self.input_debug
+                            .log(format!("pending finished error={error:#}"));
                         self.push_notice(format!("Action failed: {error:#}"));
                         false
                     }
@@ -443,6 +643,10 @@ impl App {
                 } else {
                     UiState::Idle
                 };
+                self.input_debug.log(format!(
+                    "pending transitioned to state={}",
+                    self.state_label()
+                ));
                 Ok(Some(should_quit))
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
@@ -450,6 +654,8 @@ impl App {
                 Ok(Some(false))
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.input_debug.log("pending receiver closed");
+                self.state = UiState::Idle;
                 self.push_notice("The last action did not finish cleanly.".to_string());
                 Ok(Some(false))
             }
@@ -478,6 +684,7 @@ impl App {
 
         if reset_to_idle {
             self.state = UiState::Idle;
+            self.input_debug.log("sync_state reset ui state to idle");
         }
     }
 
@@ -633,6 +840,37 @@ impl App {
         self.wait_duration = next.clamp(TimeDelta::ONE_SECOND, TimeDelta::from_hours(12));
     }
 
+    fn state_label(&self) -> &'static str {
+        match &self.state {
+            UiState::Idle => "idle",
+            UiState::ListMenu(_) => "list_menu",
+            UiState::WaitMenu => "wait_menu",
+            UiState::DialogueInput(_) => "dialogue_input",
+            UiState::Pending(_) => "pending",
+        }
+    }
+
+    fn try_open_explore_overlay(&mut self, ch: char) -> bool {
+        if ch.eq_ignore_ascii_case(&'g') {
+            self.state = UiState::ListMenu(ListMenuState {
+                kind: ListMenuKind::Travel,
+                selected: 0,
+            });
+            true
+        } else if ch.eq_ignore_ascii_case(&'e') {
+            self.state = UiState::ListMenu(ListMenuState {
+                kind: ListMenuKind::Interact,
+                selected: 0,
+            });
+            true
+        } else if ch.eq_ignore_ascii_case(&'w') {
+            self.state = UiState::WaitMenu;
+            true
+        } else {
+            false
+        }
+    }
+
     fn overlay_area(&self, area: Rect, width: u16, height: u16) -> Rect {
         let vertical = Layout::vertical([
             Constraint::Fill(1),
@@ -679,6 +917,62 @@ fn selected_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+struct InputDebugLogger {
+    sink: Option<File>,
+    path: Option<PathBuf>,
+}
+
+impl InputDebugLogger {
+    fn from_env() -> Self {
+        let env_enabled = std::env::var("RIGGY_INPUT_DEBUG")
+            .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        let enabled = (cfg!(debug_assertions) && !cfg!(test)) || env_enabled;
+        if !enabled {
+            return Self {
+                sink: None,
+                path: None,
+            };
+        }
+
+        let path = std::env::var_os("RIGGY_INPUT_LOG")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_input_log_path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let sink = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok();
+
+        let mut logger = Self {
+            sink,
+            path: Some(path),
+        };
+        if let Some(path) = logger.path.as_ref() {
+            logger.log(format!("logging enabled path={}", path.display()));
+        }
+        logger.log("==== new riggy input log session ====");
+        logger
+    }
+
+    fn log(&mut self, message: impl AsRef<str>) {
+        let Some(sink) = &mut self.sink else {
+            return;
+        };
+        let _ = writeln!(sink, "{}", message.as_ref());
+        let _ = sink.flush();
+    }
+}
+
+fn default_input_log_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("riggy-input.log")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -690,7 +984,8 @@ mod tests {
     use crate::llm::MockBackend;
 
     use super::{
-        App, KeyCode, KeyEvent, KeyEventKind, ListMenuKind, UiState, is_actionable_key_event,
+        App, KeyCode, KeyEvent, KeyEventKind, ListMenuKind, UiState, default_input_log_path,
+        is_actionable_key_event,
     };
 
     #[test]
@@ -776,5 +1071,40 @@ mod tests {
             app.state,
             UiState::ListMenu(ref menu) if menu.kind == ListMenuKind::Travel
         ));
+    }
+
+    #[tokio::test]
+    async fn pasted_explore_shortcuts_open_overlays() {
+        let game = Arc::new(Mutex::new(GameService::new(MockBackend).unwrap()));
+        let snapshot = {
+            let game = game.lock().await;
+            game.snapshot()
+        };
+        let mut app = App::new();
+
+        app.handle_paste("e".to_string(), &game, &snapshot).unwrap();
+
+        assert!(matches!(
+            app.state,
+            UiState::ListMenu(ref menu) if menu.kind == ListMenuKind::Interact
+        ));
+    }
+
+    #[test]
+    fn debug_log_defaults_into_repo_target_dir() {
+        let path = default_input_log_path();
+        assert!(path.ends_with("target/riggy-input.log"));
+    }
+
+    #[tokio::test]
+    async fn poll_pending_preserves_non_pending_state() {
+        let game = Arc::new(Mutex::new(GameService::new(MockBackend).unwrap()));
+        let mut app = App::new();
+        app.state = UiState::WaitMenu;
+
+        let result = app.poll_pending(&game).await.unwrap();
+
+        assert_eq!(result, None);
+        assert!(matches!(app.state, UiState::WaitMenu));
     }
 }

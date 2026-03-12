@@ -120,6 +120,10 @@ impl<B: LlmBackend> GameService<B> {
         let data = fs::read_to_string(path)?;
         let mut state = serde_json::from_str::<GameState>(&data)?;
         let player_id = state.world.ensure_player();
+        let current_time = state.world.current_time();
+        for process_id in state.world.active_dialogue_process_ids(player_id) {
+            state.world.end_process(process_id, current_time);
+        }
         if state.world.player_place_id(player_id).is_none() {
             let start_city_id = state.world.city_ids()[0];
             let start_place_id = state.world.city_places(start_city_id)[0];
@@ -514,6 +518,32 @@ mod tests {
             game.state.world.player_city_id(game_player_id),
             loaded.state.world.player_city_id(loaded_player_id)
         );
+    }
+
+    #[tokio::test]
+    async fn load_closes_stale_dialogue_processes() {
+        let mut game = GameService::new(MockBackend).unwrap();
+        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
+        assert_eq!(game.snapshot().mode, UiMode::Dialogue);
+        game.save(Path::new("/tmp/riggy-dialogue-save.json"))
+            .unwrap();
+
+        let mut loaded = GameService::new(MockBackend).unwrap();
+        loaded
+            .load(Path::new("/tmp/riggy-dialogue-save.json"))
+            .unwrap();
+
+        assert_eq!(loaded.snapshot().mode, UiMode::Explore);
+        assert_eq!(
+            loaded
+                .state
+                .world
+                .active_dialogue_npc_id(loaded.player_id()),
+            None
+        );
+        assert!(loaded.snapshot().interactables.iter().any(
+            |interactable| matches!(interactable, Interactable::Talk(actor) if actor.id == npc_id)
+        ));
     }
 
     #[tokio::test]
