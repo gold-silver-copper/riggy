@@ -1,3 +1,4 @@
+use bfo::{BfoClass, RelationKind};
 use petgraph::Direction::{Incoming, Outgoing};
 use petgraph::stable_graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -12,10 +13,8 @@ use crate::domain::records::{ContextEntry, DialogueLine, DialogueSpeaker, System
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
-use crate::graph_ecs::{
-    BfoClass, RelationKind, WorldEdge, WorldGraph, WorldNode, add_edge, edge_snapshot,
-};
 pub use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId, PlayerId, ProcessId};
+use crate::graph_ecs::{WorldEdge, WorldGraph, WorldNode, add_edge, edge_snapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct World {

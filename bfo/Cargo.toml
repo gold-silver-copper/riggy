@@ -1,0 +1,9 @@
+[package]
+name = "bfo"
+version = "0.1.0"
+edition = "2024"
+description = "Basic Formal Ontology types and relation schema"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }

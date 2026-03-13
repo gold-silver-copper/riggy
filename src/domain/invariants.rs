@@ -1,9 +1,9 @@
+use bfo::{RelationKind, bfo_class_allowed, relation_spec, relation_specs};
 use petgraph::stable_graph::NodeIndex;
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 
-use crate::domain::ontology::{bfo_class_allowed, relation_spec, relation_specs};
 use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId, PlayerId, ProcessId};
-use crate::graph_ecs::{RelationKind, WorldEdge, WorldNode};
+use crate::graph_ecs::{WorldEdge, WorldNode};
 use crate::world::OccurrentKind;
 use crate::world::World;
 

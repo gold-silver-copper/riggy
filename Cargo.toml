@@ -3,8 +3,12 @@ name = "riggy"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["bfo"]
+
 [dependencies]
 anyhow = "1.0.100"
+bfo = { path = "bfo", version = "0.1.0" }
 crossterm = "0.29.0"
 futures = "0.3.31"
 petgraph = { version = "0.8.3", features = ["serde-1"] }

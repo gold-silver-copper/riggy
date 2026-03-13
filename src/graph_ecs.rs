@@ -1,3 +1,4 @@
+use bfo::{BfoClass, RelationKind};
 use petgraph::Directed;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
@@ -63,96 +64,6 @@ impl ProcessId {
 }
 
 pub type WorldGraph = StableGraph<WorldNode, WorldEdge, Directed>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum BfoClass {
-    Entity,
-    Continuant,
-    IndependentContinuant,
-    MaterialEntity,
-    Object,
-    ImmaterialEntity,
-    Site,
-    SpecificallyDependentContinuant,
-    Role,
-    Disposition,
-    Function,
-    Quality,
-    GenericallyDependentContinuant,
-    InformationContentEntity,
-    Occurrent,
-    Process,
-    History,
-    TemporalRegion,
-}
-
-impl BfoClass {
-    pub const fn parent(self) -> Option<Self> {
-        match self {
-            Self::Entity => None,
-            Self::Continuant | Self::Occurrent => Some(Self::Entity),
-            Self::IndependentContinuant
-            | Self::SpecificallyDependentContinuant
-            | Self::GenericallyDependentContinuant => Some(Self::Continuant),
-            Self::MaterialEntity | Self::ImmaterialEntity => Some(Self::IndependentContinuant),
-            Self::Object => Some(Self::MaterialEntity),
-            Self::Site => Some(Self::ImmaterialEntity),
-            Self::Role | Self::Disposition | Self::Function | Self::Quality => {
-                Some(Self::SpecificallyDependentContinuant)
-            }
-            Self::InformationContentEntity => Some(Self::GenericallyDependentContinuant),
-            Self::Process | Self::History | Self::TemporalRegion => Some(Self::Occurrent),
-        }
-    }
-
-    pub fn is_a(self, other: Self) -> bool {
-        let mut current = Some(self);
-        while let Some(class) = current {
-            if class == other {
-                return true;
-            }
-            current = class.parent();
-        }
-        false
-    }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Entity => "entity",
-            Self::Continuant => "continuant",
-            Self::IndependentContinuant => "independent continuant",
-            Self::MaterialEntity => "material entity",
-            Self::Object => "object",
-            Self::ImmaterialEntity => "immaterial entity",
-            Self::Site => "site",
-            Self::SpecificallyDependentContinuant => "specifically dependent continuant",
-            Self::Role => "role",
-            Self::Disposition => "disposition",
-            Self::Function => "function",
-            Self::Quality => "quality",
-            Self::GenericallyDependentContinuant => "generically dependent continuant",
-            Self::InformationContentEntity => "information content entity",
-            Self::Occurrent => "occurrent",
-            Self::Process => "process",
-            Self::History => "history",
-            Self::TemporalRegion => "temporal region",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum RelationKind {
-    Contains,
-    Occupies,
-    ResidentOf,
-    ConnectedTo,
-    SpecificallyDependsOn,
-    InheresIn,
-    IsAbout,
-    HasParticipant,
-    OccursIn,
-    HasOutput,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WorldNode {
