@@ -3,6 +3,3 @@ name = "bfo"
 version = "0.1.0"
 edition = "2024"
 description = "Basic Formal Ontology"
-
-[dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
