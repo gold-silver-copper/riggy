@@ -2,9 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use riggy_ontology::time::{GameTime, TimeDelta};
 
-use crate::world::{
-    DistrictId, EntityId, EntityKind, NpcId, PlaceId, PlaceKind, TransportMode, TravelRoute,
-};
+use crate::world::{DistrictId, EntityId, EntityKind, NpcId, PlaceId, PlaceKind, TravelRoute};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaceSummary {
@@ -47,7 +45,6 @@ pub enum SystemContext {
     Start,
     Travel {
         destination: PlaceSummary,
-        transport_mode: TransportMode,
         duration: TimeDelta,
     },
 }
@@ -74,15 +71,8 @@ pub enum GameEvent {
     },
     TravelCompleted {
         destination: PlaceSummary,
-        transport_mode: TransportMode,
         route: TravelRoute,
         duration: TimeDelta,
-    },
-    VehicleEntered {
-        entity: EntitySummary,
-    },
-    VehicleExited {
-        entity: EntitySummary,
     },
     EntityInspected {
         entity: EntitySummary,

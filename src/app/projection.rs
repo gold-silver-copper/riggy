@@ -1,13 +1,10 @@
 use crate::ai::context::{CityContext, NpcContext};
-use crate::app::query::{
-    active_dialogue_npc_id, current_place_id, current_transport_mode, current_vehicle_id,
-    reachable_car_ids,
-};
+use crate::app::query::{active_dialogue_npc_id, current_place_id};
 use crate::domain::events::{EntitySummary, PlaceSummary};
 use crate::simulation::{
     ActorView, CityView, DialoguePartnerView, GameState, Interactable, RouteView,
 };
-use crate::world::{CityId, EntityId, EntityKind, NpcId, PlaceId, World};
+use crate::world::{CityId, EntityId, NpcId, PlaceId, World};
 
 pub fn place_summary(world: &World, place_id: PlaceId) -> PlaceSummary {
     let place = world.place(place_id);
@@ -55,7 +52,6 @@ pub fn dialogue_partner_view(state: &GameState) -> Option<DialoguePartnerView> {
 }
 
 pub fn route_views(state: &GameState) -> Vec<RouteView> {
-    let transport_mode = current_transport_mode(state);
     state
         .world
         .place_routes(current_place_id(state))
@@ -63,7 +59,7 @@ pub fn route_views(state: &GameState) -> Vec<RouteView> {
         .map(|(place_id, route)| RouteView {
             destination: place_summary(&state.world, *place_id),
             route: *route,
-            travel_time: route.travel_time(transport_mode),
+            travel_time: route.travel_time,
         })
         .collect()
 }
@@ -75,20 +71,11 @@ pub fn interactables(state: &GameState) -> Vec<Interactable> {
         .into_iter()
         .map(|npc_id| Interactable::Talk(actor_view(&state.world, npc_id)))
         .collect::<Vec<_>>();
-    interactables.extend(reachable_car_ids(state).into_iter().map(|entity_id| {
-        let entity = entity_summary(&state.world, entity_id);
-        if current_vehicle_id(state) == Some(entity.id) {
-            Interactable::ExitVehicle(entity)
-        } else {
-            Interactable::EnterVehicle(entity)
-        }
-    }));
     interactables.extend(
         state
             .world
             .place_entities(current_place_id(state))
             .into_iter()
-            .filter(|entity_id| !matches!(state.world.entity(*entity_id).kind, EntityKind::Car))
             .map(|entity_id| Interactable::Inspect(entity_summary(&state.world, entity_id))),
     );
     interactables

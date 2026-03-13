@@ -1,10 +1,7 @@
 use crate::app::projection::{
     city_view, dialogue_partner_view, interactables, place_summary, route_views,
 };
-use crate::app::query::{
-    active_dialogue_process_id, current_city_id, current_place_id, current_time,
-    current_transport_mode, player_id,
-};
+use crate::app::query::{active_dialogue_process_id, current_city_id, current_place_id, current_time, player_id};
 use crate::simulation::{GameState, PlayerStatusView, UiMode, UiSnapshot};
 
 const RECENT_CONTEXT_LIMIT: usize = 64;
@@ -12,7 +9,6 @@ const RECENT_CONTEXT_LIMIT: usize = 64;
 pub fn build_ui_snapshot(state: &GameState) -> UiSnapshot {
     let status = PlayerStatusView {
         clock: current_time(state),
-        transport_mode: current_transport_mode(state),
         known_city_count: state.world.discovered_city_ids(player_id(state)).len(),
     };
     let context_feed = state

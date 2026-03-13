@@ -354,11 +354,6 @@ fn invalid_edge_violation(
             place_id: PlaceId(source),
             target: target.index(),
         },
-        WorldEdge::ContainsPlayer => InvariantViolation::InvalidOntologyRelation {
-            relation: edge.relation(),
-            from: source.index(),
-            to: target.index(),
-        },
         WorldEdge::Resident => InvariantViolation::InvalidResidentEdge {
             city_id: CityId(source),
             target: target.index(),

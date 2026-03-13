@@ -55,30 +55,6 @@ macro_rules! labeled_enum {
     };
 }
 
-labeled_enum!(TransportMode {
-    Walking => "walk",
-    Transit => "transit",
-    Car => "car",
-});
-
-impl TransportMode {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Walking => Self::Transit,
-            Self::Transit => Self::Car,
-            Self::Car => Self::Walking,
-        }
-    }
-
-    pub fn previous(self) -> Self {
-        match self {
-            Self::Walking => Self::Car,
-            Self::Transit => Self::Walking,
-            Self::Car => Self::Transit,
-        }
-    }
-}
-
 labeled_enum!(RouteKind {
     Hallway => "hallway",
     Stairwell => "stairwell",
@@ -92,23 +68,7 @@ labeled_enum!(RouteKind {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TravelRoute {
     pub kind: RouteKind,
-    pub walking_time: TimeDelta,
-    pub transit_time: Option<TimeDelta>,
-    pub driving_time: Option<TimeDelta>,
-}
-
-impl TravelRoute {
-    pub fn travel_time(self, mode: TransportMode) -> Option<TimeDelta> {
-        match mode {
-            TransportMode::Walking => Some(self.walking_time),
-            TransportMode::Transit => self.transit_time,
-            TransportMode::Car => self.driving_time,
-        }
-    }
-
-    pub fn supports(self, mode: TransportMode) -> bool {
-        self.travel_time(mode).is_some()
-    }
+    pub travel_time: TimeDelta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -251,7 +211,6 @@ pub struct Entity {
 pub struct Player;
 
 labeled_enum!(EntityKind {
-    Car => "car",
     Gun => "gun",
     Knife => "knife",
     Bag => "bag",
@@ -342,10 +301,7 @@ pub struct TemporalRegion {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OccurrentKind {
     Dialogue,
-    Travel {
-        transport_mode: TransportMode,
-        duration: TimeDelta,
-    },
+    Travel { duration: TimeDelta },
     Waiting {
         duration: TimeDelta,
     },
@@ -437,8 +393,6 @@ impl World {
                     &mut rng,
                     RouteKind::LocalRoad,
                     (60, 180),
-                    None,
-                    Some((20, 60)),
                 );
                 add_bidirectional_route(&mut graph, window[0].0, window[1].0, route);
             }
@@ -449,21 +403,17 @@ impl World {
                     &mut rng,
                     RouteKind::LocalRoad,
                     (120, 360),
-                    Some((60, 180)),
-                    Some((30, 120)),
                 );
                 add_bidirectional_route(&mut graph, a.0, b.0, route);
             }
 
             for window in pedestrian_places.windows(2) {
-                let route =
-                    random_timed_route(&mut rng, RouteKind::SideStreet, (20, 90), None, None);
+                let route = random_timed_route(&mut rng, RouteKind::SideStreet, (20, 90));
                 add_bidirectional_route(&mut graph, window[0].0, window[1].0, route);
             }
 
             if let Some(station_sidewalk) = pedestrian_places.first().copied() {
-                let station_access =
-                    random_timed_route(&mut rng, RouteKind::Hallway, (20, 60), None, None);
+                let station_access = random_timed_route(&mut rng, RouteKind::Hallway, (20, 60));
                 add_bidirectional_route(
                     &mut graph,
                     station_sidewalk.0,
@@ -689,20 +639,6 @@ impl World {
             .and_then(|process_id| self.dialogue_npc_id(process_id))
     }
 
-    pub fn player_vehicle_id(&self, player_id: PlayerId) -> Option<EntityId> {
-        collect_incoming(
-            &self.graph,
-            player_id.0,
-            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::Contains),
-            |index, node, edge| match (node, edge) {
-                (WorldNode::Entity(_), WorldEdge::ContainsPlayer) => Some(EntityId(index)),
-                _ => None,
-            },
-        )
-        .into_iter()
-        .next()
-    }
-
     pub fn move_player(&mut self, player_id: PlayerId, place_id: PlaceId) {
         let existing = self
             .graph
@@ -718,27 +654,6 @@ impl World {
             player_id.0,
             WorldEdge::PresentAt,
         );
-    }
-
-    pub fn board_player_vehicle(&mut self, player_id: PlayerId, vehicle_id: EntityId) {
-        self.leave_player_vehicle(player_id);
-        add_edge(
-            &mut self.graph,
-            vehicle_id.0,
-            player_id.0,
-            WorldEdge::ContainsPlayer,
-        );
-    }
-
-    pub fn leave_player_vehicle(&mut self, player_id: PlayerId) {
-        let existing = self
-            .graph
-            .edges_directed(player_id.0, Incoming)
-            .find(|edge| matches!(edge.weight(), WorldEdge::ContainsPlayer))
-            .map(|edge| edge.id());
-        if let Some(edge_id) = existing {
-            self.graph.remove_edge(edge_id);
-        }
     }
 
     pub fn city_ids(&self) -> Vec<CityId> {
@@ -811,13 +726,6 @@ impl World {
                 _ => None,
             },
         )
-    }
-
-    pub fn place_cars(&self, place_id: PlaceId) -> Vec<EntityId> {
-        self.place_entities(place_id)
-            .into_iter()
-            .filter(|entity_id| matches!(self.entity(*entity_id).kind, EntityKind::Car))
-            .collect()
     }
 
     pub fn place_city_ids(&self, place_id: PlaceId) -> Vec<CityId> {
@@ -1104,17 +1012,13 @@ impl World {
         &mut self,
         player_id: PlayerId,
         destination_id: PlaceId,
-        transport_mode: TransportMode,
         duration: TimeDelta,
         ended_at: GameTime,
     ) -> ProcessId {
         let started_at =
             GameTime::from_seconds(ended_at.seconds().saturating_sub(duration.seconds()));
         let index = self.graph.add_node(WorldNode::Occurrent(Occurrent {
-            kind: OccurrentKind::Travel {
-                transport_mode,
-                duration,
-            },
+            kind: OccurrentKind::Travel { duration },
             started_at,
             ended_at: Some(ended_at),
         }));
@@ -1155,23 +1059,6 @@ impl World {
         );
         add_edge(&mut self.graph, index, place_id.0, WorldEdge::OccursIn);
         ProcessId(index)
-    }
-
-    pub fn move_entity(&mut self, entity_id: EntityId, place_id: PlaceId) {
-        let existing = self
-            .graph
-            .edges_directed(entity_id.0, Incoming)
-            .find(|edge| matches!(edge.weight(), WorldEdge::ContainsEntity))
-            .map(|edge| edge.id());
-        if let Some(edge_id) = existing {
-            self.graph.remove_edge(edge_id);
-        }
-        add_edge(
-            &mut self.graph,
-            place_id.0,
-            entity_id.0,
-            WorldEdge::ContainsEntity,
-        );
     }
 
     pub fn place_city_id(&self, place_id: PlaceId) -> Option<CityId> {
@@ -1317,21 +1204,14 @@ pub fn place_name_from_parts(
 
 pub fn entity_name_from_parts(seed: WorldSeed, id: EntityId, kind: EntityKind) -> String {
     match kind {
-        EntityKind::Car => format!(
-            "{} {}",
-            VEHICLE_PREFIXES
-                [(mix_seed(seed, &[9, id.index() as u64]) as usize) % VEHICLE_PREFIXES.len()],
-            VEHICLE_MODELS
-                [((mix_seed(seed, &[9, id.index() as u64]) >> 16) as usize) % VEHICLE_MODELS.len()]
-        ),
         EntityKind::Gun => GUN_NAMES
-            [(mix_seed(seed, &[10, id.index() as u64]) as usize) % GUN_NAMES.len()]
+            [(mix_seed(seed, &[9, id.index() as u64]) as usize) % GUN_NAMES.len()]
         .to_string(),
         EntityKind::Knife => KNIFE_NAMES
-            [(mix_seed(seed, &[11, id.index() as u64]) as usize) % KNIFE_NAMES.len()]
+            [(mix_seed(seed, &[10, id.index() as u64]) as usize) % KNIFE_NAMES.len()]
         .to_string(),
         EntityKind::Bag => BAG_NAMES
-            [(mix_seed(seed, &[12, id.index() as u64]) as usize) % BAG_NAMES.len()]
+            [(mix_seed(seed, &[11, id.index() as u64]) as usize) % BAG_NAMES.len()]
         .to_string(),
     }
 }
@@ -1369,7 +1249,7 @@ fn add_connected_place(
         graph,
         from.0,
         place_id.0,
-        random_timed_route(rng, route_kind, walking, None, None),
+        random_timed_route(rng, route_kind, walking),
     );
     place_id
 }
@@ -1412,7 +1292,7 @@ fn build_district_bundle(
     city_id: CityId,
     district_id: DistrictId,
     is_starting_apartment_district: bool,
-    is_primary_district: bool,
+    _is_primary_district: bool,
 ) -> DistrictBundle {
     let district_name = district_id.name(seed);
     let road_id = add_place(
@@ -1457,7 +1337,7 @@ fn build_district_bundle(
         graph,
         left_sidewalk_id.0,
         right_sidewalk_id.0,
-        random_timed_route(rng, RouteKind::Crosswalk, (15, 35), None, None),
+        random_timed_route(rng, RouteKind::Crosswalk, (15, 35)),
     );
 
     let building_id = add_connected_place(
@@ -1487,9 +1367,6 @@ fn build_district_bundle(
         ));
     }
 
-    if is_primary_district || rng.random_bool(0.55) {
-        add_entity_to_place(graph, road_id, EntityKind::Car);
-    }
     if rng.random_bool(0.18) {
         let entity_kind = if rng.random_bool(0.5) {
             EntityKind::Knife
@@ -1702,16 +1579,10 @@ fn random_timed_route(
     rng: &mut ChaCha8Rng,
     kind: RouteKind,
     walking: (u32, u32),
-    transit: Option<(u32, u32)>,
-    driving: Option<(u32, u32)>,
 ) -> TravelRoute {
     TravelRoute {
         kind,
-        walking_time: TimeDelta::from_seconds(rng.random_range(walking.0..=walking.1)),
-        transit_time: transit
-            .map(|(min, max)| TimeDelta::from_seconds(rng.random_range(min..=max))),
-        driving_time: driving
-            .map(|(min, max)| TimeDelta::from_seconds(rng.random_range(min..=max))),
+        travel_time: TimeDelta::from_seconds(rng.random_range(walking.0..=walking.1)),
     }
 }
 
@@ -1729,33 +1600,23 @@ fn random_route(rng: &mut ChaCha8Rng, primary_link: bool) -> TravelRoute {
         if rng.random_bool(0.45) {
             TravelRoute {
                 kind: RouteKind::ArterialRoad,
-                walking_time: TimeDelta::from_seconds(rng.random_range(45 * 60..=80 * 60)),
-                transit_time: Some(TimeDelta::from_seconds(rng.random_range(18 * 60..=35 * 60))),
-                driving_time: Some(TimeDelta::from_seconds(rng.random_range(10 * 60..=22 * 60))),
+                travel_time: TimeDelta::from_seconds(rng.random_range(45 * 60..=80 * 60)),
             }
         } else {
             TravelRoute {
                 kind: RouteKind::Highway,
-                walking_time: TimeDelta::from_seconds(rng.random_range(2 * 60 * 60..=4 * 60 * 60)),
-                transit_time: Some(TimeDelta::from_seconds(rng.random_range(45 * 60..=95 * 60))),
-                driving_time: Some(TimeDelta::from_seconds(rng.random_range(30 * 60..=70 * 60))),
+                travel_time: TimeDelta::from_seconds(rng.random_range(2 * 60 * 60..=4 * 60 * 60)),
             }
         }
     } else if rng.random_bool(0.5) {
         TravelRoute {
             kind: RouteKind::Highway,
-            walking_time: TimeDelta::from_seconds(rng.random_range(3 * 60 * 60..=6 * 60 * 60)),
-            transit_time: Some(TimeDelta::from_seconds(
-                rng.random_range(60 * 60..=2 * 60 * 60),
-            )),
-            driving_time: Some(TimeDelta::from_seconds(rng.random_range(40 * 60..=90 * 60))),
+            travel_time: TimeDelta::from_seconds(rng.random_range(3 * 60 * 60..=6 * 60 * 60)),
         }
     } else {
         TravelRoute {
             kind: RouteKind::ArterialRoad,
-            walking_time: TimeDelta::from_seconds(rng.random_range(60 * 60..=2 * 60 * 60)),
-            transit_time: Some(TimeDelta::from_seconds(rng.random_range(25 * 60..=50 * 60))),
-            driving_time: Some(TimeDelta::from_seconds(rng.random_range(15 * 60..=35 * 60))),
+            travel_time: TimeDelta::from_seconds(rng.random_range(60 * 60..=2 * 60 * 60)),
         }
     }
 }
@@ -1833,23 +1694,6 @@ const PLACE_INTERIOR_KINDS: [&str; 6] = [
     "bookstore",
 ];
 const APARTMENT_ROOM_LABELS: [&str; 6] = ["1A", "1B", "2A", "2B", "3A", "3B"];
-const VEHICLE_PREFIXES: [&str; 8] = [
-    "Ashcrest",
-    "Northgate",
-    "Moonline",
-    "Harbor",
-    "Juniper",
-    "Raven",
-    "Quartz",
-    "Lowcross",
-];
-const VEHICLE_MODELS: [&str; 5] = [
-    "sedan",
-    "hatchback",
-    "delivery van",
-    "compact SUV",
-    "rideshare Prius",
-];
 const GUN_NAMES: [&str; 3] = ["compact pistol", "service revolver", "polymer handgun"];
 const KNIFE_NAMES: [&str; 3] = ["pocket knife", "utility knife", "folding knife"];
 const BAG_NAMES: [&str; 3] = ["duffel bag", "messenger bag", "canvas tote"];

@@ -5,7 +5,7 @@ use crate::domain::memory::ConversationMemory;
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
-use crate::world::{CityId, DistrictId, LandmarkId, NpcId, TransportMode, World};
+use crate::world::{CityId, DistrictId, LandmarkId, NpcId, World};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameState {
@@ -29,21 +29,18 @@ pub struct UiSnapshot {
 pub struct RouteView {
     pub destination: PlaceSummary,
     pub route: crate::world::TravelRoute,
-    pub travel_time: Option<TimeDelta>,
+    pub travel_time: TimeDelta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interactable {
     Talk(ActorView),
-    EnterVehicle(EntitySummary),
-    ExitVehicle(EntitySummary),
     Inspect(EntitySummary),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerStatusView {
     pub clock: GameTime,
-    pub transport_mode: TransportMode,
     pub known_city_count: usize,
 }
 

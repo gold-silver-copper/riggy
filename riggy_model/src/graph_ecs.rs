@@ -103,7 +103,6 @@ pub enum WorldEdge {
     TravelRoute(TravelRoute),
     ContainsPlace,
     ContainsEntity,
-    ContainsPlayer,
     Resident,
     PresentAt,
     SpecificallyDependsOn,
@@ -118,7 +117,7 @@ impl WorldEdge {
     pub const fn relation(&self) -> WorldRelation {
         match self {
             Self::TravelRoute(_) => WorldRelation::Riggy(RiggyRelation::TravelRoute),
-            Self::ContainsPlace | Self::ContainsEntity | Self::ContainsPlayer => {
+            Self::ContainsPlace | Self::ContainsEntity => {
                 WorldRelation::Riggy(RiggyRelation::Contains)
             }
             Self::Resident => WorldRelation::Riggy(RiggyRelation::ResidentOf),

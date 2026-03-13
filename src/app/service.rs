@@ -9,7 +9,7 @@ use crate::app::projection::{
 };
 use crate::app::query::{
     active_dialogue_npc_id, active_dialogue_process_id, current_city_id, current_place_id,
-    current_time, current_transport_mode, current_vehicle_id, player_id, reachable_car_ids,
+    current_time, player_id,
 };
 use crate::app::read_model::build_ui_snapshot;
 use crate::domain::commands::GameCommand;
@@ -21,7 +21,7 @@ use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::llm::LlmBackend;
 use crate::simulation::{GameState, UiSnapshot};
-use crate::world::{EntityId, NpcId, PlaceId, PlaceKind, TransportMode, World};
+use crate::world::{EntityId, NpcId, PlaceId, PlaceKind, World};
 
 const START_TIME: GameTime = GameTime::from_seconds(8 * 60 * 60);
 const DIALOGUE_TIME: TimeDelta = TimeDelta::from_seconds(30);
@@ -43,19 +43,6 @@ impl<B: LlmBackend> GameService<B> {
             .iter()
             .copied()
             .find(|place_id| matches!(world.place(*place_id).kind, PlaceKind::ApartmentLobby))
-            .or_else(|| {
-                city_places.iter().copied().find(|place_id| {
-                    world.place(*place_id).kind.supports_people()
-                        && (!world.place_cars(*place_id).is_empty()
-                            || world
-                                .place_routes(*place_id)
-                                .iter()
-                                .any(|(neighbor_id, _)| {
-                                    matches!(world.place(*neighbor_id).kind, PlaceKind::RoadLane)
-                                        && !world.place_cars(*neighbor_id).is_empty()
-                                }))
-                })
-            })
             .or_else(|| {
                 city_places
                     .iter()
@@ -98,8 +85,6 @@ impl<B: LlmBackend> GameService<B> {
             GameCommand::TravelTo(destination) => self.travel_to(destination)?,
             GameCommand::OpenDialogue(npc_id) => self.start_dialogue(npc_id)?,
             GameCommand::SubmitDialogueLine(input) => self.submit_dialogue_line(input).await?,
-            GameCommand::EnterVehicle(entity_id) => vec![self.enter_vehicle(entity_id)?],
-            GameCommand::ExitVehicle => vec![self.exit_vehicle()?],
             GameCommand::InspectEntity(entity_id) => vec![self.inspect_entity(entity_id)?],
             GameCommand::Wait(duration) => vec![self.wait_for(duration.max(TimeDelta::ONE_SECOND))],
             GameCommand::LeaveDialogue => vec![self.leave_dialogue().await?],
@@ -173,7 +158,6 @@ impl<B: LlmBackend> GameService<B> {
     }
 
     fn travel_to(&mut self, destination_id: PlaceId) -> Result<Vec<GameEvent>> {
-        let place = self.current_place();
         let (resolved_destination_id, route) = self
             .state
             .world
@@ -181,19 +165,7 @@ impl<B: LlmBackend> GameService<B> {
             .into_iter()
             .find(|(place_id, _)| *place_id == destination_id)
             .ok_or_else(|| anyhow::anyhow!("Selected route is no longer available."))?;
-        let transport_mode = current_transport_mode(&self.state);
-        if transport_mode == TransportMode::Car
-            && (!matches!(place.kind, PlaceKind::RoadLane)
-                || !matches!(
-                    self.state.world.place(resolved_destination_id).kind,
-                    PlaceKind::RoadLane
-                ))
-        {
-            bail!("You can only drive along roads while you are in a vehicle.");
-        }
-        let travel_time = route.travel_time(transport_mode).ok_or_else(|| {
-            anyhow::anyhow!("You cannot use {} on this route.", transport_mode.label())
-        })?;
+        let travel_time = route.travel_time;
 
         self.move_player_to(resolved_destination_id);
         self.advance_time(travel_time);
@@ -201,7 +173,6 @@ impl<B: LlmBackend> GameService<B> {
         self.state.world.record_travel_process(
             player_id,
             resolved_destination_id,
-            transport_mode,
             travel_time,
             current_time(&self.state),
         );
@@ -211,7 +182,6 @@ impl<B: LlmBackend> GameService<B> {
             current_time(&self.state),
             SystemContext::Travel {
                 destination,
-                transport_mode,
                 duration: travel_time,
             },
         );
@@ -219,7 +189,6 @@ impl<B: LlmBackend> GameService<B> {
             context_event,
             GameEvent::TravelCompleted {
                 destination,
-                transport_mode,
                 route,
                 duration: travel_time,
             },
@@ -252,39 +221,6 @@ impl<B: LlmBackend> GameService<B> {
         let mut events = vec![GameEvent::DialogueStarted { npc_id }];
         events.extend(self.record_dialogue_line(DialogueSpeaker::Npc(npc_id), opening_text));
         Ok(events)
-    }
-
-    fn enter_vehicle(&mut self, entity_id: EntityId) -> Result<GameEvent> {
-        if current_vehicle_id(&self.state).is_some() {
-            bail!("You are already in a vehicle.");
-        }
-        if !reachable_car_ids(&self.state).contains(&entity_id) {
-            bail!("That vehicle is no longer reachable.");
-        }
-        let vehicle_place_id = self
-            .state
-            .world
-            .entity_place_id(entity_id)
-            .expect("vehicle should always belong to a place");
-        if !matches!(
-            self.state.world.place(vehicle_place_id).kind,
-            PlaceKind::RoadLane
-        ) {
-            bail!("You can only get into a vehicle that is parked on a road.");
-        }
-        self.move_player_to(vehicle_place_id);
-        self.state
-            .world
-            .board_player_vehicle(self.player_id(), entity_id);
-        Ok(self.vehicle_event(entity_id, true))
-    }
-
-    fn exit_vehicle(&mut self) -> Result<GameEvent> {
-        let Some(vehicle_id) = current_vehicle_id(&self.state) else {
-            bail!("You are not in a vehicle.");
-        };
-        self.state.world.leave_player_vehicle(self.player_id());
-        Ok(self.vehicle_event(vehicle_id, false))
     }
 
     fn inspect_entity(&self, entity_id: EntityId) -> Result<GameEvent> {
@@ -345,9 +281,6 @@ impl<B: LlmBackend> GameService<B> {
     fn move_player_to(&mut self, place_id: PlaceId) {
         let player_id = self.player_id();
         self.state.world.move_player(player_id, place_id);
-        if let Some(vehicle_id) = current_vehicle_id(&self.state) {
-            self.state.world.move_entity(vehicle_id, place_id);
-        }
     }
 
     fn record_dialogue_line(&mut self, speaker: DialogueSpeaker, text: String) -> Vec<GameEvent> {
@@ -368,15 +301,6 @@ impl<B: LlmBackend> GameService<B> {
         ]
     }
 
-    fn vehicle_event(&self, entity_id: EntityId, entered: bool) -> GameEvent {
-        let entity = self.entity_summary(entity_id);
-        if entered {
-            GameEvent::VehicleEntered { entity }
-        } else {
-            GameEvent::VehicleExited { entity }
-        }
-    }
-
     fn advance_time(&mut self, duration: TimeDelta) {
         let next_time = current_time(&self.state).advance(duration);
         self.state.world.set_current_time(next_time);
@@ -392,10 +316,6 @@ impl<B: LlmBackend> GameService<B> {
                 .world
                 .discover_city(player_id, connected, current_time(&self.state));
         }
-    }
-
-    fn current_place(&self) -> &crate::world::Place {
-        self.state.world.place(current_place_id(&self.state))
     }
 
     fn player_id(&self) -> crate::world::PlayerId {

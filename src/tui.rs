@@ -84,7 +84,6 @@ impl ListMenuKind {
             Self::Travel => snapshot
                 .routes
                 .get(index)
-                .filter(|route| route.travel_time.is_some())
                 .map(|route| GameCommand::TravelTo(route.destination.id)),
             Self::Interact => {
                 snapshot
@@ -92,8 +91,6 @@ impl ListMenuKind {
                     .get(index)
                     .map(|interactable| match interactable {
                         Interactable::Talk(actor) => GameCommand::OpenDialogue(actor.id),
-                        Interactable::EnterVehicle(entity) => GameCommand::EnterVehicle(entity.id),
-                        Interactable::ExitVehicle(_) => GameCommand::ExitVehicle,
                         Interactable::Inspect(entity) => GameCommand::InspectEntity(entity.id),
                     })
             }

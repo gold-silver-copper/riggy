@@ -57,11 +57,6 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
         Line::from(vec![
             Span::raw("Time: "),
             highlighted(snapshot.status.clock.format(), Color::Cyan),
-            Span::raw("  |  Transport: "),
-            highlighted(
-                snapshot.status.transport_mode.label().to_string(),
-                Color::Yellow,
-            ),
             Span::raw("  |  Known cities: "),
             highlighted(snapshot.status.known_city_count.to_string(), Color::Green),
         ]),
@@ -118,26 +113,6 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
             "People here",
             people_here.into_iter(),
             Color::Magenta,
-            " | ",
-        );
-    }
-
-    let vehicles_within_reach = snapshot
-        .interactables
-        .iter()
-        .filter_map(|interactable| match interactable {
-            Interactable::EnterVehicle(entity) | Interactable::ExitVehicle(entity) => {
-                Some(formatter.entity(entity))
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if !vehicles_within_reach.is_empty() {
-        push_list_section(
-            &mut lines,
-            "Vehicles within reach",
-            vehicles_within_reach.into_iter(),
-            Color::Yellow,
             " | ",
         );
     }
@@ -208,19 +183,12 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
 
 pub fn render_route_label(world_seed: WorldSeed, option: &RouteView) -> String {
     let destination_name = WorldFormatter::new(world_seed).place(&option.destination);
-    match option.travel_time {
-        Some(duration) => format!(
-            "{} via {} ({})",
-            destination_name,
-            option.route.kind.label(),
-            format_duration(duration),
-        ),
-        None => format!(
-            "{} via {} (unavailable)",
-            destination_name,
-            option.route.kind.label(),
-        ),
-    }
+    format!(
+        "{} via {} ({})",
+        destination_name,
+        option.route.kind.label(),
+        format_duration(option.travel_time),
+    )
 }
 
 pub fn render_interactable_label(world_seed: WorldSeed, interactable: &Interactable) -> String {
@@ -232,12 +200,6 @@ pub fn render_interactable_label(world_seed: WorldSeed, interactable: &Interacta
             actor.occupation.label(),
             actor.archetype.label()
         ),
-        Interactable::EnterVehicle(entity) => {
-            format!("{} - enter vehicle", formatter.entity(entity))
-        }
-        Interactable::ExitVehicle(entity) => {
-            format!("{} - exit vehicle", formatter.entity(entity))
-        }
         Interactable::Inspect(entity) => {
             format!(
                 "{} - inspect {}",
@@ -404,17 +366,11 @@ impl WorldFormatter {
     fn system_context(&self, context: &SystemContext) -> String {
         match context {
             SystemContext::Start => {
-                "You arrived in a starter apartment with a need for useful names and a parked car somewhere close by.".to_string()
+                "You arrived in a starter apartment with a need for useful names.".to_string()
             }
-            SystemContext::Travel {
-                destination,
-                transport_mode,
-                duration,
-                ..
-            } => format!(
-                "Arrived at {} via {} after {}.",
+            SystemContext::Travel { destination, duration } => format!(
+                "Arrived at {} after {}.",
                 self.place(destination),
-                transport_mode.label(),
                 format_duration(*duration)
             ),
         }
@@ -432,22 +388,14 @@ impl WorldFormatter {
             }
             GameEvent::TravelCompleted {
                 destination,
-                transport_mode,
                 route,
                 duration,
             } => Some(format!(
-                "You travel to {} by {} on {} in {}.",
+                "You travel to {} on {} in {}.",
                 self.place(destination),
-                transport_mode.label(),
                 route.kind.label(),
                 format_duration(*duration)
             )),
-            GameEvent::VehicleEntered { entity } => {
-                Some(format!("You get into the {}.", self.entity(entity)))
-            }
-            GameEvent::VehicleExited { entity } => {
-                Some(format!("You get out of the {}.", self.entity(entity)))
-            }
             GameEvent::EntityInspected { entity } => Some(format!(
                 "You inspect {}. It looks like a {} left out in plain view.",
                 self.entity(entity),
@@ -485,7 +433,7 @@ mod tests {
         UiMode, UiSnapshot,
     };
     use crate::world::{
-        CityId, DistrictId, EntityKind, PlaceKind, RouteKind, TransportMode, TravelRoute,
+        CityId, DistrictId, EntityKind, PlaceKind, RouteKind, TravelRoute,
         entity_name_from_parts, place_name_from_parts,
     };
 
@@ -524,7 +472,7 @@ mod tests {
 
         let talk_label = render_interactable_label(snapshot.world_seed, &snapshot.interactables[0]);
         let inspect_label =
-            render_interactable_label(snapshot.world_seed, &snapshot.interactables[2]);
+            render_interactable_label(snapshot.world_seed, &snapshot.interactables[1]);
 
         assert_eq!(
             talk_label,
@@ -540,7 +488,7 @@ mod tests {
             inspect_label,
             format!(
                 "{} - inspect bag",
-                match snapshot.interactables[2] {
+                match snapshot.interactables[1] {
                     Interactable::Inspect(entity) => {
                         entity_name_from_parts(snapshot.world_seed, entity.id, entity.kind)
                     }
@@ -579,13 +527,12 @@ mod tests {
                     district_id: snapshot.routes[0].destination.district_id,
                     kind: snapshot.routes[0].destination.kind,
                 },
-                transport_mode: TransportMode::Walking,
                 route: snapshot.routes[0].route,
                 duration: TimeDelta::from_seconds(600),
             },
         );
         let expected = format!(
-            "You travel to {} by walk on arterial road in 10m 00s.",
+            "You travel to {} on arterial road in 10m 00s.",
             place_name_from_parts(
                 snapshot.world_seed,
                 snapshot.routes[0].destination.id,
@@ -618,12 +565,8 @@ mod tests {
             occupation: Occupation::Journalist,
             archetype: NpcArchetype::Watcher,
         };
-        let car = EntitySummary {
-            id: EntityId(NodeIndex::new(4)),
-            kind: EntityKind::Car,
-        };
         let bag = EntitySummary {
-            id: EntityId(NodeIndex::new(5)),
+            id: EntityId(NodeIndex::new(4)),
             kind: EntityKind::Bag,
         };
 
@@ -632,7 +575,6 @@ mod tests {
             mode: UiMode::Dialogue,
             status: PlayerStatusView {
                 clock: GameTime::from_seconds(29_400),
-                transport_mode: TransportMode::Walking,
                 known_city_count: 3,
             },
             city: CityView {
@@ -661,17 +603,11 @@ mod tests {
                 destination: route_destination,
                 route: TravelRoute {
                     kind: RouteKind::ArterialRoad,
-                    walking_time: crate::domain::time::TimeDelta::from_seconds(600),
-                    transit_time: Some(crate::domain::time::TimeDelta::from_seconds(240)),
-                    driving_time: Some(crate::domain::time::TimeDelta::from_seconds(120)),
+                    travel_time: crate::domain::time::TimeDelta::from_seconds(600),
                 },
-                travel_time: Some(TimeDelta::from_seconds(600)),
+                travel_time: TimeDelta::from_seconds(600),
             }],
-            interactables: vec![
-                Interactable::Talk(actor),
-                Interactable::EnterVehicle(car),
-                Interactable::Inspect(bag),
-            ],
+            interactables: vec![Interactable::Talk(actor), Interactable::Inspect(bag)],
             context_feed: vec![
                 ContextEntry::System {
                     timestamp: GameTime::from_seconds(28_800),
