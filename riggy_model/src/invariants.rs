@@ -1,9 +1,10 @@
 use bfo::{RelationKind, bfo_class_allowed, relation_spec, relation_specs};
 use petgraph::stable_graph::NodeIndex;
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+use riggy_ontology::relation::RiggyRelation;
 
 use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId, PlayerId, ProcessId};
-use crate::graph_ecs::{WorldEdge, WorldNode};
+use crate::graph_ecs::{WorldEdge, WorldNode, WorldRelation};
 use crate::world::OccurrentKind;
 use crate::world::World;
 
@@ -80,12 +81,12 @@ pub enum InvariantViolation {
         target: usize,
     },
     InvalidOntologyRelation {
-        relation: RelationKind,
+        relation: WorldRelation,
         from: usize,
         to: usize,
     },
     MissingSymmetricRelation {
-        relation: RelationKind,
+        relation: WorldRelation,
         from: usize,
         to: usize,
     },
@@ -167,7 +168,8 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                         .graph
                         .edges_directed(index, petgraph::Direction::Outgoing)
                         .filter(|edge| {
-                            edge.weight().relation_kind() == RelationKind::HasParticipant
+                            edge.weight().relation()
+                                == WorldRelation::Bfo(RelationKind::HasParticipant)
                         })
                         .filter(|edge| {
                             matches!(
@@ -202,11 +204,22 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                 edge.target(),
             ));
         }
-        let spec = relation_spec(edge.weight().relation_kind());
-        if spec.symmetric && !has_symmetric_peer(world, edge.weight(), edge.source(), edge.target())
+        if let Some(kind) = edge.weight().bfo_relation_kind() {
+            let spec = relation_spec(kind);
+            if spec.symmetric
+                && !has_symmetric_peer(world, edge.weight(), edge.source(), edge.target())
+            {
+                violations.push(InvariantViolation::MissingSymmetricRelation {
+                    relation: WorldRelation::Bfo(spec.kind),
+                    from: edge.source().index(),
+                    to: edge.target().index(),
+                });
+            }
+        } else if edge.weight().relation() == WorldRelation::Riggy(RiggyRelation::TravelRoute)
+            && !has_symmetric_peer(world, edge.weight(), edge.source(), edge.target())
         {
             violations.push(InvariantViolation::MissingSymmetricRelation {
-                relation: spec.kind,
+                relation: WorldRelation::Riggy(RiggyRelation::TravelRoute),
                 from: edge.source().index(),
                 to: edge.target().index(),
             });
@@ -215,9 +228,29 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
 
     for spec in relation_specs() {
         if let Some(max_incoming) = spec.target_max_incoming {
-            violations.extend(validate_target_cardinality(world, spec.kind, max_incoming));
+            violations.extend(validate_target_cardinality(
+                world,
+                WorldRelation::Bfo(spec.kind),
+                max_incoming,
+            ));
         }
     }
+
+    violations.extend(validate_target_cardinality(
+        world,
+        WorldRelation::Riggy(RiggyRelation::Contains),
+        1,
+    ));
+    violations.extend(validate_target_cardinality(
+        world,
+        WorldRelation::Riggy(RiggyRelation::PresentAt),
+        1,
+    ));
+    violations.extend(validate_target_cardinality(
+        world,
+        WorldRelation::Riggy(RiggyRelation::ResidentOf),
+        1,
+    ));
 
     violations
 }
@@ -228,14 +261,67 @@ fn relation_endpoints_are_valid(
     source: NodeIndex,
     target: NodeIndex,
 ) -> bool {
-    let Some(source_class) = world.bfo_class(source) else {
-        return false;
-    };
-    let Some(target_class) = world.bfo_class(target) else {
-        return false;
-    };
-    let spec = relation_spec(edge.relation_kind());
-    bfo_class_allowed(source_class, spec.source) && bfo_class_allowed(target_class, spec.target)
+    match edge.bfo_relation_kind() {
+        Some(kind) => {
+            let Some(source_class) = world.bfo_class(source) else {
+                return false;
+            };
+            let Some(target_class) = world.bfo_class(target) else {
+                return false;
+            };
+            let spec = relation_spec(kind);
+            bfo_class_allowed(source_class, spec.source) && bfo_class_allowed(target_class, spec.target)
+        }
+        None => match edge.relation() {
+            WorldRelation::Riggy(RiggyRelation::TravelRoute) => matches!(
+                world.graph.node_weight(source),
+                Some(WorldNode::City(_) | WorldNode::Place(_))
+            ) && matches!(
+                world.graph.node_weight(target),
+                Some(WorldNode::City(_) | WorldNode::Place(_))
+            ),
+            WorldRelation::Riggy(RiggyRelation::Contains) => matches!(
+                world.graph.node_weight(source),
+                Some(WorldNode::City(_) | WorldNode::Place(_) | WorldNode::Entity(_))
+            ) && matches!(
+                world.graph.node_weight(target),
+                Some(WorldNode::Place(_) | WorldNode::Entity(_) | WorldNode::Player(_))
+            ),
+            WorldRelation::Riggy(RiggyRelation::ResidentOf) => {
+                matches!(world.graph.node_weight(source), Some(WorldNode::City(_)))
+                    && matches!(world.graph.node_weight(target), Some(WorldNode::Npc(_)))
+            }
+            WorldRelation::Riggy(RiggyRelation::PresentAt) => {
+                matches!(world.graph.node_weight(source), Some(WorldNode::Place(_)))
+                    && matches!(
+                        world.graph.node_weight(target),
+                        Some(WorldNode::Npc(_) | WorldNode::Player(_))
+                    )
+            }
+            WorldRelation::Riggy(RiggyRelation::IsAbout) => {
+                matches!(
+                    world.graph.node_weight(source),
+                    Some(WorldNode::InformationContent(_))
+                ) && matches!(
+                    world.graph.node_weight(target),
+                    Some(
+                        WorldNode::City(_)
+                            | WorldNode::Npc(_)
+                            | WorldNode::Occurrent(_)
+                            | WorldNode::Player(_)
+                    )
+                )
+            }
+            WorldRelation::Riggy(RiggyRelation::HasOutput) => {
+                matches!(world.graph.node_weight(source), Some(WorldNode::Occurrent(_)))
+                    && matches!(
+                        world.graph.node_weight(target),
+                        Some(WorldNode::InformationContent(_))
+                    )
+            }
+            WorldRelation::Bfo(_) => unreachable!("handled above"),
+        },
+    }
 }
 
 fn has_symmetric_peer(
@@ -269,7 +355,7 @@ fn invalid_edge_violation(
             target: target.index(),
         },
         WorldEdge::ContainsPlayer => InvariantViolation::InvalidOntologyRelation {
-            relation: edge.relation_kind(),
+            relation: edge.relation(),
             from: source.index(),
             to: target.index(),
         },
@@ -287,7 +373,7 @@ fn invalid_edge_violation(
         | WorldEdge::HasParticipant
         | WorldEdge::OccursIn
         | WorldEdge::HasOutput => InvariantViolation::InvalidOntologyRelation {
-            relation: edge.relation_kind(),
+            relation: edge.relation(),
             from: source.index(),
             to: target.index(),
         },
@@ -296,7 +382,7 @@ fn invalid_edge_violation(
 
 fn validate_target_cardinality(
     world: &World,
-    relation: RelationKind,
+    relation: WorldRelation,
     max_incoming: usize,
 ) -> Vec<InvariantViolation> {
     let mut violations = Vec::new();
@@ -305,13 +391,13 @@ fn validate_target_cardinality(
         let count = world
             .graph
             .edges_directed(index, petgraph::Direction::Incoming)
-            .filter(|edge| edge.weight().relation_kind() == relation)
+            .filter(|edge| edge.weight().relation() == relation)
             .count();
         if count <= max_incoming {
             continue;
         }
         match relation {
-            RelationKind::Contains => match world.graph.node_weight(index) {
+            WorldRelation::Riggy(RiggyRelation::Contains) => match world.graph.node_weight(index) {
                 Some(WorldNode::Place(_)) => {
                     violations.push(InvariantViolation::PlaceMultipleCities {
                         place_id: PlaceId(index),
@@ -332,7 +418,8 @@ fn validate_target_cardinality(
                 }
                 _ => {}
             },
-            RelationKind::Occupies => match world.graph.node_weight(index) {
+            WorldRelation::Riggy(RiggyRelation::PresentAt) => match world.graph.node_weight(index)
+            {
                 Some(WorldNode::Npc(_)) => {
                     violations.push(InvariantViolation::NpcMultiplePresentAtPlaces {
                         npc_id: NpcId(index),
@@ -347,7 +434,7 @@ fn validate_target_cardinality(
                 }
                 _ => {}
             },
-            RelationKind::ResidentOf => {
+            WorldRelation::Riggy(RiggyRelation::ResidentOf) => {
                 if matches!(world.graph.node_weight(index), Some(WorldNode::Npc(_))) {
                     violations.push(InvariantViolation::NpcMultipleResidentCities {
                         npc_id: NpcId(index),
@@ -355,13 +442,13 @@ fn validate_target_cardinality(
                     });
                 }
             }
-            RelationKind::ConnectedTo
-            | RelationKind::SpecificallyDependsOn
-            | RelationKind::InheresIn
-            | RelationKind::IsAbout
-            | RelationKind::HasParticipant
-            | RelationKind::OccursIn
-            | RelationKind::HasOutput => {}
+            WorldRelation::Riggy(RiggyRelation::TravelRoute)
+            | WorldRelation::Riggy(RiggyRelation::IsAbout)
+            | WorldRelation::Riggy(RiggyRelation::HasOutput)
+            | WorldRelation::Bfo(RelationKind::SpecificallyDependsOn)
+            | WorldRelation::Bfo(RelationKind::InheresIn)
+            | WorldRelation::Bfo(RelationKind::HasParticipant)
+            | WorldRelation::Bfo(RelationKind::OccursIn) => {}
         }
     }
 

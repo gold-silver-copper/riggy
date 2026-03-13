@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::domain::time::{GameTime, TimeDelta};
+use riggy_ontology::time::{GameTime, TimeDelta};
+
 use crate::world::{
     DistrictId, EntityId, EntityKind, NpcId, PlaceId, PlaceKind, TransportMode, TravelRoute,
 };

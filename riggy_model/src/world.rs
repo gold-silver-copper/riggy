@@ -7,14 +7,15 @@ use rand::prelude::IndexedRandom;
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::invariants::{InvariantViolation, validate_world};
-use crate::domain::memory::ConversationMemory;
-use crate::domain::records::{ContextEntry, DialogueLine, DialogueSpeaker, SystemContext};
-use crate::domain::seed::WorldSeed;
-use crate::domain::time::{GameTime, TimeDelta};
-use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
+use riggy_ontology::memory::ConversationMemory;
+use riggy_ontology::seed::WorldSeed;
+use riggy_ontology::time::{GameTime, TimeDelta};
+use riggy_ontology::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
+
+use crate::invariants::{InvariantViolation, validate_world};
+use crate::records::{ContextEntry, DialogueLine, DialogueSpeaker, SystemContext};
 pub use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId, PlayerId, ProcessId};
-use crate::graph_ecs::{WorldEdge, WorldGraph, WorldNode, add_edge, edge_snapshot};
+use crate::graph_ecs::{WorldEdge, WorldGraph, WorldNode, WorldRelation, add_edge, edge_snapshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct World {
@@ -524,7 +525,7 @@ impl World {
         for dependent in collect_incoming(
             &self.graph,
             id.0,
-            RelationKind::SpecificallyDependsOn,
+            WorldRelation::Bfo(RelationKind::SpecificallyDependsOn),
             |_, node, _| match node {
                 WorldNode::DependentContinuant(node) => Some(node.clone()),
                 _ => None,
@@ -632,7 +633,7 @@ impl World {
         collect_outgoing(
             &self.graph,
             place_id.0,
-            RelationKind::Occupies,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::PresentAt),
             |index, node, _| match node {
                 WorldNode::Player(_) => Some(PlayerId(index)),
                 _ => None,
@@ -644,7 +645,7 @@ impl World {
         collect_incoming(
             &self.graph,
             player_id.0,
-            RelationKind::Occupies,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::PresentAt),
             |index, node, _| match node {
                 WorldNode::Place(_) => Some(PlaceId(index)),
                 _ => None,
@@ -663,7 +664,7 @@ impl World {
         let mut ids = collect_incoming(
             &self.graph,
             player_id.0,
-            RelationKind::HasParticipant,
+            WorldRelation::Bfo(RelationKind::HasParticipant),
             |index, node, _| match node {
                 WorldNode::Occurrent(Occurrent {
                     kind: OccurrentKind::Dialogue,
@@ -692,7 +693,7 @@ impl World {
         collect_incoming(
             &self.graph,
             player_id.0,
-            RelationKind::Contains,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::Contains),
             |index, node, edge| match (node, edge) {
                 (WorldNode::Entity(_), WorldEdge::ContainsPlayer) => Some(EntityId(index)),
                 _ => None,
@@ -758,7 +759,7 @@ impl World {
         collect_outgoing(
             &self.graph,
             city_id.0,
-            RelationKind::ConnectedTo,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::TravelRoute),
             |index, node, _| match node {
                 WorldNode::City(_) => Some(CityId(index)),
                 _ => None,
@@ -778,7 +779,7 @@ impl World {
         collect_outgoing(
             &self.graph,
             place_id.0,
-            RelationKind::ConnectedTo,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::TravelRoute),
             |index, node, edge| match (node, edge) {
                 (WorldNode::Place(_), WorldEdge::TravelRoute(route)) => {
                     Some((PlaceId(index), *route))
@@ -792,7 +793,7 @@ impl World {
         collect_outgoing(
             &self.graph,
             place_id.0,
-            RelationKind::Occupies,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::PresentAt),
             |index, node, _| match node {
                 WorldNode::Npc(_) => Some(NpcId(index)),
                 _ => None,
@@ -804,7 +805,7 @@ impl World {
         collect_outgoing(
             &self.graph,
             place_id.0,
-            RelationKind::Contains,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::Contains),
             |index, node, _| match node {
                 WorldNode::Entity(_) => Some(EntityId(index)),
                 _ => None,
@@ -823,7 +824,7 @@ impl World {
         collect_incoming(
             &self.graph,
             place_id.0,
-            RelationKind::Contains,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::Contains),
             |index, node, _| match node {
                 WorldNode::City(_) => Some(CityId(index)),
                 _ => None,
@@ -841,7 +842,7 @@ impl World {
         collect_incoming(
             &self.graph,
             entity_id.0,
-            RelationKind::Contains,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::Contains),
             |index, node, _| match node {
                 WorldNode::Place(_) => Some(PlaceId(index)),
                 _ => None,
@@ -853,7 +854,7 @@ impl World {
         collect_incoming(
             &self.graph,
             npc_id.0,
-            RelationKind::ResidentOf,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::ResidentOf),
             |index, node, _| match node {
                 WorldNode::City(_) => Some(CityId(index)),
                 _ => None,
@@ -865,7 +866,7 @@ impl World {
         collect_incoming(
             &self.graph,
             npc_id.0,
-            RelationKind::Occupies,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::PresentAt),
             |index, node, _| match node {
                 WorldNode::Place(_) => Some(PlaceId(index)),
                 _ => None,
@@ -877,7 +878,7 @@ impl World {
         collect_incoming(
             &self.graph,
             npc_id.0,
-            RelationKind::IsAbout,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::IsAbout),
             |_, node, _| match node {
                 WorldNode::InformationContent(InformationContent::ConversationMemory {
                     summary,
@@ -935,7 +936,7 @@ impl World {
         let mut ids = collect_incoming(
             &self.graph,
             player_id.0,
-            RelationKind::IsAbout,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::IsAbout),
             |_, node, _| match node {
                 WorldNode::InformationContent(InformationContent::CityKnowledge {
                     city_id,
@@ -979,7 +980,7 @@ impl World {
         collect_outgoing(
             &self.graph,
             process_id.0,
-            RelationKind::HasParticipant,
+            WorldRelation::Bfo(RelationKind::HasParticipant),
             |index, node, _| match node {
                 WorldNode::Npc(_) => Some(NpcId(index)),
                 _ => None,
@@ -993,7 +994,7 @@ impl World {
         let mut lines = collect_outgoing(
             &self.graph,
             process_id.0,
-            RelationKind::HasOutput,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::HasOutput),
             |index, node, _| match node {
                 WorldNode::InformationContent(InformationContent::DialogueRecord(line)) => {
                     Some((index.index(), line.clone()))
@@ -1073,7 +1074,7 @@ impl World {
         let mut entries = collect_incoming(
             &self.graph,
             player_id.0,
-            RelationKind::IsAbout,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::IsAbout),
             |_, node, _| match node {
                 WorldNode::InformationContent(InformationContent::ContextRecord(entry)) => {
                     Some(entry.clone())
@@ -1195,7 +1196,7 @@ impl World {
         collect_outgoing(
             graph,
             city_id.0,
-            RelationKind::ResidentOf,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::ResidentOf),
             |index, node, _| match node {
                 WorldNode::Npc(_) => Some(NpcId(index)),
                 _ => None,
@@ -1207,7 +1208,7 @@ impl World {
         collect_outgoing(
             graph,
             city_id.0,
-            RelationKind::Contains,
+            WorldRelation::Riggy(riggy_ontology::relation::RiggyRelation::Contains),
             |index, node, _| match node {
                 WorldNode::Place(_) => Some(PlaceId(index)),
                 _ => None,
@@ -1238,12 +1239,12 @@ fn collect_node_ids<T>(
 fn collect_outgoing<T>(
     graph: &WorldGraph,
     source: NodeIndex,
-    relation_kind: RelationKind,
+    relation: WorldRelation,
     map: impl Fn(NodeIndex, &WorldNode, &WorldEdge) -> Option<T>,
 ) -> Vec<T> {
     graph
         .edges_directed(source, Outgoing)
-        .filter(|edge| edge.weight().relation_kind() == relation_kind)
+        .filter(|edge| edge.weight().relation() == relation)
         .filter_map(|edge| {
             graph
                 .node_weight(edge.target())
@@ -1255,12 +1256,12 @@ fn collect_outgoing<T>(
 fn collect_incoming<T>(
     graph: &WorldGraph,
     target: NodeIndex,
-    relation_kind: RelationKind,
+    relation: WorldRelation,
     map: impl Fn(NodeIndex, &WorldNode, &WorldEdge) -> Option<T>,
 ) -> Vec<T> {
     graph
         .edges_directed(target, Incoming)
-        .filter(|edge| edge.weight().relation_kind() == relation_kind)
+        .filter(|edge| edge.weight().relation() == relation)
         .filter_map(|edge| {
             graph
                 .node_weight(edge.source())
@@ -1856,22 +1857,23 @@ const BAG_NAMES: [&str; 3] = ["duffel bag", "messenger bag", "canvas tote"];
 #[cfg(test)]
 mod tests {
     use super::World;
-    use crate::domain::invariants::InvariantViolation;
     use crate::graph_ecs::WorldEdge;
+    use crate::invariants::InvariantViolation;
     use petgraph::Direction::Incoming;
     use petgraph::visit::EdgeRef;
+    use riggy_ontology::seed::WorldSeed;
 
     #[test]
     fn procgen_is_deterministic() {
-        let a = World::generate(crate::domain::seed::WorldSeed::new(42), 18);
-        let b = World::generate(crate::domain::seed::WorldSeed::new(42), 18);
+        let a = World::generate(WorldSeed::new(42), 18);
+        let b = World::generate(WorldSeed::new(42), 18);
         assert_eq!(a, b);
         assert!(a.validate().is_empty());
     }
 
     #[test]
     fn world_is_connected_and_in_bounds() {
-        let world = World::generate(crate::domain::seed::WorldSeed::new(7), 24);
+        let world = World::generate(WorldSeed::new(7), 24);
         assert_eq!(world.city_ids().len(), 24);
 
         let mut visited = std::collections::BTreeSet::new();
@@ -1890,7 +1892,7 @@ mod tests {
 
     #[test]
     fn validator_detects_missing_place_container() {
-        let mut world = World::generate(crate::domain::seed::WorldSeed::new(3), 16);
+        let mut world = World::generate(WorldSeed::new(3), 16);
         let place_id = world.city_places(world.city_ids()[0])[0];
         let edge_id = world
             .graph
@@ -1909,7 +1911,7 @@ mod tests {
 
     #[test]
     fn validator_detects_npc_present_outside_resident_city() {
-        let mut world = World::generate(crate::domain::seed::WorldSeed::new(5), 16);
+        let mut world = World::generate(WorldSeed::new(5), 16);
         let npc_id = world.npc_ids()[0];
         let resident_city_id = world.npc_resident_city_ids(npc_id)[0];
         let present_edge_id = world

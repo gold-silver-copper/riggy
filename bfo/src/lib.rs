@@ -78,16 +78,10 @@ impl BfoClass {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RelationKind {
-    Contains,
-    Occupies,
-    ResidentOf,
-    ConnectedTo,
     SpecificallyDependsOn,
     InheresIn,
-    IsAbout,
     HasParticipant,
     OccursIn,
-    HasOutput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,45 +93,14 @@ pub struct RelationSpec {
     pub symmetric: bool,
 }
 
-const SITE: [BfoClass; 1] = [BfoClass::Site];
-const MATERIAL_ENTITY: [BfoClass; 1] = [BfoClass::MaterialEntity];
-const SITE_OR_MATERIAL_ENTITY: [BfoClass; 2] = [BfoClass::Site, BfoClass::MaterialEntity];
 const INDEPENDENT_CONTINUANT: [BfoClass; 1] = [BfoClass::IndependentContinuant];
 const SPECIFICALLY_DEPENDENT_CONTINUANT: [BfoClass; 1] =
     [BfoClass::SpecificallyDependentContinuant];
-const INFORMATION_CONTENT_ENTITY: [BfoClass; 1] = [BfoClass::InformationContentEntity];
 const PROCESS: [BfoClass; 1] = [BfoClass::Process];
-const ENTITY: [BfoClass; 1] = [BfoClass::Entity];
+const MATERIAL_ENTITY: [BfoClass; 1] = [BfoClass::MaterialEntity];
+const SITE: [BfoClass; 1] = [BfoClass::Site];
 
-const RELATION_SPECS: [RelationSpec; 10] = [
-    RelationSpec {
-        kind: RelationKind::Contains,
-        source: &SITE_OR_MATERIAL_ENTITY,
-        target: &SITE_OR_MATERIAL_ENTITY,
-        target_max_incoming: Some(1),
-        symmetric: false,
-    },
-    RelationSpec {
-        kind: RelationKind::Occupies,
-        source: &SITE,
-        target: &MATERIAL_ENTITY,
-        target_max_incoming: Some(1),
-        symmetric: false,
-    },
-    RelationSpec {
-        kind: RelationKind::ResidentOf,
-        source: &SITE,
-        target: &MATERIAL_ENTITY,
-        target_max_incoming: Some(1),
-        symmetric: false,
-    },
-    RelationSpec {
-        kind: RelationKind::ConnectedTo,
-        source: &SITE,
-        target: &SITE,
-        target_max_incoming: None,
-        symmetric: true,
-    },
+const RELATION_SPECS: [RelationSpec; 4] = [
     RelationSpec {
         kind: RelationKind::SpecificallyDependsOn,
         source: &SPECIFICALLY_DEPENDENT_CONTINUANT,
@@ -153,13 +116,6 @@ const RELATION_SPECS: [RelationSpec; 10] = [
         symmetric: false,
     },
     RelationSpec {
-        kind: RelationKind::IsAbout,
-        source: &INFORMATION_CONTENT_ENTITY,
-        target: &ENTITY,
-        target_max_incoming: None,
-        symmetric: false,
-    },
-    RelationSpec {
         kind: RelationKind::HasParticipant,
         source: &PROCESS,
         target: &MATERIAL_ENTITY,
@@ -170,13 +126,6 @@ const RELATION_SPECS: [RelationSpec; 10] = [
         kind: RelationKind::OccursIn,
         source: &PROCESS,
         target: &SITE,
-        target_max_incoming: None,
-        symmetric: false,
-    },
-    RelationSpec {
-        kind: RelationKind::HasOutput,
-        source: &PROCESS,
-        target: &INFORMATION_CONTENT_ENTITY,
         target_max_incoming: None,
         symmetric: false,
     },
@@ -213,7 +162,7 @@ mod tests {
 
     #[test]
     fn relation_specs_accept_subclasses() {
-        let spec = relation_spec(RelationKind::Occupies);
+        let spec = relation_spec(RelationKind::HasParticipant);
         assert!(bfo_class_allowed(BfoClass::Object, spec.target));
         assert!(!bfo_class_allowed(BfoClass::Site, spec.target));
     }

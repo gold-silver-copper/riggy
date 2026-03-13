@@ -2,6 +2,7 @@ use bfo::{BfoClass, RelationKind};
 use petgraph::Directed;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
+use riggy_ontology::relation::RiggyRelation;
 use serde::{Deserialize, Serialize};
 
 use crate::world::{
@@ -10,22 +11,22 @@ use crate::world::{
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CityId(pub(crate) NodeIndex);
+pub struct CityId(pub NodeIndex);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NpcId(pub(crate) NodeIndex);
+pub struct NpcId(pub NodeIndex);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PlaceId(pub(crate) NodeIndex);
+pub struct PlaceId(pub NodeIndex);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EntityId(pub(crate) NodeIndex);
+pub struct EntityId(pub NodeIndex);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PlayerId(pub(crate) NodeIndex);
+pub struct PlayerId(pub NodeIndex);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProcessId(pub(crate) NodeIndex);
+pub struct ProcessId(pub NodeIndex);
 
 impl CityId {
     pub fn index(self) -> usize {
@@ -64,6 +65,12 @@ impl ProcessId {
 }
 
 pub type WorldGraph = StableGraph<WorldNode, WorldEdge, Directed>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WorldRelation {
+    Bfo(RelationKind),
+    Riggy(RiggyRelation),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WorldNode {
@@ -108,20 +115,27 @@ pub enum WorldEdge {
 }
 
 impl WorldEdge {
-    pub const fn relation_kind(&self) -> RelationKind {
+    pub const fn relation(&self) -> WorldRelation {
         match self {
-            Self::TravelRoute(_) => RelationKind::ConnectedTo,
+            Self::TravelRoute(_) => WorldRelation::Riggy(RiggyRelation::TravelRoute),
             Self::ContainsPlace | Self::ContainsEntity | Self::ContainsPlayer => {
-                RelationKind::Contains
+                WorldRelation::Riggy(RiggyRelation::Contains)
             }
-            Self::Resident => RelationKind::ResidentOf,
-            Self::PresentAt => RelationKind::Occupies,
-            Self::SpecificallyDependsOn => RelationKind::SpecificallyDependsOn,
-            Self::InheresIn => RelationKind::InheresIn,
-            Self::IsAbout => RelationKind::IsAbout,
-            Self::HasParticipant => RelationKind::HasParticipant,
-            Self::OccursIn => RelationKind::OccursIn,
-            Self::HasOutput => RelationKind::HasOutput,
+            Self::Resident => WorldRelation::Riggy(RiggyRelation::ResidentOf),
+            Self::PresentAt => WorldRelation::Riggy(RiggyRelation::PresentAt),
+            Self::SpecificallyDependsOn => WorldRelation::Bfo(RelationKind::SpecificallyDependsOn),
+            Self::InheresIn => WorldRelation::Bfo(RelationKind::InheresIn),
+            Self::IsAbout => WorldRelation::Riggy(RiggyRelation::IsAbout),
+            Self::HasParticipant => WorldRelation::Bfo(RelationKind::HasParticipant),
+            Self::OccursIn => WorldRelation::Bfo(RelationKind::OccursIn),
+            Self::HasOutput => WorldRelation::Riggy(RiggyRelation::HasOutput),
+        }
+    }
+
+    pub const fn bfo_relation_kind(&self) -> Option<RelationKind> {
+        match self.relation() {
+            WorldRelation::Bfo(kind) => Some(kind),
+            WorldRelation::Riggy(_) => None,
         }
     }
 }
