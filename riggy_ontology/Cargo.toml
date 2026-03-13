@@ -1,0 +1,9 @@
+[package]
+name = "riggy_ontology"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bfo = { path = "../bfo", version = "0.1.0" }
+schemars = "1.0.4"
+serde = { version = "1.0.228", features = ["derive"] }
