@@ -1,4 +1,4 @@
-use bfo::{RelationKind, bfo_class_allowed, relation_spec, relation_specs};
+use bfo::RelationKind;
 use petgraph::stable_graph::NodeIndex;
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 use riggy_ontology::relation::RiggyRelation;
@@ -205,12 +205,11 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
             ));
         }
         if let Some(kind) = edge.weight().bfo_relation_kind() {
-            let spec = relation_spec(kind);
-            if spec.symmetric
+            if kind.is_symmetric()
                 && !has_symmetric_peer(world, edge.weight(), edge.source(), edge.target())
             {
                 violations.push(InvariantViolation::MissingSymmetricRelation {
-                    relation: WorldRelation::Bfo(spec.kind),
+                    relation: WorldRelation::Bfo(kind),
                     from: edge.source().index(),
                     to: edge.target().index(),
                 });
@@ -223,16 +222,6 @@ pub fn validate_world(world: &World) -> Vec<InvariantViolation> {
                 from: edge.source().index(),
                 to: edge.target().index(),
             });
-        }
-    }
-
-    for spec in relation_specs() {
-        if let Some(max_incoming) = spec.target_max_incoming {
-            violations.extend(validate_target_cardinality(
-                world,
-                WorldRelation::Bfo(spec.kind),
-                max_incoming,
-            ));
         }
     }
 
@@ -269,8 +258,7 @@ fn relation_endpoints_are_valid(
             let Some(target_class) = world.bfo_class(target) else {
                 return false;
             };
-            let spec = relation_spec(kind);
-            bfo_class_allowed(source_class, spec.source) && bfo_class_allowed(target_class, spec.target)
+            kind.domain_allows(source_class) && kind.range_allows(target_class)
         }
         None => match edge.relation() {
             WorldRelation::Riggy(RiggyRelation::TravelRoute) => matches!(
@@ -440,10 +428,7 @@ fn validate_target_cardinality(
             WorldRelation::Riggy(RiggyRelation::TravelRoute)
             | WorldRelation::Riggy(RiggyRelation::IsAbout)
             | WorldRelation::Riggy(RiggyRelation::HasOutput)
-            | WorldRelation::Bfo(RelationKind::SpecificallyDependsOn)
-            | WorldRelation::Bfo(RelationKind::InheresIn)
-            | WorldRelation::Bfo(RelationKind::HasParticipant)
-            | WorldRelation::Bfo(RelationKind::OccursIn) => {}
+            | WorldRelation::Bfo(_) => {}
         }
     }
 

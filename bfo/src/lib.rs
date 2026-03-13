@@ -1,157 +1,70 @@
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum BfoClass {
-    Entity,
-    Continuant,
-    IndependentContinuant,
-    MaterialEntity,
-    Object,
-    ImmaterialEntity,
-    Site,
-    SpecificallyDependentContinuant,
-    Role,
-    Disposition,
-    Function,
-    Quality,
-    GenericallyDependentContinuant,
-    InformationContentEntity,
-    Occurrent,
-    Process,
-    History,
-    TemporalRegion,
-}
-
-impl BfoClass {
-    pub const fn parent(self) -> Option<Self> {
-        match self {
-            Self::Entity => None,
-            Self::Continuant | Self::Occurrent => Some(Self::Entity),
-            Self::IndependentContinuant
-            | Self::SpecificallyDependentContinuant
-            | Self::GenericallyDependentContinuant => Some(Self::Continuant),
-            Self::MaterialEntity | Self::ImmaterialEntity => Some(Self::IndependentContinuant),
-            Self::Object => Some(Self::MaterialEntity),
-            Self::Site => Some(Self::ImmaterialEntity),
-            Self::Role | Self::Disposition | Self::Function | Self::Quality => {
-                Some(Self::SpecificallyDependentContinuant)
-            }
-            Self::InformationContentEntity => Some(Self::GenericallyDependentContinuant),
-            Self::Process | Self::History | Self::TemporalRegion => Some(Self::Occurrent),
-        }
-    }
-
-    pub fn is_a(self, other: Self) -> bool {
-        let mut current = Some(self);
-        while let Some(class) = current {
-            if class == other {
-                return true;
-            }
-            current = class.parent();
-        }
-        false
-    }
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Entity => "entity",
-            Self::Continuant => "continuant",
-            Self::IndependentContinuant => "independent continuant",
-            Self::MaterialEntity => "material entity",
-            Self::Object => "object",
-            Self::ImmaterialEntity => "immaterial entity",
-            Self::Site => "site",
-            Self::SpecificallyDependentContinuant => "specifically dependent continuant",
-            Self::Role => "role",
-            Self::Disposition => "disposition",
-            Self::Function => "function",
-            Self::Quality => "quality",
-            Self::GenericallyDependentContinuant => "generically dependent continuant",
-            Self::InformationContentEntity => "information content entity",
-            Self::Occurrent => "occurrent",
-            Self::Process => "process",
-            Self::History => "history",
-            Self::TemporalRegion => "temporal region",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum RelationKind {
-    SpecificallyDependsOn,
-    InheresIn,
-    HasParticipant,
-    OccursIn,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RelationSpec {
-    pub kind: RelationKind,
-    pub source: &'static [BfoClass],
-    pub target: &'static [BfoClass],
-    pub target_max_incoming: Option<usize>,
-    pub symmetric: bool,
-}
-
-const INDEPENDENT_CONTINUANT: [BfoClass; 1] = [BfoClass::IndependentContinuant];
-const SPECIFICALLY_DEPENDENT_CONTINUANT: [BfoClass; 1] =
-    [BfoClass::SpecificallyDependentContinuant];
-const PROCESS: [BfoClass; 1] = [BfoClass::Process];
-const MATERIAL_ENTITY: [BfoClass; 1] = [BfoClass::MaterialEntity];
-const SITE: [BfoClass; 1] = [BfoClass::Site];
-
-const RELATION_SPECS: [RelationSpec; 4] = [
-    RelationSpec {
-        kind: RelationKind::SpecificallyDependsOn,
-        source: &SPECIFICALLY_DEPENDENT_CONTINUANT,
-        target: &INDEPENDENT_CONTINUANT,
-        target_max_incoming: None,
-        symmetric: false,
-    },
-    RelationSpec {
-        kind: RelationKind::InheresIn,
-        source: &SPECIFICALLY_DEPENDENT_CONTINUANT,
-        target: &MATERIAL_ENTITY,
-        target_max_incoming: None,
-        symmetric: false,
-    },
-    RelationSpec {
-        kind: RelationKind::HasParticipant,
-        source: &PROCESS,
-        target: &MATERIAL_ENTITY,
-        target_max_incoming: None,
-        symmetric: false,
-    },
-    RelationSpec {
-        kind: RelationKind::OccursIn,
-        source: &PROCESS,
-        target: &SITE,
-        target_max_incoming: None,
-        symmetric: false,
-    },
-];
-
-pub const fn relation_specs() -> &'static [RelationSpec] {
-    &RELATION_SPECS
-}
-
-pub fn relation_spec(kind: RelationKind) -> &'static RelationSpec {
-    RELATION_SPECS
-        .iter()
-        .find(|spec| spec.kind == kind)
-        .expect("relation spec should exist")
-}
-
-pub fn bfo_class_allowed(class: BfoClass, allowed: &[BfoClass]) -> bool {
-    allowed
-        .iter()
-        .copied()
-        .any(|candidate| class.is_a(candidate))
-}
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
 #[cfg(test)]
 mod tests {
-    use super::{BfoClass, RelationKind, bfo_class_allowed, relation_spec};
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::{BfoClass, RelationKind};
+
+    fn ofn_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("BFO-2020-master/21838-2/owl/bfo-core.ofn")
+    }
+
+    fn count_declarations(prefix: &str) -> usize {
+        fs::read_to_string(ofn_path())
+            .expect("failed to read bfo-core.ofn")
+            .lines()
+            .filter(|line| line.trim().starts_with(prefix))
+            .count()
+    }
+
+    fn declared_ids(prefix: &str) -> BTreeSet<String> {
+        fs::read_to_string(ofn_path())
+            .expect("failed to read bfo-core.ofn")
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                if !trimmed.starts_with(prefix) {
+                    return None;
+                }
+                let start = trimmed.find('<')?;
+                let end = trimmed[start + 1..].find('>')? + start + 1;
+                let iri = &trimmed[start + 1..end];
+                Some(
+                    iri.rsplit('/')
+                        .next()
+                        .expect("iri should have suffix")
+                        .replace('_', ":"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn generated_class_inventory_matches_ofn_declarations() {
+        assert_eq!(BfoClass::ALL.len(), count_declarations("Declaration(Class("));
+        let generated = BfoClass::ALL
+            .iter()
+            .map(|class| class.id().to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(generated, declared_ids("Declaration(Class("));
+    }
+
+    #[test]
+    fn generated_relation_inventory_matches_ofn_declarations() {
+        assert_eq!(
+            RelationKind::ALL.len(),
+            count_declarations("Declaration(ObjectProperty(")
+        );
+        let generated = RelationKind::ALL
+            .iter()
+            .map(|relation| relation.id().to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(generated, declared_ids("Declaration(ObjectProperty("));
+    }
 
     #[test]
     fn object_is_a_material_entity() {
@@ -161,9 +74,10 @@ mod tests {
     }
 
     #[test]
-    fn relation_specs_accept_subclasses() {
-        let spec = relation_spec(RelationKind::HasParticipant);
-        assert!(bfo_class_allowed(BfoClass::Object, spec.target));
-        assert!(!bfo_class_allowed(BfoClass::Site, spec.target));
+    fn generated_relation_domain_and_range_are_usable() {
+        assert!(RelationKind::HasParticipant.domain_allows(BfoClass::Process));
+        assert!(RelationKind::HasParticipant.range_allows(BfoClass::Object));
+        assert!(RelationKind::OccursIn.range_allows(BfoClass::Site));
+        assert!(!RelationKind::InheresIn.domain_allows(BfoClass::Process));
     }
 }

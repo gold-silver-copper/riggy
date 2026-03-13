@@ -1960,6 +1960,7 @@ dependencies = [
 name = "riggy_ontology"
 version = "0.1.0"
 dependencies = [
+ "bfo",
  "schemars",
  "serde",
 ]

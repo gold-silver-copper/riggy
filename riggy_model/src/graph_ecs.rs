@@ -91,7 +91,7 @@ impl WorldNode {
             Self::City(_) | Self::Place(_) => BfoClass::Site,
             Self::Entity(_) | Self::Npc(_) | Self::Player(_) => BfoClass::Object,
             Self::DependentContinuant(node) => node.bfo_class(),
-            Self::InformationContent(_) => BfoClass::InformationContentEntity,
+            Self::InformationContent(_) => BfoClass::GenericallyDependentContinuant,
             Self::Occurrent(_) => BfoClass::Process,
             Self::TemporalRegion(_) => BfoClass::TemporalRegion,
         }
