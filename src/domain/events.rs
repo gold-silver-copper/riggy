@@ -4,7 +4,7 @@ pub use crate::domain::records::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommandResult {
+pub struct ActionResult {
     pub events: Vec<GameEvent>,
     pub should_quit: bool,
 }

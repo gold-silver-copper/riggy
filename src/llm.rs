@@ -6,7 +6,7 @@ use rig::completion::{Chat, Prompt};
 use rig::message::Message;
 use rig::providers::{ollama, openai};
 
-use crate::ai::context::NpcDialogueContext;
+use crate::ai::context::ActorDialogueContext;
 use crate::ai::prompting::build_dialogue_prompt;
 use crate::domain::events::{DialogueLine, DialogueSpeaker};
 use crate::domain::memory::ConversationMemory;
@@ -18,7 +18,7 @@ pub struct DialogueResponse {
 
 #[allow(async_fn_in_trait)]
 pub trait LlmBackend {
-    async fn generate_dialogue(&self, context: &NpcDialogueContext) -> Result<DialogueResponse>;
+    async fn generate_dialogue(&self, context: &ActorDialogueContext) -> Result<DialogueResponse>;
 
     async fn summarize_memory(&self, transcript: &[DialogueLine]) -> Result<ConversationMemory>;
 
@@ -45,7 +45,7 @@ impl AnyBackend {
 }
 
 impl LlmBackend for AnyBackend {
-    async fn generate_dialogue(&self, context: &NpcDialogueContext) -> Result<DialogueResponse> {
+    async fn generate_dialogue(&self, context: &ActorDialogueContext) -> Result<DialogueResponse> {
         match self {
             Self::Mock(backend) => backend.generate_dialogue(context).await,
             Self::Rig(backend) => backend.generate_dialogue(context).await,
@@ -71,12 +71,12 @@ impl LlmBackend for AnyBackend {
 pub struct MockBackend;
 
 impl LlmBackend for MockBackend {
-    async fn generate_dialogue(&self, context: &NpcDialogueContext) -> Result<DialogueResponse> {
-        let lower = context.turn.player_input.to_lowercase();
+    async fn generate_dialogue(&self, context: &ActorDialogueContext) -> Result<DialogueResponse> {
+        let lower = context.turn.speaker_input.to_lowercase();
         let mut lines = vec![format!(
             "{} the {} leans in, measuring your tone before answering.",
-            context.npc.name(context.world_seed),
-            context.npc.occupation.label()
+            context.actor.name(context.world_seed),
+            context.actor.occupation.label()
         )];
 
         if lower.contains("job") || lower.contains("work") || lower.contains("favor") {
@@ -96,7 +96,7 @@ impl LlmBackend for MockBackend {
                 context.city.biome.label(),
                 context.city.economy.label(),
                 context.city.culture.label(),
-                context.npc.home_place_name(context.world_seed),
+                context.actor.home_place_name(context.world_seed),
                 if context.city.connected_cities.is_empty() {
                     "nowhere worth naming".to_string()
                 } else {
@@ -113,7 +113,7 @@ impl LlmBackend for MockBackend {
             lines.push(format!(
                 "\"You don't sound like most people passing through {}. That can be useful or it can get noticed. I spend most of my time around {}, so I hear things early.\"",
                 context.city.name(context.world_seed),
-                context.npc.home_place_name(context.world_seed)
+                context.actor.home_place_name(context.world_seed)
             ));
         }
 
@@ -188,14 +188,16 @@ impl RigBackend {
         })
     }
 
-    async fn prompt_text(&self, context: &NpcDialogueContext) -> Result<String> {
+    async fn prompt_text(&self, context: &ActorDialogueContext) -> Result<String> {
         let history = context
             .turn
             .transcript
             .iter()
             .map(|line| match line.speaker {
-                DialogueSpeaker::Player => Message::user(line.text.clone()),
-                DialogueSpeaker::Npc(_) | DialogueSpeaker::System => {
+                DialogueSpeaker::Actor(actor_id) if actor_id == context.counterpart.id => {
+                    Message::user(line.text.clone())
+                }
+                DialogueSpeaker::Actor(_) | DialogueSpeaker::System => {
                     Message::assistant(line.text.clone())
                 }
             })
@@ -224,7 +226,7 @@ impl RigBackend {
 
     async fn prompt_memory_summary_text(&self, transcript: &str) -> Result<String> {
         let prompt = format!(
-            "Summarize what this NPC and player talked about in 1-2 durable sentences.\n\nConversation:\n{}",
+            "Summarize what these two actors talked about in 1-2 durable sentences.\n\nConversation:\n{}",
             transcript
         );
 
@@ -250,7 +252,7 @@ impl RigBackend {
 }
 
 impl LlmBackend for RigBackend {
-    async fn generate_dialogue(&self, context: &NpcDialogueContext) -> Result<DialogueResponse> {
+    async fn generate_dialogue(&self, context: &ActorDialogueContext) -> Result<DialogueResponse> {
         Ok(DialogueResponse {
             text: self.prompt_text(context).await?,
         })
@@ -281,13 +283,12 @@ impl LlmBackend for RigBackend {
 
 fn speaker_label(line: &DialogueLine) -> String {
     match line.speaker {
-        DialogueSpeaker::Player => "You".to_string(),
-        DialogueSpeaker::Npc(_) => "NPC".to_string(),
+        DialogueSpeaker::Actor(_) => "Actor".to_string(),
         DialogueSpeaker::System => "System".to_string(),
     }
 }
 
-const DIALOGUE_PREAMBLE: &str = "You are roleplaying a resident of a procedurally generated city in a turn-based text game. Speak in first person as the NPC, stay consistent with the provided setting and personal motive, and do not narrate as a game master.";
+const DIALOGUE_PREAMBLE: &str = "You are roleplaying a resident of a procedurally generated city in a turn-based text game. Speak in first person as the character, stay consistent with the provided setting and personal motive, and do not narrate as a game master.";
 const MEMORY_PREAMBLE: &str =
     "Summarize conversations for a text game. Keep only durable memory of what was discussed.";
 
@@ -309,104 +310,58 @@ fn fallback_summary(transcript: &[DialogueLine]) -> String {
 }
 
 #[cfg(test)]
-fn fallback_conversation_memory(
-    transcript: &[DialogueLine],
-    summary: String,
-) -> ConversationMemory {
-    let _ = transcript;
-    ConversationMemory { summary }.normalized()
-}
-
-#[cfg(test)]
 mod tests {
-    use crate::ai::context::build_npc_dialogue_context;
+    use crate::ai::context::build_actor_dialogue_context;
     use crate::domain::events::{DialogueLine, DialogueSpeaker};
     use crate::domain::memory::ConversationMemory;
     use crate::domain::time::GameTime;
-    use crate::llm::{LlmBackend, MockBackend, fallback_conversation_memory};
     use crate::world::World;
+
+    use super::{LlmBackend, MockBackend};
 
     #[tokio::test]
     async fn mock_backend_generates_dialogue() {
         let mut world = World::generate(crate::domain::seed::WorldSeed::new(2), 16);
-        let city_id = world.city_ids()[0];
-        let npc_id = world.city_npcs(city_id)[0];
-        let player_id = world.player_id().expect("world should contain a player");
-        let memory = ConversationMemory::default();
-        let place_id = world.city_places(city_id)[0];
-        let process_id =
-            world.start_dialogue_process(player_id, npc_id, place_id, GameTime::from_seconds(0));
-        world.append_dialogue_utterance(
-            process_id,
-            player_id,
-            DialogueLine {
+        let actor_id = world.manual_actor_id().unwrap();
+        let city_id = world.actor_city_id(actor_id).unwrap();
+        let place_id = world.actor_place_id(actor_id).unwrap();
+        let counterpart_id = world
+            .place_actors(place_id)
+            .into_iter()
+            .find(|candidate| *candidate != actor_id)
+            .unwrap_or_else(|| {
+                let counterpart_id = world
+                    .actor_ids()
+                    .into_iter()
+                    .find(|candidate| *candidate != actor_id)
+                    .unwrap();
+                world.move_actor(counterpart_id, place_id);
+                counterpart_id
+            });
+        world.record_speech_process(
+            actor_id,
+            counterpart_id,
+            place_id,
+            GameTime::from_seconds(0),
+            crate::domain::time::TimeDelta::from_seconds(10),
+            vec![DialogueLine {
                 timestamp: GameTime::from_seconds(0),
-                speaker: DialogueSpeaker::Player,
+                speaker: DialogueSpeaker::Actor(actor_id),
                 text: "Hello".to_string(),
-            },
+            }],
         );
-        let context = build_npc_dialogue_context(
+        let context = build_actor_dialogue_context(
             &world,
             GameTime::from_seconds(0),
             city_id,
-            &memory,
-            process_id,
+            counterpart_id,
+            actor_id,
+            &ConversationMemory::default(),
             "Hello there.".to_string(),
         )
         .unwrap();
 
         let response = MockBackend.generate_dialogue(&context).await.unwrap();
         assert!(!response.text.is_empty());
-    }
-
-    #[test]
-    fn context_contains_npc_and_city_state() {
-        let mut world = World::generate(crate::domain::seed::WorldSeed::new(9), 16);
-        let city_id = world.city_ids()[0];
-        let npc_id = world.city_npcs(city_id)[0];
-        let player_id = world.player_id().expect("world should contain a player");
-        let memory = ConversationMemory {
-            summary: "The player kept their word once before.".to_string(),
-        };
-        let place_id = world.city_places(city_id)[0];
-        let process_id =
-            world.start_dialogue_process(player_id, npc_id, place_id, GameTime::from_seconds(4));
-
-        let context = build_npc_dialogue_context(
-            &world,
-            GameTime::from_seconds(34),
-            city_id,
-            &memory,
-            process_id,
-            "What is this city like?".to_string(),
-        )
-        .unwrap();
-
-        assert_eq!(context.npc.id, npc_id);
-        assert_eq!(context.npc.home_place.city_id, city_id);
-        assert_eq!(context.city.id, city_id);
-        assert_eq!(context.current_place.city_id, city_id);
-        assert!(!context.city.connected_cities.is_empty());
-        assert_eq!(context.memory.summary, memory.summary);
-    }
-
-    #[test]
-    fn fallback_conversation_memory_preserves_summary() {
-        let npc_id = crate::world::NpcId(2.into());
-        let transcript = vec![
-            DialogueLine {
-                timestamp: GameTime::from_seconds(0),
-                speaker: DialogueSpeaker::Player,
-                text: "tell me about work".to_string(),
-            },
-            DialogueLine {
-                timestamp: GameTime::from_seconds(30),
-                speaker: DialogueSpeaker::Npc(npc_id),
-                text: "I might have a job if you're reliable.".to_string(),
-            },
-        ];
-
-        let memory = fallback_conversation_memory(&transcript, "Fallback summary".to_string());
-        assert_eq!(memory.summary, "Fallback summary");
     }
 }

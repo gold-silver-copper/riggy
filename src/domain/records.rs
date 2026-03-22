@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::time::{GameTime, TimeDelta};
-use crate::world::{CityId, EntityId, EntityKind, NpcId, PlaceId, PlaceKind, TravelRoute};
+use crate::world::{ActorId, CityId, EntityId, EntityKind, PlaceId, PlaceKind, TravelRoute};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaceSummary {
@@ -25,8 +25,7 @@ pub struct DialogueLine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DialogueSpeaker {
-    Player,
-    Npc(NpcId),
+    Actor(ActorId),
     System,
 }
 
@@ -59,14 +58,8 @@ impl SystemContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameEvent {
-    DialogueStarted {
-        npc_id: NpcId,
-    },
-    DialogueLineRecorded {
+    SpeechLineRecorded {
         line: DialogueLine,
-    },
-    DialogueEnded {
-        npc_id: NpcId,
     },
     TravelCompleted {
         destination: PlaceSummary,

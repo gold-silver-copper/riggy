@@ -3,28 +3,25 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use crate::ai::context::build_npc_dialogue_context;
+use crate::ai::context::build_actor_dialogue_context;
 use crate::app::projection::{
     entity_summary as build_entity_summary, place_summary as build_place_summary,
 };
-use crate::app::query::{
-    active_dialogue_npc_id, active_dialogue_process_id, current_city_id, current_place_id,
-    current_time, player_id,
-};
+use crate::app::query::manual_actor_id;
 use crate::app::read_model::build_ui_snapshot;
-use crate::domain::commands::GameCommand;
+use crate::domain::commands::{ActionKind, ActionRequest};
 use crate::domain::events::{
-    CommandResult, ContextEntry, DialogueLine, DialogueSpeaker, EntitySummary, GameEvent,
+    ActionResult, ContextEntry, DialogueLine, DialogueSpeaker, EntitySummary, GameEvent,
     PlaceSummary, SystemContext,
 };
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::llm::LlmBackend;
-use crate::simulation::{GameState, UiSnapshot};
-use crate::world::{EntityId, NpcId, PlaceId, PlaceKind, World};
+use crate::simulation::GameState;
+use crate::world::{ActorId, ControllerMode, EntityId, PlaceId, PlaceKind, World};
 
 const START_TIME: GameTime = GameTime::from_seconds(8 * 60 * 60);
-const DIALOGUE_TIME: TimeDelta = TimeDelta::from_seconds(30);
+const INSPECT_TIME: TimeDelta = TimeDelta::from_seconds(10);
 
 #[derive(Debug)]
 pub struct GameService<B> {
@@ -36,8 +33,10 @@ impl<B: LlmBackend> GameService<B> {
     pub fn new(backend: B) -> Result<Self> {
         let seed = WorldSeed::new(42);
         let mut world = World::generate(seed, 18);
-        validate_world(&world)?;
-        let start_city_id = world.city_ids()[0];
+        let actor_id = world
+            .manual_actor_id()
+            .expect("generated world should contain a manual actor");
+        let start_city_id = world.actor_city_id(actor_id).unwrap_or_else(|| world.city_ids()[0]);
         let city_places = world.city_places(start_city_id);
         let start_place_id = city_places
             .iter()
@@ -51,20 +50,21 @@ impl<B: LlmBackend> GameService<B> {
             })
             .or_else(|| city_places.first().copied())
             .expect("generated city should have places");
-        let player_id = world.ensure_player();
-        world.move_player(player_id, start_place_id);
+        world.set_actor_home(actor_id, start_place_id);
+        world.move_actor(actor_id, start_place_id);
         world.set_current_time(START_TIME);
-        world.discover_city(player_id, start_city_id, START_TIME);
+        world.discover_city(actor_id, start_city_id, START_TIME);
         for city_id in world.city_connections(start_city_id) {
-            world.discover_city(player_id, city_id, START_TIME);
+            world.discover_city(actor_id, city_id, START_TIME);
         }
         world.append_context_entry(
-            player_id,
+            actor_id,
             ContextEntry::System {
                 timestamp: START_TIME,
                 context: SystemContext::Start,
             },
         );
+        validate_world(&world)?;
 
         Ok(Self {
             state: GameState { world },
@@ -76,20 +76,26 @@ impl<B: LlmBackend> GameService<B> {
         self.backend.name()
     }
 
-    pub fn snapshot(&self) -> UiSnapshot {
+    pub fn snapshot(&self) -> crate::simulation::UiSnapshot {
         build_ui_snapshot(&self.state)
     }
 
-    pub async fn apply_command(&mut self, command: GameCommand) -> Result<CommandResult> {
-        let events = match command {
-            GameCommand::TravelTo(destination) => self.travel_to(destination)?,
-            GameCommand::OpenDialogue(npc_id) => self.start_dialogue(npc_id)?,
-            GameCommand::SubmitDialogueLine(input) => self.submit_dialogue_line(input).await?,
-            GameCommand::InspectEntity(entity_id) => vec![self.inspect_entity(entity_id)?],
-            GameCommand::Wait(duration) => vec![self.wait_for(duration.max(TimeDelta::ONE_SECOND))],
-            GameCommand::LeaveDialogue => vec![self.leave_dialogue().await?],
+    pub async fn apply_action(&mut self, request: ActionRequest) -> Result<ActionResult> {
+        if !self.state.world.actor_ids().contains(&request.actor_id) {
+            bail!("Actor does not exist.");
+        }
+
+        let events = match request.action {
+            ActionKind::MoveTo { destination } => self.move_to(request.actor_id, destination)?,
+            ActionKind::Speak { target, text } => self.speak(request.actor_id, target, text).await?,
+            ActionKind::InspectEntity { entity_id } => {
+                vec![self.inspect_entity(request.actor_id, entity_id)?]
+            }
+            ActionKind::Wait { duration } => {
+                vec![self.wait_for(request.actor_id, duration.max(TimeDelta::ONE_SECOND))]
+            }
         };
-        Ok(CommandResult {
+        Ok(ActionResult {
             events,
             should_quit: false,
         })
@@ -103,83 +109,135 @@ impl<B: LlmBackend> GameService<B> {
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
         let data = fs::read_to_string(path)?;
-        let mut state = serde_json::from_str::<GameState>(&data)?;
-        let player_id = state.world.ensure_player();
-        let current_time = state.world.current_time();
-        for process_id in state.world.active_dialogue_process_ids(player_id) {
-            state.world.end_process(process_id, current_time);
-        }
-        if state.world.player_place_id(player_id).is_none() {
-            let start_city_id = state.world.city_ids()[0];
-            let start_place_id = state.world.city_places(start_city_id)[0];
-            state.world.move_player(player_id, start_place_id);
-        }
+        let state = serde_json::from_str::<GameState>(&data)?;
         validate_world(&state.world)?;
         self.state = state;
         Ok(())
     }
 
-    async fn submit_dialogue_line(&mut self, input: String) -> Result<Vec<GameEvent>> {
-        let trimmed = input.trim();
+    async fn speak(
+        &mut self,
+        actor_id: ActorId,
+        target_id: ActorId,
+        text: String,
+    ) -> Result<Vec<GameEvent>> {
+        let trimmed = text.trim();
         if trimmed.is_empty() {
             return Ok(Vec::new());
         }
+        if actor_id == target_id {
+            bail!("You cannot talk to yourself.");
+        }
 
-        let Some(process_id) = active_dialogue_process_id(&self.state) else {
-            bail!("You are not talking to anyone right now.");
+        let actor_place_id = self
+            .state
+            .world
+            .actor_place_id(actor_id)
+            .ok_or_else(|| anyhow::anyhow!("Actor is not in a place."))?;
+        if self.state.world.actor_place_id(target_id) != Some(actor_place_id) {
+            bail!("That person is no longer here.");
+        }
+
+        let city_id = self
+            .state
+            .world
+            .place_city_id(actor_place_id)
+            .expect("actor place should belong to a city");
+        let started_at = self.current_time();
+        let actor_line = DialogueLine {
+            timestamp: started_at,
+            speaker: DialogueSpeaker::Actor(actor_id),
+            text: trimmed.to_string(),
         };
-        let mut events = self.record_dialogue_line(DialogueSpeaker::Player, trimmed.to_string());
+        let mut transcript = vec![actor_line.clone()];
+        let mut events = vec![GameEvent::SpeechLineRecorded { line: actor_line }];
+        let actor_duration = line_duration(trimmed);
+        let mut total_duration = actor_duration;
 
-        let npc_id = self
-            .state
+        if self.state.world.actor(target_id).controller == ControllerMode::AiAgent {
+            let memory = self
+                .state
+                .world
+                .actor_conversation_memory(target_id)
+                .unwrap_or_default();
+            let context = build_actor_dialogue_context(
+                &self.state.world,
+                started_at,
+                city_id,
+                target_id,
+                actor_id,
+                &memory,
+                trimmed.to_string(),
+            )?;
+
+            let response = self.backend.generate_dialogue(&context).await?;
+            let response_duration = line_duration(&response.text);
+            let response_line = DialogueLine {
+                timestamp: started_at.advance(actor_duration),
+                speaker: DialogueSpeaker::Actor(target_id),
+                text: response.text,
+            };
+            total_duration = total_duration.saturating_add(response_duration);
+            transcript.push(response_line.clone());
+            events.push(GameEvent::SpeechLineRecorded {
+                line: response_line,
+            });
+        }
+
+        self.state.world.record_speech_process(
+            actor_id,
+            target_id,
+            actor_place_id,
+            started_at,
+            total_duration,
+            transcript.clone(),
+        );
+        self.advance_time(total_duration);
+
+        let memory_summary = self.backend.summarize_memory(&transcript).await?;
+        self.state
             .world
-            .dialogue_npc_id(process_id)
-            .expect("active dialogue should include an npc");
-        let memory = self
-            .state
+            .merge_actor_conversation_memory(actor_id, memory_summary.clone());
+        self.state
             .world
-            .npc_conversation_memory(npc_id)
-            .unwrap_or_default();
-        let context = build_npc_dialogue_context(
-            &self.state.world,
-            current_time(&self.state),
-            current_city_id(&self.state),
-            &memory,
-            process_id,
-            trimmed.to_string(),
-        )?;
+            .merge_actor_conversation_memory(target_id, memory_summary);
 
-        let response = self.backend.generate_dialogue(&context).await?;
-        let text = response.text;
-
-        events.extend(self.record_dialogue_line(DialogueSpeaker::Npc(npc_id), text));
-        self.advance_time(DIALOGUE_TIME);
         Ok(events)
     }
 
-    fn travel_to(&mut self, destination_id: PlaceId) -> Result<Vec<GameEvent>> {
+    fn move_to(&mut self, actor_id: ActorId, destination_id: PlaceId) -> Result<Vec<GameEvent>> {
+        let current_place_id = self
+            .state
+            .world
+            .actor_place_id(actor_id)
+            .ok_or_else(|| anyhow::anyhow!("Actor is not in a place."))?;
         let (resolved_destination_id, route) = self
             .state
             .world
-            .place_routes(current_place_id(&self.state))
+            .place_routes(current_place_id)
             .into_iter()
             .find(|(place_id, _)| *place_id == destination_id)
             .ok_or_else(|| anyhow::anyhow!("Selected route is no longer available."))?;
         let travel_time = route.travel_time;
+        let started_at = self.current_time();
 
-        self.move_player_to(resolved_destination_id);
+        self.state
+            .world
+            .record_travel_process(actor_id, resolved_destination_id, started_at, travel_time);
+        self.state.world.move_actor(actor_id, resolved_destination_id);
         self.advance_time(travel_time);
-        let player_id = self.player_id();
-        self.state.world.record_travel_process(
-            player_id,
-            resolved_destination_id,
-            travel_time,
-            current_time(&self.state),
+        self.learn_city(
+            actor_id,
+            self.state
+                .world
+                .place_city_id(resolved_destination_id)
+                .expect("destination should belong to a city"),
         );
-        self.learn_city(current_city_id(&self.state));
+
         let destination = self.place_summary(resolved_destination_id);
         let context_event = self.push_system_context(
-            current_time(&self.state),
+            actor_id,
+            self.current_time(),
             SystemContext::Travel {
                 destination,
                 duration: travel_time,
@@ -195,131 +253,81 @@ impl<B: LlmBackend> GameService<B> {
         ])
     }
 
-    fn start_dialogue(&mut self, npc_id: NpcId) -> Result<Vec<GameEvent>> {
-        if active_dialogue_process_id(&self.state).is_some() {
-            bail!("You are already talking to someone.");
-        }
-        let is_nearby = self
+    fn inspect_entity(&mut self, actor_id: ActorId, entity_id: EntityId) -> Result<GameEvent> {
+        let place_id = self
             .state
             .world
-            .place_npcs(current_place_id(&self.state))
-            .contains(&npc_id);
-        if !is_nearby {
-            bail!("That person is no longer here.");
-        }
-        let player_id = self.player_id();
-        self.state.world.start_dialogue_process(
-            player_id,
-            npc_id,
-            current_place_id(&self.state),
-            current_time(&self.state),
-        );
-        let opening_text = format!(
-            "What do you want to know about {}?",
-            self.state.world.city_name(current_city_id(&self.state))
-        );
-        let mut events = vec![GameEvent::DialogueStarted { npc_id }];
-        events.extend(self.record_dialogue_line(DialogueSpeaker::Npc(npc_id), opening_text));
-        Ok(events)
-    }
-
-    fn inspect_entity(&self, entity_id: EntityId) -> Result<GameEvent> {
-        let is_here = self
-            .state
-            .world
-            .place_entities(current_place_id(&self.state))
-            .contains(&entity_id);
+            .actor_place_id(actor_id)
+            .ok_or_else(|| anyhow::anyhow!("Actor is not in a place."))?;
+        let is_here = self.state.world.place_entities(place_id).contains(&entity_id);
         if !is_here {
             bail!("That entity is no longer here.");
         }
+        let started_at = self.current_time();
+        self.state.world.record_inspect_process(
+            actor_id,
+            entity_id,
+            place_id,
+            started_at,
+            INSPECT_TIME,
+        );
+        self.advance_time(INSPECT_TIME);
         Ok(GameEvent::EntityInspected {
             entity: self.entity_summary(entity_id),
         })
     }
 
-    fn wait_for(&mut self, duration: TimeDelta) -> GameEvent {
+    fn wait_for(&mut self, actor_id: ActorId, duration: TimeDelta) -> GameEvent {
         let duration = duration.max(TimeDelta::ONE_SECOND);
+        let place_id = self
+            .state
+            .world
+            .actor_place_id(actor_id)
+            .expect("actor should occupy a place");
+        let started_at = self.current_time();
+        self.state
+            .world
+            .record_waiting_process(actor_id, place_id, started_at, duration);
         self.advance_time(duration);
-        let player_id = self.player_id();
-        self.state.world.record_waiting_process(
-            player_id,
-            current_place_id(&self.state),
-            duration,
-            current_time(&self.state),
-        );
         GameEvent::WaitCompleted {
             duration,
-            current_time: current_time(&self.state),
+            current_time: self.current_time(),
         }
     }
 
-    async fn leave_dialogue(&mut self) -> Result<GameEvent> {
-        let Some(process_id) = active_dialogue_process_id(&self.state) else {
-            bail!("You are not talking to anyone right now.");
-        };
-        let npc_id = active_dialogue_npc_id(&self.state)
-            .expect("active dialogue should include an npc participant");
-        let transcript = self.state.world.dialogue_lines(process_id);
-        let summary = self.backend.summarize_memory(&transcript).await?;
-        self.state
-            .world
-            .end_process(process_id, current_time(&self.state));
-        self.state
-            .world
-            .merge_npc_conversation_memory(npc_id, summary);
-        Ok(GameEvent::DialogueEnded { npc_id })
-    }
-
-    fn push_system_context(&mut self, timestamp: GameTime, context: SystemContext) -> GameEvent {
+    fn push_system_context(
+        &mut self,
+        actor_id: ActorId,
+        timestamp: GameTime,
+        context: SystemContext,
+    ) -> GameEvent {
         let entry = ContextEntry::System { timestamp, context };
-        self.state
-            .world
-            .append_context_entry(self.player_id(), entry.clone());
+        self.state.world.append_context_entry(actor_id, entry.clone());
         GameEvent::ContextAppended { entry }
     }
 
-    fn move_player_to(&mut self, place_id: PlaceId) {
-        let player_id = self.player_id();
-        self.state.world.move_player(player_id, place_id);
-    }
-
-    fn record_dialogue_line(&mut self, speaker: DialogueSpeaker, text: String) -> Vec<GameEvent> {
-        let process_id = active_dialogue_process_id(&self.state)
-            .expect("dialogue should be active while recording a line");
-        let line = DialogueLine {
-            timestamp: current_time(&self.state),
-            speaker,
-            text,
-        };
-        self.state
-            .world
-            .append_dialogue_utterance(process_id, self.player_id(), line.clone());
-        let entry = ContextEntry::Dialogue(line.clone());
-        vec![
-            GameEvent::DialogueLineRecorded { line },
-            GameEvent::ContextAppended { entry },
-        ]
-    }
-
     fn advance_time(&mut self, duration: TimeDelta) {
-        let next_time = current_time(&self.state).advance(duration);
+        let next_time = self.current_time().advance(duration);
         self.state.world.set_current_time(next_time);
     }
 
-    fn learn_city(&mut self, city_id: crate::world::CityId) {
-        let player_id = self.player_id();
+    fn learn_city(&mut self, actor_id: ActorId, city_id: crate::world::CityId) {
         self.state
             .world
-            .discover_city(player_id, city_id, current_time(&self.state));
+            .discover_city(actor_id, city_id, self.current_time());
         for connected in self.state.world.city_connections(city_id) {
             self.state
                 .world
-                .discover_city(player_id, connected, current_time(&self.state));
+                .discover_city(actor_id, connected, self.current_time());
         }
     }
 
-    fn player_id(&self) -> crate::world::PlayerId {
-        player_id(&self.state)
+    fn current_time(&self) -> GameTime {
+        self.state.world.current_time()
+    }
+
+    pub fn manual_actor_id(&self) -> ActorId {
+        manual_actor_id(&self.state)
     }
 
     fn place_summary(&self, place_id: PlaceId) -> PlaceSummary {
@@ -329,6 +337,11 @@ impl<B: LlmBackend> GameService<B> {
     fn entity_summary(&self, entity_id: EntityId) -> EntitySummary {
         build_entity_summary(&self.state.world, entity_id)
     }
+}
+
+fn line_duration(text: &str) -> TimeDelta {
+    let word_count = text.split_whitespace().count().max(1) as u32;
+    TimeDelta::from_seconds(4 + word_count.saturating_mul(2))
 }
 
 fn validate_world(world: &World) -> Result<()> {
@@ -347,43 +360,16 @@ mod tests {
     use petgraph::visit::EdgeRef;
     use serde_json::to_vec_pretty;
 
-    use crate::ai::context::NpcDialogueContext;
-    use crate::domain::commands::GameCommand;
-    use crate::domain::events::{DialogueLine, GameEvent};
-    use crate::domain::memory::ConversationMemory;
+    use crate::domain::commands::{ActionKind, ActionRequest};
+    use crate::domain::events::GameEvent;
     use crate::domain::time::TimeDelta;
-    use crate::llm::{DialogueResponse, LlmBackend, MockBackend};
-    use crate::simulation::{Interactable, UiMode};
-    use crate::world::{NpcId, WorldNode, WorldRelation};
+    use crate::llm::{LlmBackend, MockBackend};
+    use crate::simulation::Interactable;
+    use crate::world::{WorldNode, WorldRelation};
 
     use super::GameService;
 
-    #[derive(Debug, Clone, Copy)]
-    struct FailingSummaryBackend;
-
-    impl LlmBackend for FailingSummaryBackend {
-        async fn generate_dialogue(
-            &self,
-            _context: &NpcDialogueContext,
-        ) -> anyhow::Result<DialogueResponse> {
-            Ok(DialogueResponse {
-                text: "Normal reply.".to_string(),
-            })
-        }
-
-        async fn summarize_memory(
-            &self,
-            _transcript: &[DialogueLine],
-        ) -> anyhow::Result<ConversationMemory> {
-            anyhow::bail!("summary failed")
-        }
-
-        fn name(&self) -> &'static str {
-            "failing-summary"
-        }
-    }
-
-    fn nearby_npc_id<B: LlmBackend>(game: &GameService<B>) -> NpcId {
+    fn nearby_actor_id<B: LlmBackend>(game: &GameService<B>) -> crate::world::ActorId {
         game.snapshot()
             .interactables
             .into_iter()
@@ -391,38 +377,51 @@ mod tests {
                 Interactable::Talk(actor) => Some(actor.id),
                 _ => None,
             })
-            .expect("expected a nearby npc")
-    }
-
-    async fn open_dialogue_with_nearby_npc<B: LlmBackend>(game: &mut GameService<B>) -> NpcId {
-        let npc_id = nearby_npc_id(game);
-        game.apply_command(GameCommand::OpenDialogue(npc_id))
-            .await
-            .unwrap();
-        npc_id
+            .expect("expected a nearby actor")
     }
 
     #[tokio::test]
-    async fn dialogue_can_be_opened_and_closed_through_typed_commands() {
+    async fn speak_action_uses_typed_action_path() {
         let mut game = GameService::new(MockBackend).unwrap();
-        open_dialogue_with_nearby_npc(&mut game).await;
-        assert_eq!(game.snapshot().mode, UiMode::Dialogue);
-        let leave = game
-            .apply_command(GameCommand::LeaveDialogue)
+        let actor_id = game.manual_actor_id();
+        let target_id = nearby_actor_id(&game);
+
+        let result = game
+            .apply_action(ActionRequest {
+                actor_id,
+                action: ActionKind::Speak {
+                    target: target_id,
+                    text: "hello".to_string(),
+                },
+            })
             .await
             .unwrap();
-        assert!(matches!(
-            leave.events.as_slice(),
-            [GameEvent::DialogueEnded { .. }]
-        ));
+
+        assert!(
+            result
+                .events
+                .iter()
+                .any(|event| matches!(event, GameEvent::SpeechLineRecorded { .. }))
+        );
+        assert!(
+            game.snapshot()
+                .context_feed
+                .iter()
+                .any(|entry| matches!(entry, crate::domain::events::ContextEntry::Dialogue(_)))
+        );
     }
 
     #[tokio::test]
     async fn save_and_load_round_trip() {
         let mut game = GameService::new(MockBackend).unwrap();
-        game.apply_command(GameCommand::Wait(TimeDelta::from_seconds(60)))
-            .await
-            .unwrap();
+        game.apply_action(ActionRequest {
+            actor_id: game.manual_actor_id(),
+            action: ActionKind::Wait {
+                duration: TimeDelta::from_seconds(60),
+            },
+        })
+        .await
+        .unwrap();
         game.save(Path::new("/tmp/riggy-test-save.json")).unwrap();
 
         let mut loaded = GameService::new(MockBackend).unwrap();
@@ -431,126 +430,25 @@ mod tests {
             game.state.world.current_time(),
             loaded.state.world.current_time()
         );
-        let loaded_player_id = loaded.state.world.player_id().unwrap();
-        let game_player_id = game.state.world.player_id().unwrap();
+        let loaded_actor_id = loaded.state.world.manual_actor_id().unwrap();
+        let game_actor_id = game.state.world.manual_actor_id().unwrap();
         assert_eq!(
-            game.state.world.player_city_id(game_player_id),
-            loaded.state.world.player_city_id(loaded_player_id)
+            game.state.world.actor_city_id(game_actor_id),
+            loaded.state.world.actor_city_id(loaded_actor_id)
         );
-    }
-
-    #[tokio::test]
-    async fn load_closes_stale_dialogue_processes() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
-        assert_eq!(game.snapshot().mode, UiMode::Dialogue);
-        game.save(Path::new("/tmp/riggy-dialogue-save.json"))
-            .unwrap();
-
-        let mut loaded = GameService::new(MockBackend).unwrap();
-        loaded
-            .load(Path::new("/tmp/riggy-dialogue-save.json"))
-            .unwrap();
-
-        assert_eq!(loaded.snapshot().mode, UiMode::Explore);
-        assert_eq!(
-            loaded
-                .state
-                .world
-                .active_dialogue_npc_id(loaded.player_id()),
-            None
-        );
-        assert!(loaded.snapshot().interactables.iter().any(
-            |interactable| matches!(interactable, Interactable::Talk(actor) if actor.id == npc_id)
-        ));
-    }
-
-    #[tokio::test]
-    async fn dialogue_submission_uses_typed_command_path() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        open_dialogue_with_nearby_npc(&mut game).await;
-        let result = game
-            .apply_command(GameCommand::SubmitDialogueLine("hello".to_string()))
-            .await
-            .unwrap();
-
-        assert!(
-            result
-                .events
-                .iter()
-                .any(|event| matches!(event, GameEvent::DialogueLineRecorded { .. }))
-        );
-    }
-
-    #[tokio::test]
-    async fn leaving_dialogue_persists_conversation_memory() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
-        game.apply_command(GameCommand::SubmitDialogueLine(
-            "tell me about work".to_string(),
-        ))
-        .await
-        .unwrap();
-        game.apply_command(GameCommand::LeaveDialogue)
-            .await
-            .unwrap();
-
-        let memory = game.state.world.npc_conversation_memory(npc_id).unwrap();
-        assert!(!memory.summary.is_empty());
-        assert!(memory.summary.contains("tell me about work"));
-    }
-
-    #[tokio::test]
-    async fn leaving_dialogue_preserves_session_when_summary_fails() {
-        let mut game = GameService::new(FailingSummaryBackend).unwrap();
-        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
-        let error = game
-            .apply_command(GameCommand::LeaveDialogue)
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("summary failed"));
-        assert_eq!(
-            game.state.world.active_dialogue_npc_id(game.player_id()),
-            Some(npc_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn leaving_dialogue_merges_conversation_memory_across_sessions() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
-        game.apply_command(GameCommand::SubmitDialogueLine(
-            "tell me about work".to_string(),
-        ))
-        .await
-        .unwrap();
-        game.apply_command(GameCommand::LeaveDialogue)
-            .await
-            .unwrap();
-
-        game.apply_command(GameCommand::OpenDialogue(npc_id))
-            .await
-            .unwrap();
-        game.apply_command(GameCommand::SubmitDialogueLine(
-            "tell me about the city".to_string(),
-        ))
-        .await
-        .unwrap();
-        game.apply_command(GameCommand::LeaveDialogue)
-            .await
-            .unwrap();
-
-        let memory = game.state.world.npc_conversation_memory(npc_id).unwrap();
-        assert!(memory.summary.contains("tell me about work"));
-        assert!(memory.summary.contains("tell me about the city"));
     }
 
     #[tokio::test]
     async fn load_rejects_invalid_world_snapshot() {
         let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = game.state.world.npc_ids()[0];
-        let resident_city_id = game.state.world.npc_resident_city_ids(npc_id)[0];
+        let actor_id = game
+            .state
+            .world
+            .actor_ids()
+            .into_iter()
+            .find(|candidate| *candidate != game.manual_actor_id())
+            .unwrap();
+        let resident_city_id = game.state.world.actor_resident_city_ids(actor_id)[0];
         let other_city_id = game
             .state
             .world
@@ -563,7 +461,7 @@ mod tests {
             .state
             .world
             .graph
-            .edges_directed(npc_id.0, petgraph::Direction::Outgoing)
+            .edges_directed(actor_id.0, petgraph::Direction::Outgoing)
             .find(|edge| {
                 matches!(edge.weight(), WorldRelation::LocatedAt)
                     && matches!(
@@ -572,10 +470,10 @@ mod tests {
                     )
             })
             .map(|edge| edge.id())
-            .expect("npc should have a present place");
+            .expect("actor should have a present place");
         game.state.world.graph.remove_edge(present_edge_id);
         game.state.world.graph.add_edge(
-            npc_id.0,
+            actor_id.0,
             other_place_id.0,
             WorldRelation::LocatedAt,
         );

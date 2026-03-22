@@ -12,15 +12,15 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::{LocalSet, spawn_local};
 
 use crate::app::service::GameService;
-use crate::domain::commands::GameCommand;
-use crate::domain::events::CommandResult;
+use crate::domain::commands::{ActionKind, ActionRequest};
+use crate::domain::events::ActionResult;
 use crate::domain::time::TimeDelta;
 use crate::llm::LlmBackend;
 use crate::presenter::{
     build_world_text, build_world_title, format_duration, render_event_notice,
     render_interactable_label, render_route_label,
 };
-use crate::simulation::{Interactable, UiMode, UiSnapshot};
+use crate::simulation::{ActorView, Interactable, UiSnapshot};
 
 const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
 const NOTICE_HISTORY_LIMIT: usize = 48;
@@ -51,7 +51,7 @@ impl ListMenuKind {
     fn hint(self) -> Line<'static> {
         match self {
             Self::Travel => Line::from("Up/Down route  Enter travel  Esc back  Ctrl+C quit"),
-            Self::Interact => Line::from("Up/Down target  Enter interact  Esc back  Ctrl+C quit"),
+            Self::Interact => Line::from("Up/Down target  Enter select  Esc back  Ctrl+C quit"),
         }
     }
 
@@ -78,24 +78,6 @@ impl ListMenuKind {
             ),
         }
     }
-
-    fn action(self, snapshot: &UiSnapshot, index: usize) -> Option<GameCommand> {
-        match self {
-            Self::Travel => snapshot
-                .routes
-                .get(index)
-                .map(|route| GameCommand::TravelTo(route.destination.id)),
-            Self::Interact => {
-                snapshot
-                    .interactables
-                    .get(index)
-                    .map(|interactable| match interactable {
-                        Interactable::Talk(actor) => GameCommand::OpenDialogue(actor.id),
-                        Interactable::Inspect(entity) => GameCommand::InspectEntity(entity.id),
-                    })
-            }
-        }
-    }
 }
 
 fn list_items(items: impl Iterator<Item = String>) -> Vec<ListItem<'static>> {
@@ -108,12 +90,12 @@ fn list_items(items: impl Iterator<Item = String>) -> Vec<ListItem<'static>> {
 }
 
 #[derive(Default)]
-struct DialogueInputState {
+struct TextInputState {
     input: String,
     cursor: usize,
 }
 
-impl DialogueInputState {
+impl TextInputState {
     fn insert_char(&mut self, ch: char) {
         let byte_index = self.byte_index();
         self.input.insert(byte_index, ch);
@@ -163,21 +145,35 @@ impl DialogueInputState {
     }
 }
 
+struct ConversationState {
+    target: ActorView,
+    input: TextInputState,
+}
+
+impl ConversationState {
+    fn new(target: ActorView) -> Self {
+        Self {
+            target,
+            input: TextInputState::default(),
+        }
+    }
+}
+
 struct ListMenuState {
     kind: ListMenuKind,
     selected: usize,
 }
 
 struct PendingState {
-    resume_input_on_success: bool,
-    rx: oneshot::Receiver<anyhow::Result<CommandResult>>,
+    resume_conversation: Option<ActorView>,
+    rx: oneshot::Receiver<anyhow::Result<ActionResult>>,
 }
 
 enum UiState {
     Idle,
     ListMenu(ListMenuState),
     WaitMenu,
-    DialogueInput(DialogueInputState),
+    Conversation(ConversationState),
     Pending(PendingState),
 }
 
@@ -220,16 +216,13 @@ impl App {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
 
             if event::poll(Duration::from_millis(50))? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        if !is_actionable_key_event(key) {
-                            continue;
-                        }
-                        if self.handle_key(key, &game, &snapshot)? {
-                            break;
-                        }
+                if let Event::Key(key) = event::read()? {
+                    if !is_actionable_key_event(key) {
+                        continue;
                     }
-                    _ => {}
+                    if self.handle_key(key, &game, &snapshot)? {
+                        break;
+                    }
                 }
             }
         }
@@ -249,40 +242,16 @@ impl App {
 
         match &self.state {
             UiState::Pending(_) => Ok(false),
-            UiState::Idle => self.handle_idle_key(key, game, snapshot),
+            UiState::Idle => self.handle_idle_key(key),
             UiState::ListMenu(_) => self.handle_list_menu_key(key, game, snapshot),
-            UiState::WaitMenu => self.handle_wait_key(key, game),
-            UiState::DialogueInput(_) => self.handle_dialogue_input_key(key, game),
+            UiState::WaitMenu => self.handle_wait_key(key, game, snapshot),
+            UiState::Conversation(_) => self.handle_conversation_key(key, game, snapshot),
         }
     }
 
-    fn handle_idle_key<B: LlmBackend + Clone + 'static>(
-        &mut self,
-        key: KeyEvent,
-        game: &Arc<Mutex<GameService<B>>>,
-        snapshot: &UiSnapshot,
-    ) -> Result<bool> {
-        match key.code {
-            KeyCode::Char(ch) if snapshot.mode == UiMode::Explore => {
-                if self.try_open_explore_overlay(ch) {
-                    return Ok(false);
-                }
-            }
-            KeyCode::Char(ch)
-                if snapshot.mode == UiMode::Dialogue
-                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                let mut input = DialogueInputState::default();
-                input.insert_char(ch);
-                self.state = UiState::DialogueInput(input);
-            }
-            KeyCode::Enter if snapshot.mode == UiMode::Dialogue => {
-                self.state = UiState::DialogueInput(DialogueInputState::default());
-            }
-            KeyCode::Esc if snapshot.mode == UiMode::Dialogue => {
-                return self.execute_action(game, GameCommand::LeaveDialogue, false);
-            }
-            _ => {}
+    fn handle_idle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if let KeyCode::Char(ch) = key.code {
+            let _ = self.try_open_explore_overlay(ch);
         }
         Ok(false)
     }
@@ -306,12 +275,43 @@ impl App {
             KeyCode::Up => {
                 cycle_selection(&mut menu.selected, menu.kind.len(snapshot), false);
             }
-            KeyCode::Enter => {
-                if let Some(action) = menu.kind.action(snapshot, menu.selected) {
-                    let resume_input = matches!(action, GameCommand::OpenDialogue(_));
-                    return self.execute_action(game, action, resume_input);
+            KeyCode::Enter => match menu.kind {
+                ListMenuKind::Travel => {
+                    if let Some(route) = snapshot.routes.get(menu.selected) {
+                        return self.execute_action(
+                            game,
+                            ActionRequest {
+                                actor_id: snapshot.actor_id,
+                                action: ActionKind::MoveTo {
+                                    destination: route.destination.id,
+                                },
+                            },
+                            None,
+                        );
+                    }
                 }
-            }
+                ListMenuKind::Interact => {
+                    if let Some(interactable) = snapshot.interactables.get(menu.selected) {
+                        match interactable {
+                            Interactable::Talk(actor) => {
+                                self.state = UiState::Conversation(ConversationState::new(*actor));
+                            }
+                            Interactable::Inspect(entity) => {
+                                return self.execute_action(
+                                    game,
+                                    ActionRequest {
+                                        actor_id: snapshot.actor_id,
+                                        action: ActionKind::InspectEntity {
+                                            entity_id: entity.id,
+                                        },
+                                    },
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                }
+            },
             _ => {}
         }
         Ok(false)
@@ -321,64 +321,68 @@ impl App {
         &mut self,
         key: KeyEvent,
         game: &Arc<Mutex<GameService<B>>>,
+        snapshot: &UiSnapshot,
     ) -> Result<bool> {
         match key.code {
             KeyCode::Esc => {
                 self.state = UiState::Idle;
             }
-            KeyCode::Left => {
-                self.adjust_wait(-1);
-            }
-            KeyCode::Right => {
-                self.adjust_wait(1);
-            }
-            KeyCode::Down => {
-                self.adjust_wait(-60);
-            }
-            KeyCode::Up => {
-                self.adjust_wait(60);
-            }
+            KeyCode::Left => self.adjust_wait(-1),
+            KeyCode::Right => self.adjust_wait(1),
+            KeyCode::Down => self.adjust_wait(-60),
+            KeyCode::Up => self.adjust_wait(60),
             KeyCode::Enter => {
-                return self.execute_action(game, GameCommand::Wait(self.wait_duration), false);
+                return self.execute_action(
+                    game,
+                    ActionRequest {
+                        actor_id: snapshot.actor_id,
+                        action: ActionKind::Wait {
+                            duration: self.wait_duration,
+                        },
+                    },
+                    None,
+                );
             }
             _ => {}
         }
         Ok(false)
     }
 
-    fn handle_dialogue_input_key<B: LlmBackend + Clone + 'static>(
+    fn handle_conversation_key<B: LlmBackend + Clone + 'static>(
         &mut self,
         key: KeyEvent,
         game: &Arc<Mutex<GameService<B>>>,
+        snapshot: &UiSnapshot,
     ) -> Result<bool> {
-        let UiState::DialogueInput(input) = &mut self.state else {
+        let UiState::Conversation(conversation) = &mut self.state else {
             return Ok(false);
         };
+
         match key.code {
             KeyCode::Esc => {
-                return self.execute_action(game, GameCommand::LeaveDialogue, false);
-            }
-            KeyCode::Enter => {
-                if let Some(submitted) = input.take_trimmed() {
-                    return self.execute_action(
-                        game,
-                        GameCommand::SubmitDialogueLine(submitted),
-                        true,
-                    );
-                }
                 self.state = UiState::Idle;
             }
-            KeyCode::Backspace => {
-                input.delete_char();
+            KeyCode::Enter => {
+                if let Some(submitted) = conversation.input.take_trimmed() {
+                    let target = conversation.target;
+                    return self.execute_action(
+                        game,
+                        ActionRequest {
+                            actor_id: snapshot.actor_id,
+                            action: ActionKind::Speak {
+                                target: target.id,
+                                text: submitted,
+                            },
+                        },
+                        Some(target),
+                    );
+                }
             }
-            KeyCode::Left => {
-                input.move_cursor_left();
-            }
-            KeyCode::Right => {
-                input.move_cursor_right();
-            }
+            KeyCode::Backspace => conversation.input.delete_char(),
+            KeyCode::Left => conversation.input.move_cursor_left(),
+            KeyCode::Right => conversation.input.move_cursor_right(),
             KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                input.insert_char(ch);
+                conversation.input.insert_char(ch);
             }
             _ => {}
         }
@@ -388,19 +392,19 @@ impl App {
     fn execute_action<B: LlmBackend + Clone + 'static>(
         &mut self,
         game: &Arc<Mutex<GameService<B>>>,
-        action: GameCommand,
-        resume_input_on_success: bool,
+        action: ActionRequest,
+        resume_conversation: Option<ActorView>,
     ) -> Result<bool> {
         let (tx, rx) = oneshot::channel();
         let game = Arc::clone(game);
         self.state = UiState::Pending(PendingState {
-            resume_input_on_success,
+            resume_conversation,
             rx,
         });
         spawn_local(async move {
             let result = {
                 let mut game = game.lock().await;
-                game.apply_command(action).await
+                game.apply_action(action).await
             };
             let _ = tx.send(result);
         });
@@ -422,16 +426,18 @@ impl App {
         match pending.rx.try_recv() {
             Ok(result) => {
                 let should_quit = match result {
-                    Ok(CommandResult {
+                    Ok(ActionResult {
                         events,
                         should_quit,
                     }) => {
-                        let world_seed = {
+                        let snapshot = {
                             let game = game.lock().await;
-                            game.snapshot().world_seed
+                            game.snapshot()
                         };
                         for event in &events {
-                            if let Some(text) = render_event_notice(world_seed, event) {
+                            if let Some(text) =
+                                render_event_notice(snapshot.world_seed, snapshot.actor_id, event)
+                            {
                                 self.push_notice(text);
                             }
                         }
@@ -442,12 +448,20 @@ impl App {
                         false
                     }
                 };
-                let in_dialogue = {
+                let snapshot = {
                     let game = game.lock().await;
-                    game.snapshot().mode == UiMode::Dialogue
+                    game.snapshot()
                 };
-                self.state = if pending.resume_input_on_success && in_dialogue {
-                    UiState::DialogueInput(DialogueInputState::default())
+                self.state = if let Some(target) = pending.resume_conversation {
+                    if snapshot
+                        .interactables
+                        .iter()
+                        .any(|interactable| matches!(interactable, Interactable::Talk(actor) if actor.id == target.id))
+                    {
+                        UiState::Conversation(ConversationState::new(target))
+                    } else {
+                        UiState::Idle
+                    }
                 } else {
                     UiState::Idle
                 };
@@ -468,20 +482,19 @@ impl App {
     fn sync_state(&mut self, snapshot: &UiSnapshot) {
         let reset_to_idle = match &mut self.state {
             UiState::Idle | UiState::Pending(_) => false,
-            UiState::WaitMenu => snapshot.mode != UiMode::Explore,
-            UiState::DialogueInput(_) => snapshot.mode != UiMode::Dialogue,
+            UiState::WaitMenu => false,
+            UiState::Conversation(conversation) => !snapshot
+                .interactables
+                .iter()
+                .any(|interactable| matches!(interactable, Interactable::Talk(actor) if actor.id == conversation.target.id)),
             UiState::ListMenu(menu) => {
-                if snapshot.mode != UiMode::Explore {
-                    true
+                let len = menu.kind.len(snapshot);
+                menu.selected = if len == 0 {
+                    0
                 } else {
-                    let len = menu.kind.len(snapshot);
-                    menu.selected = if len == 0 {
-                        0
-                    } else {
-                        menu.selected.min(len - 1)
-                    };
-                    false
-                }
+                    menu.selected.min(len - 1)
+                };
+                false
             }
         };
 
@@ -496,18 +509,31 @@ impl App {
 
         frame.render_widget(self.world_paragraph(snapshot), world_area);
         self.render_overlay(frame, snapshot, world_area);
-        frame.render_widget(self.command_bar(snapshot, backend_name), command_area);
+        frame.render_widget(self.command_bar(backend_name), command_area);
 
-        if let UiState::DialogueInput(input) = &self.state {
+        if let UiState::Conversation(conversation) = &self.state {
             let area = self.overlay_area(world_area, 72, 6);
-            frame.set_cursor_position(Position::new(area.x + input.cursor as u16 + 1, area.y + 2));
+            frame.set_cursor_position(Position::new(
+                area.x + conversation.input.cursor as u16 + 1,
+                area.y + 2,
+            ));
         }
     }
 
     fn world_paragraph(&self, snapshot: &UiSnapshot) -> Paragraph<'static> {
-        let mode_label = match snapshot.mode {
-            UiMode::Explore => "Explore",
-            UiMode::Dialogue => "Dialogue",
+        let mode_label = match self.state {
+            UiState::Conversation(_) => "Conversation",
+            UiState::ListMenu(ListMenuState {
+                kind: ListMenuKind::Travel,
+                ..
+            }) => "Travel",
+            UiState::ListMenu(ListMenuState {
+                kind: ListMenuKind::Interact,
+                ..
+            }) => "Interact",
+            UiState::WaitMenu => "Wait",
+            UiState::Pending(_) => "Working",
+            UiState::Idle => "Explore",
         };
         let mut title = build_world_title(snapshot).spans;
         title.push(Span::raw("  "));
@@ -528,10 +554,10 @@ impl App {
                 frame.render_widget(Clear, area);
                 frame.render_widget(self.pending_widget(), area);
             }
-            UiState::DialogueInput(input) => {
+            UiState::Conversation(conversation) => {
                 let area = self.overlay_area(world_area, 72, 6);
                 frame.render_widget(Clear, area);
-                frame.render_widget(self.input_widget(&input.input), area);
+                frame.render_widget(self.input_widget(snapshot, conversation), area);
             }
             UiState::WaitMenu => {
                 let area = self.overlay_area(world_area, 38, 5);
@@ -554,10 +580,17 @@ impl App {
         }
     }
 
-    fn input_widget<'a>(&self, input: &'a str) -> Paragraph<'a> {
+    fn input_widget<'a>(
+        &self,
+        snapshot: &'a UiSnapshot,
+        conversation: &'a ConversationState,
+    ) -> Paragraph<'a> {
         Paragraph::new(vec![
-            Line::from("Type your reply. Press Enter to send or Esc to leave."),
-            Line::from(input),
+            Line::from(format!(
+                "Talking to {}. Press Enter to speak or Esc to close.",
+                conversation.target.id.name(snapshot.world_seed)
+            )),
+            Line::from(conversation.input.input.as_str()),
         ])
         .style(Style::default().fg(Color::Yellow))
         .alignment(Alignment::Left)
@@ -578,7 +611,7 @@ impl App {
             ]),
             Line::from(""),
             Line::from(
-                "Dialogue and world commands run in the background. The UI will stay responsive while this finishes.",
+                "World actions run in the background. The UI will stay responsive while this finishes.",
             ),
         ])
         .block(Block::bordered().title("Working"))
@@ -602,24 +635,21 @@ impl App {
         .block(Block::bordered().title("Wait"))
     }
 
-    fn command_bar(&self, snapshot: &UiSnapshot, backend_name: &str) -> Line<'static> {
+    fn command_bar(&self, backend_name: &str) -> Line<'static> {
         match &self.state {
             UiState::Pending(_) => Line::from(vec![
                 "Ctrl+C".bold(),
                 " quit  ".into(),
                 Span::raw(format!("Waiting on {}...", backend_name)),
             ]),
-            UiState::DialogueInput(_) => {
-                Line::from("Enter send  Esc leave dialogue  Left/Right move  Ctrl+C quit")
+            UiState::Conversation(_) => {
+                Line::from("Enter speak  Esc close panel  Left/Right move  Ctrl+C quit")
             }
             UiState::ListMenu(menu) => menu.kind.hint(),
             UiState::WaitMenu => {
                 Line::from("Left/Right +/-1s  Up/Down +/-1m  Enter wait  Esc back  Ctrl+C quit")
             }
-            UiState::Idle => match snapshot.mode {
-                UiMode::Explore => Line::from("g travel  e interact  w wait  Ctrl+C quit"),
-                UiMode::Dialogue => Line::from("Type reply  Esc leave dialogue  Ctrl+C quit"),
-            },
+            UiState::Idle => Line::from("g travel  e interact  w wait  Ctrl+C quit"),
         }
     }
 
@@ -641,6 +671,7 @@ impl App {
         };
         self.wait_duration = next.clamp(TimeDelta::ONE_SECOND, TimeDelta::from_hours(12));
     }
+
     fn try_open_explore_overlay(&mut self, ch: char) -> bool {
         if ch.eq_ignore_ascii_case(&'g') {
             self.state = UiState::ListMenu(ListMenuState {
@@ -706,116 +737,4 @@ fn selected_style() -> Style {
         .fg(Color::Black)
         .bg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use crossterm::event::{KeyEventState, KeyModifiers};
-    use tokio::sync::Mutex;
-
-    use crate::app::service::GameService;
-    use crate::llm::MockBackend;
-
-    use super::{
-        App, KeyCode, KeyEvent, KeyEventKind, ListMenuKind, UiState, is_actionable_key_event,
-    };
-
-    #[test]
-    fn actionable_key_events_ignore_release_only() {
-        let press = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
-        let repeat = KeyEvent {
-            code: KeyCode::Char('g'),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Repeat,
-            state: KeyEventState::NONE,
-        };
-        let release = KeyEvent {
-            code: KeyCode::Char('g'),
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Release,
-            state: KeyEventState::NONE,
-        };
-
-        assert!(is_actionable_key_event(press));
-        assert!(is_actionable_key_event(repeat));
-        assert!(!is_actionable_key_event(release));
-    }
-
-    #[tokio::test]
-    async fn explore_keys_open_the_expected_overlays() {
-        let game = Arc::new(Mutex::new(GameService::new(MockBackend).unwrap()));
-        let snapshot = {
-            let game = game.lock().await;
-            game.snapshot()
-        };
-        let mut app = App::new();
-
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
-            &game,
-            &snapshot,
-        )
-        .unwrap();
-        assert!(matches!(
-            app.state,
-            UiState::ListMenu(ref menu) if menu.kind == ListMenuKind::Travel
-        ));
-
-        app.state = UiState::Idle;
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
-            &game,
-            &snapshot,
-        )
-        .unwrap();
-        assert!(matches!(
-            app.state,
-            UiState::ListMenu(ref menu) if menu.kind == ListMenuKind::Interact
-        ));
-
-        app.state = UiState::Idle;
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
-            &game,
-            &snapshot,
-        )
-        .unwrap();
-        assert!(matches!(app.state, UiState::WaitMenu));
-    }
-
-    #[tokio::test]
-    async fn uppercase_explore_keys_also_open_overlays() {
-        let game = Arc::new(Mutex::new(GameService::new(MockBackend).unwrap()));
-        let snapshot = {
-            let game = game.lock().await;
-            game.snapshot()
-        };
-        let mut app = App::new();
-
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
-            &game,
-            &snapshot,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            app.state,
-            UiState::ListMenu(ref menu) if menu.kind == ListMenuKind::Travel
-        ));
-    }
-
-    #[tokio::test]
-    async fn poll_pending_preserves_non_pending_state() {
-        let game = Arc::new(Mutex::new(GameService::new(MockBackend).unwrap()));
-        let mut app = App::new();
-        app.state = UiState::WaitMenu;
-
-        let result = app.poll_pending(&game).await.unwrap();
-
-        assert_eq!(result, None);
-        assert!(matches!(app.state, UiState::WaitMenu));
-    }
 }

@@ -1,12 +1,12 @@
 use crate::domain::time::GameTime;
 use crate::simulation::GameState;
-use crate::world::{CityId, NpcId, PlaceId, PlayerId, ProcessId};
+use crate::world::{ActorId, CityId, PlaceId};
 
-pub fn player_id(state: &GameState) -> PlayerId {
+pub fn manual_actor_id(state: &GameState) -> ActorId {
     state
         .world
-        .player_id()
-        .expect("player should exist in world")
+        .manual_actor_id()
+        .expect("world should contain a manual actor")
 }
 
 pub fn current_time(state: &GameState) -> GameTime {
@@ -16,21 +16,13 @@ pub fn current_time(state: &GameState) -> GameTime {
 pub fn current_place_id(state: &GameState) -> PlaceId {
     state
         .world
-        .player_place_id(player_id(state))
-        .expect("player should occupy a place")
+        .actor_place_id(manual_actor_id(state))
+        .expect("manual actor should occupy a place")
 }
 
 pub fn current_city_id(state: &GameState) -> CityId {
     state
         .world
-        .player_city_id(player_id(state))
-        .expect("player place should belong to a city")
-}
-
-pub fn active_dialogue_process_id(state: &GameState) -> Option<ProcessId> {
-    state.world.active_dialogue_process_id(player_id(state))
-}
-
-pub fn active_dialogue_npc_id(state: &GameState) -> Option<NpcId> {
-    state.world.active_dialogue_npc_id(player_id(state))
+        .actor_city_id(manual_actor_id(state))
+        .expect("manual actor place should belong to a city")
 }

@@ -29,8 +29,7 @@ macro_rules! node_id_type {
 node_id_type!(CountryId);
 node_id_type!(CityId);
 node_id_type!(PlaceId);
-node_id_type!(NpcId);
-node_id_type!(PlayerId);
+node_id_type!(ActorId);
 node_id_type!(EntityId);
 node_id_type!(ProcessId);
 node_id_type!(RecordId);
@@ -41,8 +40,7 @@ pub enum NodeId {
     Country(CountryId),
     City(CityId),
     Place(PlaceId),
-    Character(NpcId),
-    Player(PlayerId),
+    Actor(ActorId),
     Item(EntityId),
     Process(ProcessId),
     Record(RecordId),
@@ -55,8 +53,7 @@ impl NodeId {
             Self::Country(id) => id.index(),
             Self::City(id) => id.index(),
             Self::Place(id) => id.index(),
-            Self::Character(id) => id.index(),
-            Self::Player(id) => id.index(),
+            Self::Actor(id) => id.index(),
             Self::Item(id) => id.index(),
             Self::Process(id) => id.index(),
             Self::Record(id) => id.index(),
@@ -76,13 +73,13 @@ impl CityId {
     }
 }
 
-impl NpcId {
+impl ActorId {
     pub fn name(self, seed: WorldSeed) -> String {
         let key = mix_seed(seed, &[1, self.index() as u64]);
         format!(
             "{} {}",
-            NPC_FIRST_NAMES[(key as usize) % NPC_FIRST_NAMES.len()],
-            NPC_LAST_NAMES[((key >> 16) as usize) % NPC_LAST_NAMES.len()]
+            ACTOR_FIRST_NAMES[(key as usize) % ACTOR_FIRST_NAMES.len()],
+            ACTOR_LAST_NAMES[((key >> 16) as usize) % ACTOR_LAST_NAMES.len()]
         )
     }
 }
@@ -134,6 +131,12 @@ labeled_enum!(EntityKind {
     Bag => "bag",
 });
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ControllerMode {
+    Manual,
+    AiAgent,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Country;
 
@@ -151,15 +154,13 @@ pub struct Place {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Npc {
+pub struct Actor {
+    pub controller: ControllerMode,
     pub occupation: Occupation,
     pub archetype: NpcArchetype,
     pub traits: Vec<TraitTag>,
     pub goal: GoalTag,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct Player;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entity {
@@ -170,14 +171,16 @@ pub struct Entity {
 pub struct Process {
     pub kind: ProcessKind,
     pub started_at: GameTime,
-    pub ended_at: Option<GameTime>,
+    pub duration: TimeDelta,
+    pub ended_at: GameTime,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ProcessKind {
-    Dialogue,
-    Travel { duration: TimeDelta },
-    Waiting { duration: TimeDelta },
+    Speak,
+    Travel,
+    Waiting,
+    Inspect,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -193,7 +196,8 @@ pub struct Clock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NpcProfile {
+pub struct ActorProfile {
+    pub controller: ControllerMode,
     pub occupation: Occupation,
     pub archetype: NpcArchetype,
     pub traits: Vec<TraitTag>,
@@ -206,8 +210,7 @@ pub enum WorldNode {
     Country(Country),
     City(City),
     Place(Place),
-    Character(Npc),
-    Player(Player),
+    Actor(Actor),
     Item(Entity),
     Process(Process),
     Record(Record),
@@ -264,7 +267,6 @@ impl World {
 
         let country_id = world.add_country();
         world.add_clock(GameTime::from_seconds(0));
-        world.ensure_player();
 
         let mut station_ids = Vec::with_capacity(target_cities);
         let mut city_ids = Vec::with_capacity(target_cities);
@@ -286,7 +288,11 @@ impl World {
             let b = city_ids[(city_index + 1) % target_cities];
             let route = random_transit_route(&mut rng, true);
             world.connect_cities(a, b, route);
-            world.connect_places(station_ids[city_index], station_ids[(city_index + 1) % target_cities], route);
+            world.connect_places(
+                station_ids[city_index],
+                station_ids[(city_index + 1) % target_cities],
+                route,
+            );
         }
 
         for _ in 0..(target_cities / 2) {
@@ -295,16 +301,30 @@ impl World {
             while b_index == a_index {
                 b_index = rng.random_range(0..target_cities);
             }
-            let a = city_ids[a_index];
-            let b = city_ids[b_index];
             let route = random_transit_route(&mut rng, false);
-            world.connect_cities(a, b, route);
+            world.connect_cities(city_ids[a_index], city_ids[b_index], route);
             world.connect_places(station_ids[a_index], station_ids[b_index], route);
         }
 
-        for city_id in city_ids {
-            world.spawn_city_npcs(&mut rng, city_id);
+        for city_id in city_ids.iter().copied() {
+            world.spawn_city_ai_actors(&mut rng, city_id);
         }
+
+        let start_city_id = city_ids[0];
+        let start_place_id = world
+            .city_places(start_city_id)
+            .into_iter()
+            .find(|place_id| matches!(world.place(*place_id).kind, PlaceKind::Residence))
+            .unwrap_or_else(|| world.city_places(start_city_id)[0]);
+        world.add_actor(
+            ControllerMode::Manual,
+            Occupation::SoftwareEngineer,
+            NpcArchetype::Watcher,
+            vec![TraitTag::Patient, TraitTag::Guarded],
+            GoalTag::VerifyOnlineRumor,
+            start_place_id,
+            start_place_id,
+        );
 
         world
     }
@@ -314,8 +334,7 @@ impl World {
             WorldNode::Country(_) => Some(NodeId::Country(CountryId(index))),
             WorldNode::City(_) => Some(NodeId::City(CityId(index))),
             WorldNode::Place(_) => Some(NodeId::Place(PlaceId(index))),
-            WorldNode::Character(_) => Some(NodeId::Character(NpcId(index))),
-            WorldNode::Player(_) => Some(NodeId::Player(PlayerId(index))),
+            WorldNode::Actor(_) => Some(NodeId::Actor(ActorId(index))),
             WorldNode::Item(_) => Some(NodeId::Item(EntityId(index))),
             WorldNode::Process(_) => Some(NodeId::Process(ProcessId(index))),
             WorldNode::Record(_) => Some(NodeId::Record(RecordId(index))),
@@ -334,27 +353,28 @@ impl World {
         id.name(self.seed)
     }
 
-    pub fn npc(&self, id: NpcId) -> &Npc {
+    pub fn actor(&self, id: ActorId) -> &Actor {
         match self.graph.node_weight(id.0) {
-            Some(WorldNode::Character(npc)) => npc,
-            _ => panic!("npc id {:?} is invalid", id),
+            Some(WorldNode::Actor(actor)) => actor,
+            _ => panic!("actor id {:?} is invalid", id),
         }
     }
 
-    pub fn npc_profile(&self, id: NpcId) -> NpcProfile {
-        let npc = self.npc(id);
-        NpcProfile {
-            occupation: npc.occupation,
-            archetype: npc.archetype,
-            traits: npc.traits.clone(),
-            goal: npc.goal,
+    pub fn actor_profile(&self, id: ActorId) -> ActorProfile {
+        let actor = self.actor(id);
+        ActorProfile {
+            controller: actor.controller,
+            occupation: actor.occupation,
+            archetype: actor.archetype,
+            traits: actor.traits.clone(),
+            goal: actor.goal,
             home_place_id: self
-                .npc_home_place_id(id)
-                .expect("npc should have a home place"),
+                .actor_home_place_id(id)
+                .expect("actor should have a home place"),
         }
     }
 
-    pub fn npc_name(&self, id: NpcId) -> String {
+    pub fn actor_name(&self, id: ActorId) -> String {
         id.name(self.seed)
     }
 
@@ -386,6 +406,17 @@ impl World {
     pub fn validate(&self) -> Vec<String> {
         let mut issues = Vec::new();
 
+        let country_ids = self.collect_node_ids(|index, node| match node {
+            WorldNode::Country(_) => Some(CountryId(index)),
+            _ => None,
+        });
+        if country_ids.len() != 1 {
+            issues.push(format!(
+                "expected exactly one country node, found {}",
+                country_ids.len()
+            ));
+        }
+
         let clock_ids = self.collect_node_ids(|index, node| match node {
             WorldNode::Clock(_) => Some(ClockId(index)),
             _ => None,
@@ -394,14 +425,15 @@ impl World {
             issues.push(format!("expected exactly one clock node, found {}", clock_ids.len()));
         }
 
-        let player_ids = self.collect_node_ids(|index, node| match node {
-            WorldNode::Player(_) => Some(PlayerId(index)),
-            _ => None,
-        });
-        if player_ids.len() > 1 {
+        let manual_actor_ids = self
+            .actor_ids()
+            .into_iter()
+            .filter(|actor_id| self.actor(*actor_id).controller == ControllerMode::Manual)
+            .collect::<Vec<_>>();
+        if manual_actor_ids.len() != 1 {
             issues.push(format!(
-                "expected at most one player node, found {}",
-                player_ids.len()
+                "expected exactly one manual actor, found {}",
+                manual_actor_ids.len()
             ));
         }
 
@@ -489,8 +521,8 @@ impl World {
             }
         }
 
-        for npc_id in self.npc_ids() {
-            let home_places = self.collect_outgoing(npc_id.0, |target, node, relation| {
+        for actor_id in self.actor_ids() {
+            let home_places = self.collect_outgoing(actor_id.0, |target, node, relation| {
                 if matches!(relation, WorldRelation::Home) && matches!(node, WorldNode::Place(_)) {
                     Some(PlaceId(target))
                 } else {
@@ -499,13 +531,13 @@ impl World {
             });
             if home_places.len() != 1 {
                 issues.push(format!(
-                    "npc {} should have exactly one home place, found {}",
-                    npc_id.index(),
+                    "actor {} should have exactly one home place, found {}",
+                    actor_id.index(),
                     home_places.len()
                 ));
             }
 
-            let present_places = self.collect_outgoing(npc_id.0, |target, node, relation| {
+            let present_places = self.collect_outgoing(actor_id.0, |target, node, relation| {
                 if matches!(relation, WorldRelation::LocatedAt) && matches!(node, WorldNode::Place(_))
                 {
                     Some(PlaceId(target))
@@ -515,8 +547,8 @@ impl World {
             });
             if present_places.len() != 1 {
                 issues.push(format!(
-                    "npc {} should have exactly one present place, found {}",
-                    npc_id.index(),
+                    "actor {} should have exactly one present place, found {}",
+                    actor_id.index(),
                     present_places.len()
                 ));
             }
@@ -529,8 +561,8 @@ impl World {
                 let present_city = self.place_city_id(present_place);
                 if home_city != present_city {
                     issues.push(format!(
-                        "npc {} lives in city {:?} but is present in {:?}",
-                        npc_id.index(),
+                        "actor {} lives in city {:?} but is present in {:?}",
+                        actor_id.index(),
                         home_city.map(CityId::index),
                         present_city.map(CityId::index)
                     ));
@@ -539,7 +571,7 @@ impl World {
 
             let memory_count = self
                 .graph
-                .edges_directed(npc_id.0, Outgoing)
+                .edges_directed(actor_id.0, Outgoing)
                 .filter(|edge| {
                     matches!(edge.weight(), WorldRelation::HasMemory)
                         && matches!(self.graph.node_weight(edge.target()), Some(WorldNode::Record(Record::ConversationMemory(_))))
@@ -547,8 +579,8 @@ impl World {
                 .count();
             if memory_count != 1 {
                 issues.push(format!(
-                    "npc {} should have exactly one memory record, found {}",
-                    npc_id.index(),
+                    "actor {} should have exactly one memory record, found {}",
+                    actor_id.index(),
                     memory_count
                 ));
             }
@@ -574,122 +606,78 @@ impl World {
             }
         }
 
-        if let Some(player_id) = self.player_id() {
-            let located_places = self.collect_outgoing(player_id.0, |target, node, relation| {
-                if matches!(relation, WorldRelation::LocatedAt) && matches!(node, WorldNode::Place(_))
-                {
-                    Some(PlaceId(target))
-                } else {
-                    None
-                }
-            });
-            if located_places.len() > 1 {
-                issues.push(format!(
-                    "player should have at most one present place, found {}",
-                    located_places.len()
-                ));
-            }
-
-            for edge in self.graph.edges_directed(player_id.0, Outgoing) {
-                if let WorldRelation::KnowsCity { .. } = edge.weight() {
-                    if !matches!(self.graph.node_weight(edge.target()), Some(WorldNode::City(_))) {
-                        issues.push("player knowledge edge must target a city".to_string());
-                    }
-                }
-            }
-        }
-
-        if let Some(player_id) = self.player_id() {
-            let active_dialogues = self.active_dialogue_process_ids(player_id).len();
-            if active_dialogues > 1 {
-                issues.push(format!(
-                    "player has {} active dialogue processes",
-                    active_dialogues
-                ));
-            }
-        }
-
         for process_id in self.collect_node_ids(|index, node| match node {
             WorldNode::Process(_) => Some(ProcessId(index)),
             _ => None,
         }) {
-            let process = self.process(process_id);
-            let player_participants = self.collect_outgoing(process_id.0, |target, node, relation| {
-                if matches!(relation, WorldRelation::Participates) && matches!(node, WorldNode::Player(_)) {
-                    Some(PlayerId(target))
-                } else {
-                    None
-                }
-            });
-            if player_participants.len() != 1 {
-                issues.push(format!(
-                    "process {} should have exactly one player participant, found {}",
-                    process_id.index(),
-                    player_participants.len()
-                ));
-            }
-
-            match process.kind {
-                ProcessKind::Dialogue => {
-                    let npc_participants = self.collect_outgoing(process_id.0, |target, node, relation| {
-                        if matches!(relation, WorldRelation::Participates) && matches!(node, WorldNode::Character(_)) {
-                            Some(NpcId(target))
-                        } else {
-                            None
-                        }
-                    });
-                    if npc_participants.len() != 1 {
+            match self.process(process_id).kind {
+                ProcessKind::Speak => {
+                    let participants = self.process_actor_participants(process_id);
+                    if participants.len() != 2 {
                         issues.push(format!(
-                            "dialogue process {} should have exactly one npc participant, found {}",
+                            "speak process {} should have exactly two actor participants, found {}",
                             process_id.index(),
-                            npc_participants.len()
+                            participants.len()
                         ));
                     }
-
-                    let places = self.collect_outgoing(process_id.0, |target, node, relation| {
-                        if matches!(relation, WorldRelation::OccursAt) && matches!(node, WorldNode::Place(_)) {
-                            Some(PlaceId(target))
-                        } else {
-                            None
-                        }
-                    });
-                    if places.len() != 1 {
+                    if self.process_place(process_id).is_none() {
                         issues.push(format!(
-                            "dialogue process {} should have exactly one place, found {}",
-                            process_id.index(),
-                            places.len()
+                            "speak process {} should occur at exactly one place",
+                            process_id.index()
+                        ));
+                    }
+                    if self.process_dialogue_lines(process_id).is_empty() {
+                        issues.push(format!(
+                            "speak process {} should include transcript lines",
+                            process_id.index()
                         ));
                     }
                 }
-                ProcessKind::Travel { .. } => {
-                    let destinations = self.collect_outgoing(process_id.0, |target, node, relation| {
-                        if matches!(relation, WorldRelation::Targets) && matches!(node, WorldNode::Place(_)) {
-                            Some(PlaceId(target))
-                        } else {
-                            None
-                        }
-                    });
-                    if destinations.len() != 1 {
+                ProcessKind::Travel => {
+                    if self.process_actor_participants(process_id).len() != 1 {
                         issues.push(format!(
-                            "travel process {} should have exactly one destination, found {}",
-                            process_id.index(),
-                            destinations.len()
+                            "travel process {} should have exactly one actor participant",
+                            process_id.index()
+                        ));
+                    }
+                    if self.process_target_place(process_id).is_none() {
+                        issues.push(format!(
+                            "travel process {} should target exactly one destination",
+                            process_id.index()
                         ));
                     }
                 }
-                ProcessKind::Waiting { .. } => {
-                    let places = self.collect_outgoing(process_id.0, |target, node, relation| {
-                        if matches!(relation, WorldRelation::OccursAt) && matches!(node, WorldNode::Place(_)) {
-                            Some(PlaceId(target))
-                        } else {
-                            None
-                        }
-                    });
-                    if places.len() != 1 {
+                ProcessKind::Waiting => {
+                    if self.process_actor_participants(process_id).len() != 1 {
                         issues.push(format!(
-                            "waiting process {} should have exactly one place, found {}",
-                            process_id.index(),
-                            places.len()
+                            "waiting process {} should have exactly one actor participant",
+                            process_id.index()
+                        ));
+                    }
+                    if self.process_place(process_id).is_none() {
+                        issues.push(format!(
+                            "waiting process {} should occur at exactly one place",
+                            process_id.index()
+                        ));
+                    }
+                }
+                ProcessKind::Inspect => {
+                    if self.process_actor_participants(process_id).len() != 1 {
+                        issues.push(format!(
+                            "inspect process {} should have exactly one actor participant",
+                            process_id.index()
+                        ));
+                    }
+                    if self.process_place(process_id).is_none() {
+                        issues.push(format!(
+                            "inspect process {} should occur at exactly one place",
+                            process_id.index()
+                        ));
+                    }
+                    if self.process_target_entity(process_id).is_none() {
+                        issues.push(format!(
+                            "inspect process {} should target exactly one entity",
+                            process_id.index()
                         ));
                     }
                 }
@@ -709,7 +697,7 @@ impl World {
                         .count();
                     if incoming != 1 {
                         issues.push(format!(
-                            "memory record {} should belong to exactly one npc, found {}",
+                            "memory record {} should belong to exactly one actor, found {}",
                             record_id.index(),
                             incoming
                         ));
@@ -735,11 +723,10 @@ impl World {
                         .edges_directed(record_id.0, Incoming)
                         .filter(|edge| matches!(edge.weight(), WorldRelation::HasContext))
                         .count();
-                    if context_links != 1 {
+                    if context_links == 0 {
                         issues.push(format!(
-                            "context record {} should belong to exactly one player context feed, found {}",
-                            record_id.index(),
-                            context_links
+                            "context record {} should belong to at least one actor context feed",
+                            record_id.index()
                         ));
                     }
                 }
@@ -785,27 +772,24 @@ impl World {
         clock.current_time = current_time;
     }
 
-    pub fn player_id(&self) -> Option<PlayerId> {
+    pub fn actor_ids(&self) -> Vec<ActorId> {
         self.collect_node_ids(|index, node| match node {
-            WorldNode::Player(_) => Some(PlayerId(index)),
+            WorldNode::Actor(_) => Some(ActorId(index)),
             _ => None,
         })
-        .into_iter()
-        .next()
     }
 
-    pub fn ensure_player(&mut self) -> PlayerId {
-        if let Some(player_id) = self.player_id() {
-            return player_id;
-        }
-        PlayerId(self.graph.add_node(WorldNode::Player(Player)))
+    pub fn manual_actor_id(&self) -> Option<ActorId> {
+        self.actor_ids()
+            .into_iter()
+            .find(|actor_id| self.actor(*actor_id).controller == ControllerMode::Manual)
     }
 
-    pub fn player_place_id(&self, player_id: PlayerId) -> Option<PlaceId> {
-        if !matches!(self.graph.node_weight(player_id.0), Some(WorldNode::Player(_))) {
+    pub fn actor_place_id(&self, actor_id: ActorId) -> Option<PlaceId> {
+        if !self.has_actor(actor_id) {
             return None;
         }
-        self.collect_outgoing(player_id.0, |target, node, relation| {
+        self.collect_outgoing(actor_id.0, |target, node, relation| {
             if matches!(relation, WorldRelation::LocatedAt) && matches!(node, WorldNode::Place(_)) {
                 Some(PlaceId(target))
             } else {
@@ -816,69 +800,38 @@ impl World {
         .next()
     }
 
-    pub fn player_city_id(&self, player_id: PlayerId) -> Option<CityId> {
-        self.player_place_id(player_id)
+    pub fn actor_city_id(&self, actor_id: ActorId) -> Option<CityId> {
+        self.actor_place_id(actor_id)
             .and_then(|place_id| self.place_city_id(place_id))
     }
 
-    pub fn active_dialogue_process_ids(&self, player_id: PlayerId) -> Vec<ProcessId> {
-        if !matches!(self.graph.node_weight(player_id.0), Some(WorldNode::Player(_))) {
-            return Vec::new();
-        }
-
-        self.collect_node_ids(|index, node| match node {
-            WorldNode::Process(process)
-                if matches!(process.kind, ProcessKind::Dialogue) && process.ended_at.is_none() =>
-            {
-                Some(ProcessId(index))
-            }
-            _ => None,
-        })
-        .into_iter()
-        .filter(|process_id| {
-            self.collect_outgoing(process_id.0, |target, node, relation| {
-                if matches!(relation, WorldRelation::Participates) && matches!(node, WorldNode::Player(_)) {
-                    Some(PlayerId(target))
-                } else {
-                    None
-                }
-            })
-            .contains(&player_id)
-        })
-        .collect()
-    }
-
-    pub fn active_dialogue_process_id(&self, player_id: PlayerId) -> Option<ProcessId> {
-        self.active_dialogue_process_ids(player_id).into_iter().next()
-    }
-
-    pub fn active_dialogue_npc_id(&self, player_id: PlayerId) -> Option<NpcId> {
-        self.active_dialogue_process_id(player_id)
-            .and_then(|process_id| self.dialogue_npc_id(process_id))
-    }
-
-    pub fn move_player(&mut self, player_id: PlayerId, place_id: PlaceId) {
-        if !self.has_place(place_id) {
+    pub fn move_actor(&mut self, actor_id: ActorId, place_id: PlaceId) {
+        if !self.has_actor(actor_id) || !self.has_place(place_id) {
             return;
         }
-        let player_id = if matches!(self.graph.node_weight(player_id.0), Some(WorldNode::Player(_))) {
-            player_id
-        } else {
-            self.ensure_player()
-        };
-        self.replace_outgoing_relation(player_id.0, WorldRelationMatcher::LocatedAt, place_id.0, WorldRelation::LocatedAt);
+        self.replace_outgoing_relation(
+            actor_id.0,
+            WorldRelationMatcher::LocatedAt,
+            place_id.0,
+            WorldRelation::LocatedAt,
+        );
+    }
+
+    pub fn set_actor_home(&mut self, actor_id: ActorId, place_id: PlaceId) {
+        if !self.has_actor(actor_id) || !self.has_place(place_id) {
+            return;
+        }
+        self.replace_outgoing_relation(
+            actor_id.0,
+            WorldRelationMatcher::Home,
+            place_id.0,
+            WorldRelation::Home,
+        );
     }
 
     pub fn city_ids(&self) -> Vec<CityId> {
         self.collect_node_ids(|index, node| match node {
             WorldNode::City(_) => Some(CityId(index)),
-            _ => None,
-        })
-    }
-
-    pub fn npc_ids(&self) -> Vec<NpcId> {
-        self.collect_node_ids(|index, node| match node {
-            WorldNode::Character(_) => Some(NpcId(index)),
             _ => None,
         })
     }
@@ -896,13 +849,6 @@ impl World {
         ids
     }
 
-    pub fn city_npcs(&self, city_id: CityId) -> Vec<NpcId> {
-        self.npc_ids()
-            .into_iter()
-            .filter(|npc_id| self.npc_resident_city_ids(*npc_id).contains(&city_id))
-            .collect()
-    }
-
     pub fn city_places(&self, city_id: CityId) -> Vec<PlaceId> {
         let mut ids = self.collect_outgoing(city_id.0, |target, node, relation| {
             if matches!(relation, WorldRelation::Contains) && matches!(node, WorldNode::Place(_)) {
@@ -913,6 +859,13 @@ impl World {
         });
         ids.sort_unstable();
         ids
+    }
+
+    pub fn city_actors(&self, city_id: CityId) -> Vec<ActorId> {
+        self.actor_ids()
+            .into_iter()
+            .filter(|actor_id| self.actor_resident_city_ids(*actor_id).contains(&city_id))
+            .collect()
     }
 
     pub fn place_routes(&self, place_id: PlaceId) -> Vec<(PlaceId, TravelRoute)> {
@@ -928,11 +881,10 @@ impl World {
         routes
     }
 
-    pub fn place_npcs(&self, place_id: PlaceId) -> Vec<NpcId> {
+    pub fn place_actors(&self, place_id: PlaceId) -> Vec<ActorId> {
         let mut ids = self.collect_incoming(place_id.0, |source, node, relation| {
-            if matches!(relation, WorldRelation::LocatedAt) && matches!(node, WorldNode::Character(_))
-            {
-                Some(NpcId(source))
+            if matches!(relation, WorldRelation::LocatedAt) && matches!(node, WorldNode::Actor(_)) {
+                Some(ActorId(source))
             } else {
                 None
             }
@@ -953,19 +905,15 @@ impl World {
         ids
     }
 
-    pub fn place_city_ids(&self, place_id: PlaceId) -> Vec<CityId> {
-        self.place_city_id(place_id).into_iter().collect()
-    }
-
-    pub fn npc_resident_city_ids(&self, npc_id: NpcId) -> Vec<CityId> {
-        self.npc_home_place_id(npc_id)
+    pub fn actor_resident_city_ids(&self, actor_id: ActorId) -> Vec<CityId> {
+        self.actor_home_place_id(actor_id)
             .and_then(|place_id| self.place_city_id(place_id))
             .into_iter()
             .collect()
     }
 
-    pub fn npc_present_place_ids(&self, npc_id: NpcId) -> Vec<PlaceId> {
-        self.collect_outgoing(npc_id.0, |target, node, relation| {
+    pub fn actor_present_place_ids(&self, actor_id: ActorId) -> Vec<PlaceId> {
+        self.collect_outgoing(actor_id.0, |target, node, relation| {
             if matches!(relation, WorldRelation::LocatedAt) && matches!(node, WorldNode::Place(_))
             {
                 Some(PlaceId(target))
@@ -975,8 +923,8 @@ impl World {
         })
     }
 
-    pub fn npc_conversation_memory(&self, npc_id: NpcId) -> Option<ConversationMemory> {
-        let record_id = self.collect_outgoing(npc_id.0, |target, node, relation| {
+    pub fn actor_conversation_memory(&self, actor_id: ActorId) -> Option<ConversationMemory> {
+        let record_id = self.collect_outgoing(actor_id.0, |target, node, relation| {
             if matches!(relation, WorldRelation::HasMemory)
                 && matches!(node, WorldNode::Record(Record::ConversationMemory(_)))
             {
@@ -993,8 +941,8 @@ impl World {
         }
     }
 
-    pub fn merge_npc_conversation_memory(&mut self, npc_id: NpcId, update: ConversationMemory) {
-        if !self.has_npc(npc_id) {
+    pub fn merge_actor_conversation_memory(&mut self, actor_id: ActorId, update: ConversationMemory) {
+        if !self.has_actor(actor_id) {
             return;
         }
         let update = update.normalized();
@@ -1003,7 +951,7 @@ impl World {
         }
 
         if let Some(record_id) = self
-            .collect_outgoing(npc_id.0, |target, node, relation| {
+            .collect_outgoing(actor_id.0, |target, node, relation| {
                 if matches!(relation, WorldRelation::HasMemory)
                     && matches!(node, WorldNode::Record(Record::ConversationMemory(_)))
                 {
@@ -1029,18 +977,18 @@ impl World {
         ))));
         add_edge(
             &mut self.graph,
-            npc_id.0,
+            actor_id.0,
             record_id.0,
             WorldRelation::HasMemory,
         );
     }
 
-    pub fn discovered_city_ids(&self, player_id: PlayerId) -> Vec<CityId> {
-        if !matches!(self.graph.node_weight(player_id.0), Some(WorldNode::Player(_))) {
+    pub fn discovered_city_ids(&self, actor_id: ActorId) -> Vec<CityId> {
+        if !self.has_actor(actor_id) {
             return Vec::new();
         }
 
-        let mut ids = self.collect_outgoing(player_id.0, |target, node, relation| {
+        let mut ids = self.collect_outgoing(actor_id.0, |target, node, relation| {
             if matches!(relation, WorldRelation::KnowsCity { .. }) && matches!(node, WorldNode::City(_))
             {
                 Some(CityId(target))
@@ -1053,98 +1001,70 @@ impl World {
         ids
     }
 
-    pub fn discover_city(&mut self, player_id: PlayerId, city_id: CityId, discovered_at: GameTime) {
-        if !matches!(self.graph.node_weight(player_id.0), Some(WorldNode::Player(_)))
-            || !self.has_city(city_id)
-        {
+    pub fn discover_city(&mut self, actor_id: ActorId, city_id: CityId, discovered_at: GameTime) {
+        if !self.has_actor(actor_id) || !self.has_city(city_id) {
             return;
         }
         if self
             .graph
-            .edges_connecting(player_id.0, city_id.0)
+            .edges_connecting(actor_id.0, city_id.0)
             .any(|edge| matches!(edge.weight(), WorldRelation::KnowsCity { .. }))
         {
             return;
         }
         add_edge(
             &mut self.graph,
-            player_id.0,
+            actor_id.0,
             city_id.0,
             WorldRelation::KnowsCity { discovered_at },
         );
     }
 
-    pub fn dialogue_npc_id(&self, process_id: ProcessId) -> Option<NpcId> {
-        if !matches!(self.process(process_id).kind, ProcessKind::Dialogue) {
-            return None;
-        }
-        self.collect_outgoing(process_id.0, |target, node, relation| {
-            if matches!(relation, WorldRelation::Participates) && matches!(node, WorldNode::Character(_))
-            {
-                Some(NpcId(target))
-            } else {
-                None
-            }
-        })
-        .into_iter()
-        .next()
+    pub fn speech_lines_between(
+        &self,
+        actor_id: ActorId,
+        counterpart_id: ActorId,
+        limit: usize,
+    ) -> Vec<DialogueLine> {
+        let mut lines = self
+            .collect_node_ids(|index, node| match node {
+                WorldNode::Process(process) if process.kind == ProcessKind::Speak => Some(ProcessId(index)),
+                _ => None,
+            })
+            .into_iter()
+            .filter(|process_id| {
+                let participants = self.process_actor_participants(*process_id);
+                participants.len() == 2
+                    && participants.contains(&actor_id)
+                    && participants.contains(&counterpart_id)
+            })
+            .flat_map(|process_id| self.process_dialogue_lines(process_id))
+            .collect::<Vec<_>>();
+        lines.sort_by_key(|line| line.timestamp);
+        let len = lines.len();
+        lines.into_iter().skip(len.saturating_sub(limit)).collect()
     }
 
-    pub fn dialogue_place_id(&self, process_id: ProcessId) -> Option<PlaceId> {
-        if !matches!(self.process(process_id).kind, ProcessKind::Dialogue) {
-            return None;
-        }
-        self.collect_outgoing(process_id.0, |target, node, relation| {
-            if matches!(relation, WorldRelation::OccursAt) && matches!(node, WorldNode::Place(_)) {
-                Some(PlaceId(target))
-            } else {
-                None
-            }
-        })
-        .into_iter()
-        .next()
-    }
-
-    pub fn dialogue_lines(&self, process_id: ProcessId) -> Vec<DialogueLine> {
-        let mut transcript = self.collect_outgoing(process_id.0, |target, node, relation| {
-            if matches!(relation, WorldRelation::HasTranscript)
-                && matches!(node, WorldNode::Record(Record::Dialogue(_)))
-            {
-                let Some(WorldNode::Record(Record::Dialogue(line))) = self.graph.node_weight(target)
-                else {
-                    return None;
-                };
-                Some(line.clone())
-            } else {
-                None
-            }
-        });
-        transcript.sort_by_key(|line| line.timestamp);
-        transcript
-    }
-
-    pub fn start_dialogue_process(
+    pub fn record_speech_process(
         &mut self,
-        player_id: PlayerId,
-        npc_id: NpcId,
+        actor_id: ActorId,
+        counterpart_id: ActorId,
         place_id: PlaceId,
         started_at: GameTime,
+        duration: TimeDelta,
+        transcript: Vec<DialogueLine>,
     ) -> ProcessId {
-        let process_id = ProcessId(self.graph.add_node(WorldNode::Process(Process {
-            kind: ProcessKind::Dialogue,
-            started_at,
-            ended_at: None,
-        })));
+        let process_id = self.add_process(ProcessKind::Speak, started_at, duration);
         add_edge(
             &mut self.graph,
             process_id.0,
-            player_id.0,
+            actor_id.0,
             WorldRelation::Participates,
         );
         add_edge(
             &mut self.graph,
             process_id.0,
-            npc_id.0,
+            counterpart_id.0,
             WorldRelation::Participates,
         );
         add_edge(
@@ -1153,99 +1073,24 @@ impl World {
             place_id.0,
             WorldRelation::OccursAt,
         );
+        for line in transcript {
+            self.append_process_dialogue_line(process_id, &[actor_id, counterpart_id], line);
+        }
         process_id
-    }
-
-    pub fn append_dialogue_utterance(
-        &mut self,
-        process_id: ProcessId,
-        player_id: PlayerId,
-        line: DialogueLine,
-    ) {
-        let record_id = RecordId(self.graph.add_node(WorldNode::Record(Record::Dialogue(
-            line.clone(),
-        ))));
-        add_edge(
-            &mut self.graph,
-            process_id.0,
-            record_id.0,
-            WorldRelation::HasTranscript,
-        );
-        add_edge(
-            &mut self.graph,
-            player_id.0,
-            record_id.0,
-            WorldRelation::HasContext,
-        );
-    }
-
-    pub fn append_context_entry(&mut self, player_id: PlayerId, entry: ContextEntry) {
-        if !matches!(self.graph.node_weight(player_id.0), Some(WorldNode::Player(_))) {
-            return;
-        }
-        let record_id = RecordId(self.graph.add_node(WorldNode::Record(Record::Context(entry))));
-        add_edge(
-            &mut self.graph,
-            player_id.0,
-            record_id.0,
-            WorldRelation::HasContext,
-        );
-    }
-
-    pub fn recent_context_entries(&self, player_id: PlayerId, limit: usize) -> Vec<ContextEntry> {
-        if !matches!(self.graph.node_weight(player_id.0), Some(WorldNode::Player(_))) {
-            return Vec::new();
-        }
-
-        let mut entries = self.collect_outgoing(player_id.0, |_target, node, relation| {
-            if !matches!(relation, WorldRelation::HasContext) {
-                return None;
-            }
-
-            match node {
-                WorldNode::Record(Record::Dialogue(line)) => {
-                    Some((line.timestamp, ContextEntry::Dialogue(line.clone())))
-                }
-                WorldNode::Record(Record::Context(entry)) => {
-                    Some((context_timestamp(&entry), entry.clone()))
-                }
-                _ => None,
-            }
-        });
-        entries.sort_by_key(|(timestamp, _)| *timestamp);
-        let len = entries.len();
-        entries
-            .into_iter()
-            .skip(len.saturating_sub(limit))
-            .map(|(_, entry)| entry)
-            .collect()
-    }
-
-    pub fn end_process(&mut self, process_id: ProcessId, ended_at: GameTime) {
-        let Some(WorldNode::Process(process)) = self.graph.node_weight_mut(process_id.0) else {
-            return;
-        };
-        process.ended_at = Some(ended_at);
     }
 
     pub fn record_travel_process(
         &mut self,
-        player_id: PlayerId,
+        actor_id: ActorId,
         destination_id: PlaceId,
+        started_at: GameTime,
         duration: TimeDelta,
-        ended_at: GameTime,
     ) -> ProcessId {
-        let process_id = ProcessId(self.graph.add_node(WorldNode::Process(Process {
-            kind: ProcessKind::Travel { duration },
-            started_at: GameTime::from_seconds(
-                ended_at.seconds().saturating_sub(duration.seconds()),
-            ),
-            ended_at: Some(ended_at),
-        })));
+        let process_id = self.add_process(ProcessKind::Travel, started_at, duration);
         add_edge(
             &mut self.graph,
             process_id.0,
-            player_id.0,
+            actor_id.0,
             WorldRelation::Participates,
         );
         add_edge(
@@ -1259,22 +1104,16 @@ impl World {
 
     pub fn record_waiting_process(
         &mut self,
-        player_id: PlayerId,
+        actor_id: ActorId,
         place_id: PlaceId,
+        started_at: GameTime,
         duration: TimeDelta,
-        ended_at: GameTime,
     ) -> ProcessId {
-        let process_id = ProcessId(self.graph.add_node(WorldNode::Process(Process {
-            kind: ProcessKind::Waiting { duration },
-            started_at: GameTime::from_seconds(
-                ended_at.seconds().saturating_sub(duration.seconds()),
-            ),
-            ended_at: Some(ended_at),
-        })));
+        let process_id = self.add_process(ProcessKind::Waiting, started_at, duration);
         add_edge(
             &mut self.graph,
             process_id.0,
-            player_id.0,
+            actor_id.0,
             WorldRelation::Participates,
         );
         add_edge(
@@ -1284,6 +1123,77 @@ impl World {
             WorldRelation::OccursAt,
         );
         process_id
+    }
+
+    pub fn record_inspect_process(
+        &mut self,
+        actor_id: ActorId,
+        entity_id: EntityId,
+        place_id: PlaceId,
+        started_at: GameTime,
+        duration: TimeDelta,
+    ) -> ProcessId {
+        let process_id = self.add_process(ProcessKind::Inspect, started_at, duration);
+        add_edge(
+            &mut self.graph,
+            process_id.0,
+            actor_id.0,
+            WorldRelation::Participates,
+        );
+        add_edge(
+            &mut self.graph,
+            process_id.0,
+            entity_id.0,
+            WorldRelation::Targets,
+        );
+        add_edge(
+            &mut self.graph,
+            process_id.0,
+            place_id.0,
+            WorldRelation::OccursAt,
+        );
+        process_id
+    }
+
+    pub fn append_context_entry(&mut self, actor_id: ActorId, entry: ContextEntry) {
+        if !self.has_actor(actor_id) {
+            return;
+        }
+        let record_id = RecordId(self.graph.add_node(WorldNode::Record(Record::Context(entry))));
+        add_edge(
+            &mut self.graph,
+            actor_id.0,
+            record_id.0,
+            WorldRelation::HasContext,
+        );
+    }
+
+    pub fn recent_context_entries(&self, actor_id: ActorId, limit: usize) -> Vec<ContextEntry> {
+        if !self.has_actor(actor_id) {
+            return Vec::new();
+        }
+
+        let mut entries = self.collect_outgoing(actor_id.0, |_target, node, relation| {
+            if !matches!(relation, WorldRelation::HasContext) {
+                return None;
+            }
+            match node {
+                WorldNode::Record(Record::Dialogue(line)) => {
+                    Some((line.timestamp, ContextEntry::Dialogue(line.clone())))
+                }
+                WorldNode::Record(Record::Context(entry)) => {
+                    Some((context_timestamp(entry), entry.clone()))
+                }
+                _ => None,
+            }
+        });
+        entries.sort_by_key(|(timestamp, _)| *timestamp);
+        let len = entries.len();
+        entries
+            .into_iter()
+            .skip(len.saturating_sub(limit))
+            .map(|(_, entry)| entry)
+            .collect()
     }
 
     pub fn place_city_id(&self, place_id: PlaceId) -> Option<CityId> {
@@ -1303,6 +1213,74 @@ impl World {
             Some(WorldNode::Process(process)) => process,
             _ => panic!("process id {:?} is invalid", process_id),
         }
+    }
+
+    fn process_actor_participants(&self, process_id: ProcessId) -> Vec<ActorId> {
+        let mut ids = self.collect_outgoing(process_id.0, |target, node, relation| {
+            if matches!(relation, WorldRelation::Participates) && matches!(node, WorldNode::Actor(_))
+            {
+                Some(ActorId(target))
+            } else {
+                None
+            }
+        });
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    fn process_place(&self, process_id: ProcessId) -> Option<PlaceId> {
+        self.collect_outgoing(process_id.0, |target, node, relation| {
+            if matches!(relation, WorldRelation::OccursAt) && matches!(node, WorldNode::Place(_)) {
+                Some(PlaceId(target))
+            } else {
+                None
+            }
+        })
+        .into_iter()
+        .next()
+    }
+
+    fn process_target_place(&self, process_id: ProcessId) -> Option<PlaceId> {
+        self.collect_outgoing(process_id.0, |target, node, relation| {
+            if matches!(relation, WorldRelation::Targets) && matches!(node, WorldNode::Place(_)) {
+                Some(PlaceId(target))
+            } else {
+                None
+            }
+        })
+        .into_iter()
+        .next()
+    }
+
+    fn process_target_entity(&self, process_id: ProcessId) -> Option<EntityId> {
+        self.collect_outgoing(process_id.0, |target, node, relation| {
+            if matches!(relation, WorldRelation::Targets) && matches!(node, WorldNode::Item(_)) {
+                Some(EntityId(target))
+            } else {
+                None
+            }
+        })
+        .into_iter()
+        .next()
+    }
+
+    fn process_dialogue_lines(&self, process_id: ProcessId) -> Vec<DialogueLine> {
+        let mut transcript = self.collect_outgoing(process_id.0, |target, node, relation| {
+            if matches!(relation, WorldRelation::HasTranscript)
+                && matches!(node, WorldNode::Record(Record::Dialogue(_)))
+            {
+                let Some(WorldNode::Record(Record::Dialogue(line))) = self.graph.node_weight(target)
+                else {
+                    return None;
+                };
+                Some(line.clone())
+            } else {
+                None
+            }
+        });
+        transcript.sort_by_key(|line| line.timestamp);
+        transcript
     }
 
     fn record(&self, record_id: RecordId) -> &Record {
@@ -1335,16 +1313,20 @@ impl World {
         place_id
     }
 
-    fn add_npc(
+    fn add_actor(
         &mut self,
+        controller: ControllerMode,
         occupation: Occupation,
         archetype: NpcArchetype,
-        traits: Vec<TraitTag>,
+        mut traits: Vec<TraitTag>,
         goal: GoalTag,
         home_place_id: PlaceId,
         current_place_id: PlaceId,
-    ) -> NpcId {
-        let npc_id = NpcId(self.graph.add_node(WorldNode::Character(Npc {
+    ) -> ActorId {
+        traits.sort();
+        traits.dedup();
+        let actor_id = ActorId(self.graph.add_node(WorldNode::Actor(Actor {
+            controller,
             occupation,
             archetype,
             traits,
@@ -1352,13 +1334,13 @@ impl World {
         })));
         add_edge(
             &mut self.graph,
-            npc_id.0,
+            actor_id.0,
             home_place_id.0,
             WorldRelation::Home,
         );
         add_edge(
             &mut self.graph,
-            npc_id.0,
+            actor_id.0,
             current_place_id.0,
             WorldRelation::LocatedAt,
         );
@@ -1367,11 +1349,11 @@ impl World {
         ))));
         add_edge(
             &mut self.graph,
-            npc_id.0,
+            actor_id.0,
             memory_id.0,
             WorldRelation::HasMemory,
         );
-        npc_id
+        actor_id
     }
 
     fn add_entity_to_place(&mut self, place_id: PlaceId, kind: EntityKind) -> EntityId {
@@ -1383,6 +1365,45 @@ impl World {
             WorldRelation::LocatedAt,
         );
         entity_id
+    }
+
+    fn add_process(
+        &mut self,
+        kind: ProcessKind,
+        started_at: GameTime,
+        duration: TimeDelta,
+    ) -> ProcessId {
+        ProcessId(self.graph.add_node(WorldNode::Process(Process {
+            kind,
+            started_at,
+            duration,
+            ended_at: started_at.advance(duration),
+        })))
+    }
+
+    fn append_process_dialogue_line(
+        &mut self,
+        process_id: ProcessId,
+        context_actors: &[ActorId],
+        line: DialogueLine,
+    ) {
+        let record_id = RecordId(self.graph.add_node(WorldNode::Record(Record::Dialogue(
+            line.clone(),
+        ))));
+        add_edge(
+            &mut self.graph,
+            process_id.0,
+            record_id.0,
+            WorldRelation::HasTranscript,
+        );
+        for actor_id in context_actors {
+            add_edge(
+                &mut self.graph,
+                actor_id.0,
+                record_id.0,
+                WorldRelation::HasContext,
+            );
+        }
     }
 
     fn build_city_places(&mut self, rng: &mut ChaCha8Rng, city_id: CityId) -> PlaceId {
@@ -1407,7 +1428,7 @@ impl World {
             city_id,
             PlaceKind::Venue,
             format!(
-                "A public-facing venue in {} where people linger long enough to trade rumors.",
+                "A public-facing venue in {} where people linger long enough to trade impressions.",
                 city_name
             ),
         );
@@ -1476,23 +1497,24 @@ impl World {
         );
     }
 
-    fn spawn_city_npcs(&mut self, rng: &mut ChaCha8Rng, city_id: CityId) {
+    fn spawn_city_ai_actors(&mut self, rng: &mut ChaCha8Rng, city_id: CityId) {
         let possible_places = self
             .city_places(city_id)
             .into_iter()
             .filter(|place_id| self.place(*place_id).kind.supports_people())
             .collect::<Vec<_>>();
-        let npc_count = rng.random_range(3..=5);
+        let actor_count = rng.random_range(3..=5);
 
-        for npc_offset in 0..npc_count {
+        for actor_offset in 0..actor_count {
             let mut traits = TraitTag::ALL
                 .choose_multiple(rng, 2)
                 .copied()
                 .collect::<Vec<_>>();
             traits.sort();
             let home_place_id = *possible_places.choose(rng).unwrap();
-            let current_place_id = possible_places[npc_offset % possible_places.len()];
-            self.add_npc(
+            let current_place_id = possible_places[actor_offset % possible_places.len()];
+            self.add_actor(
+                ControllerMode::AiAgent,
                 *Occupation::ALL.choose(rng).unwrap(),
                 *NpcArchetype::ALL.choose(rng).unwrap(),
                 traits,
@@ -1503,8 +1525,8 @@ impl World {
         }
     }
 
-    fn npc_home_place_id(&self, npc_id: NpcId) -> Option<PlaceId> {
-        self.collect_outgoing(npc_id.0, |target, node, relation| {
+    fn actor_home_place_id(&self, actor_id: ActorId) -> Option<PlaceId> {
+        self.collect_outgoing(actor_id.0, |target, node, relation| {
             if matches!(relation, WorldRelation::Home) && matches!(node, WorldNode::Place(_)) {
                 Some(PlaceId(target))
             } else {
@@ -1551,8 +1573,8 @@ impl World {
         matches!(self.graph.node_weight(place_id.0), Some(WorldNode::Place(_)))
     }
 
-    fn has_npc(&self, npc_id: NpcId) -> bool {
-        matches!(self.graph.node_weight(npc_id.0), Some(WorldNode::Character(_)))
+    fn has_actor(&self, actor_id: ActorId) -> bool {
+        matches!(self.graph.node_weight(actor_id.0), Some(WorldNode::Actor(_)))
     }
 
     fn collect_node_ids<T>(&self, map: impl Fn(NodeIndex, &WorldNode) -> Option<T>) -> Vec<T> {
@@ -1596,12 +1618,14 @@ impl World {
 #[derive(Debug, Clone, Copy)]
 enum WorldRelationMatcher {
     LocatedAt,
+    Home,
 }
 
 impl WorldRelationMatcher {
     fn matches(self, relation: &WorldRelation) -> bool {
         match self {
             Self::LocatedAt => matches!(relation, WorldRelation::LocatedAt),
+            Self::Home => matches!(relation, WorldRelation::Home),
         }
     }
 }
@@ -1661,15 +1685,18 @@ pub fn place_name_from_parts(seed: WorldSeed, id: PlaceId, city_id: CityId, kind
 
 pub fn entity_name_from_parts(seed: WorldSeed, id: EntityId, kind: EntityKind) -> String {
     match kind {
-        EntityKind::Gun => GUN_NAMES
-            [(mix_seed(seed, &[5, id.index() as u64]) as usize) % GUN_NAMES.len()]
-        .to_string(),
-        EntityKind::Knife => KNIFE_NAMES
-            [(mix_seed(seed, &[6, id.index() as u64]) as usize) % KNIFE_NAMES.len()]
-        .to_string(),
-        EntityKind::Bag => BAG_NAMES
-            [(mix_seed(seed, &[7, id.index() as u64]) as usize) % BAG_NAMES.len()]
-        .to_string(),
+        EntityKind::Gun => {
+            GUN_NAMES[(mix_seed(seed, &[5, id.index() as u64]) as usize) % GUN_NAMES.len()]
+                .to_string()
+        }
+        EntityKind::Knife => {
+            KNIFE_NAMES[(mix_seed(seed, &[6, id.index() as u64]) as usize) % KNIFE_NAMES.len()]
+                .to_string()
+        }
+        EntityKind::Bag => {
+            BAG_NAMES[(mix_seed(seed, &[7, id.index() as u64]) as usize) % BAG_NAMES.len()]
+                .to_string()
+        }
     }
 }
 
@@ -1709,11 +1736,12 @@ const CITY_SUFFIXES: [&str; 16] = [
     "view", "ford", "grove", "crest", "point", "side", "market", "cross", "heights", "center",
     "gate", "harbor", "park", "field", "square", "junction",
 ];
-const NPC_FIRST_NAMES: [&str; 24] = [
-    "Ari", "Bryn", "Cato", "Dara", "Esme", "Finn", "Galen", "Hana", "Ivo", "Jora", "Kellan", "Lio",
-    "Mara", "Niko", "Orin", "Pia", "Quin", "Rhea", "Soren", "Talia", "Una", "Vero", "Wren", "Yana",
+const ACTOR_FIRST_NAMES: [&str; 24] = [
+    "Ari", "Bryn", "Cato", "Dara", "Esme", "Finn", "Galen", "Hana", "Ivo", "Jora", "Kellan",
+    "Lio", "Mara", "Niko", "Orin", "Pia", "Quin", "Rhea", "Soren", "Talia", "Una", "Vero",
+    "Wren", "Yana",
 ];
-const NPC_LAST_NAMES: [&str; 24] = [
+const ACTOR_LAST_NAMES: [&str; 24] = [
     "Ashdown", "Briar", "Cask", "Dunfield", "Ember", "Farrow", "Gale", "Hearth", "Ives", "Jun",
     "Keene", "Lark", "Morrow", "Nettle", "Orchard", "Pell", "Quarry", "Reeve", "Sable", "Thorne",
     "Vale", "Wick", "Mercer", "Cross",
@@ -1734,14 +1762,7 @@ const STREET_NAMES: [&str; 6] = [
     "Service Lane",
     "Old Road",
 ];
-const VENUE_NAMES: [&str; 6] = [
-    "Cafe",
-    "Arcade",
-    "Clinic",
-    "Bookshop",
-    "Diner",
-    "Hall",
-];
+const VENUE_NAMES: [&str; 6] = ["Cafe", "Arcade", "Clinic", "Bookshop", "Diner", "Hall"];
 const GUN_NAMES: [&str; 3] = ["compact pistol", "service revolver", "polymer handgun"];
 const KNIFE_NAMES: [&str; 3] = ["pocket knife", "utility knife", "folding knife"];
 const BAG_NAMES: [&str; 3] = ["duffel bag", "messenger bag", "canvas tote"];
@@ -1751,8 +1772,11 @@ mod tests {
     use petgraph::Direction::Outgoing;
     use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 
-    use super::{PlaceId, World, WorldNode, WorldRelation};
+    use super::{ActorId, PlaceId, ProcessKind, World, WorldNode, WorldRelation};
+    use crate::domain::events::DialogueSpeaker;
+    use crate::domain::records::DialogueLine;
     use crate::domain::seed::WorldSeed;
+    use crate::domain::time::{GameTime, TimeDelta};
 
     #[test]
     fn procgen_is_deterministic() {
@@ -1778,22 +1802,23 @@ mod tests {
 
         assert_eq!(visited.len(), world.city_ids().len());
         assert!(world.city_ids().iter().all(|city_id| world.city_places(*city_id).len() >= 4));
-        assert!(world.npc_ids().len() >= 24 * 3);
+        assert!(world.actor_ids().len() >= 24 * 3 + 1);
         assert!(world.validate().is_empty());
+        assert!(world.manual_actor_id().is_some());
     }
 
     #[test]
-    fn player_location_is_represented_by_relation() {
+    fn actor_location_is_represented_by_relation() {
         let mut world = World::generate(WorldSeed::new(42), 16);
-        let player_id = world.player_id().unwrap();
+        let actor_id = world.manual_actor_id().unwrap();
         let destination = world.city_places(world.city_ids()[0])[0];
 
-        world.move_player(player_id, destination);
+        world.move_actor(actor_id, destination);
 
-        assert_eq!(world.player_place_id(player_id), Some(destination));
+        assert_eq!(world.actor_place_id(actor_id), Some(destination));
         let outgoing = world
             .graph
-            .edges_directed(player_id.0, Outgoing)
+            .edges_directed(actor_id.0, Outgoing)
             .filter(|edge| matches!(edge.weight(), WorldRelation::LocatedAt))
             .count();
         assert_eq!(outgoing, 1);
@@ -1801,6 +1826,48 @@ mod tests {
             world.graph.node_weight(destination.0),
             Some(WorldNode::Place(_))
         ));
+    }
+
+    #[test]
+    fn speech_processes_are_timed_graph_nodes() {
+        let mut world = World::generate(WorldSeed::new(11), 16);
+        let manual_actor_id = world.manual_actor_id().unwrap();
+        let place_id = world.actor_place_id(manual_actor_id).unwrap();
+        let target_id = world
+            .place_actors(place_id)
+            .into_iter()
+            .find(|actor_id| *actor_id != manual_actor_id)
+            .unwrap_or_else(|| {
+                let actor_id = world.actor_ids().into_iter().find(|actor_id| *actor_id != manual_actor_id).unwrap();
+                world.move_actor(actor_id, place_id);
+                actor_id
+            });
+        let process_id = world.record_speech_process(
+            manual_actor_id,
+            target_id,
+            place_id,
+            GameTime::from_seconds(10),
+            TimeDelta::from_seconds(20),
+            vec![
+                DialogueLine {
+                    timestamp: GameTime::from_seconds(10),
+                    speaker: DialogueSpeaker::Actor(manual_actor_id),
+                    text: "hello".to_string(),
+                },
+                DialogueLine {
+                    timestamp: GameTime::from_seconds(20),
+                    speaker: DialogueSpeaker::Actor(target_id),
+                    text: "hi".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(world.process(process_id).kind, ProcessKind::Speak);
+        assert_eq!(
+            world.speech_lines_between(manual_actor_id, target_id, 8).len(),
+            2
+        );
+        assert!(world.validate().is_empty());
     }
 
     #[test]
@@ -1823,5 +1890,16 @@ mod tests {
         if let Some(place_id) = maybe_item_place {
             assert!(!world.place_entities(place_id).is_empty());
         }
+    }
+
+    #[test]
+    fn exactly_one_manual_actor_exists() {
+        let world = World::generate(WorldSeed::new(13), 16);
+        let manual_actor_ids = world
+            .actor_ids()
+            .into_iter()
+            .filter(|actor_id| world.actor(*actor_id).controller == super::ControllerMode::Manual)
+            .collect::<Vec<ActorId>>();
+        assert_eq!(manual_actor_ids.len(), 1);
     }
 }

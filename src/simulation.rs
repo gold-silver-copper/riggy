@@ -1,11 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::events::{EntitySummary, PlaceSummary};
-use crate::domain::memory::ConversationMemory;
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
-use crate::world::{CityId, NpcId, World};
+use crate::world::{ActorId, CityId, World};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameState {
@@ -15,11 +14,10 @@ pub struct GameState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiSnapshot {
     pub world_seed: WorldSeed,
-    pub mode: UiMode,
-    pub status: PlayerStatusView,
+    pub actor_id: ActorId,
+    pub status: ActorStatusView,
     pub city: CityView,
     pub place: PlaceSummary,
-    pub dialogue_partner: Option<DialoguePartnerView>,
     pub routes: Vec<RouteView>,
     pub interactables: Vec<Interactable>,
     pub context_feed: Vec<crate::domain::records::ContextEntry>,
@@ -38,8 +36,9 @@ pub enum Interactable {
     Inspect(EntitySummary),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlayerStatusView {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorStatusView {
+    pub id: ActorId,
     pub clock: GameTime,
     pub known_city_count: usize,
 }
@@ -53,21 +52,9 @@ pub struct CityView {
     pub connected_cities: Vec<CityId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DialoguePartnerView {
-    pub actor: ActorView,
-    pub memory: Option<ConversationMemory>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActorView {
-    pub id: NpcId,
+    pub id: ActorId,
     pub occupation: Occupation,
     pub archetype: NpcArchetype,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UiMode {
-    Explore,
-    Dialogue,
 }

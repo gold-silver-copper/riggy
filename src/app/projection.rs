@@ -1,10 +1,8 @@
-use crate::ai::context::{CityContext, NpcContext};
-use crate::app::query::{active_dialogue_npc_id, current_place_id};
+use crate::ai::context::{ActorContext, CityContext};
+use crate::app::query::{current_place_id, manual_actor_id};
 use crate::domain::events::{EntitySummary, PlaceSummary};
-use crate::simulation::{
-    ActorView, CityView, DialoguePartnerView, GameState, Interactable, RouteView,
-};
-use crate::world::{CityId, EntityId, NpcId, PlaceId, World};
+use crate::simulation::{ActorView, CityView, GameState, Interactable, RouteView};
+use crate::world::{ActorId, CityId, EntityId, PlaceId, World};
 
 pub fn place_summary(world: &World, place_id: PlaceId) -> PlaceSummary {
     let place = world.place(place_id);
@@ -25,10 +23,10 @@ pub fn entity_summary(world: &World, entity_id: EntityId) -> EntitySummary {
     }
 }
 
-pub fn actor_view(world: &World, npc_id: NpcId) -> ActorView {
-    let profile = world.npc_profile(npc_id);
+pub fn actor_view(world: &World, actor_id: ActorId) -> ActorView {
+    let profile = world.actor_profile(actor_id);
     ActorView {
-        id: npc_id,
+        id: actor_id,
         occupation: profile.occupation,
         archetype: profile.archetype,
     }
@@ -45,13 +43,6 @@ pub fn city_view(world: &World, city_id: CityId) -> CityView {
     }
 }
 
-pub fn dialogue_partner_view(state: &GameState) -> Option<DialoguePartnerView> {
-    active_dialogue_npc_id(state).map(|npc_id| DialoguePartnerView {
-        actor: actor_view(&state.world, npc_id),
-        memory: state.world.npc_conversation_memory(npc_id),
-    })
-}
-
 pub fn route_views(state: &GameState) -> Vec<RouteView> {
     state
         .world
@@ -66,11 +57,13 @@ pub fn route_views(state: &GameState) -> Vec<RouteView> {
 }
 
 pub fn interactables(state: &GameState) -> Vec<Interactable> {
+    let manual_actor_id = manual_actor_id(state);
     let mut interactables = state
         .world
-        .place_npcs(current_place_id(state))
+        .place_actors(current_place_id(state))
         .into_iter()
-        .map(|npc_id| Interactable::Talk(actor_view(&state.world, npc_id)))
+        .filter(|actor_id| *actor_id != manual_actor_id)
+        .map(|actor_id| Interactable::Talk(actor_view(&state.world, actor_id)))
         .collect::<Vec<_>>();
     interactables.extend(
         state
@@ -93,10 +86,11 @@ pub fn city_context(world: &World, city_id: CityId) -> CityContext {
     }
 }
 
-pub fn npc_context(world: &World, npc_id: NpcId) -> NpcContext {
-    let profile = world.npc_profile(npc_id);
-    NpcContext {
-        id: npc_id,
+pub fn actor_context(world: &World, actor_id: ActorId) -> ActorContext {
+    let profile = world.actor_profile(actor_id);
+    ActorContext {
+        id: actor_id,
+        controller: profile.controller,
         archetype: profile.archetype,
         occupation: profile.occupation,
         traits: profile.traits,
