@@ -80,15 +80,15 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
         }
     }
 
-    if !snapshot.city.districts.is_empty() {
+    if !snapshot.city.connected_cities.is_empty() {
         push_list_section(
             &mut lines,
-            "Districts nearby",
+            "Connected cities",
             snapshot
                 .city
-                .districts
+                .connected_cities
                 .iter()
-                .map(|district| district.name(snapshot.world_seed)),
+                .map(|city_id| city_id.name(snapshot.world_seed)),
             Color::Green,
             ", ",
         );
@@ -136,20 +136,6 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
             other_details.into_iter(),
             Color::Cyan,
             " | ",
-        );
-    }
-
-    if !snapshot.city.landmarks.is_empty() {
-        push_list_section(
-            &mut lines,
-            "Landmarks",
-            snapshot
-                .city
-                .landmarks
-                .iter()
-                .map(|landmark| landmark.name(snapshot.world_seed)),
-            Color::Cyan,
-            ", ",
         );
     }
 
@@ -344,7 +330,7 @@ impl WorldFormatter {
     }
 
     fn place(&self, place: &PlaceSummary) -> String {
-        place_name_from_parts(self.seed, place.id, place.district_id, place.kind)
+        place_name_from_parts(self.seed, place.id, place.city_id, place.kind)
     }
 
     fn entity(&self, entity: &EntitySummary) -> String {
@@ -366,7 +352,7 @@ impl WorldFormatter {
     fn system_context(&self, context: &SystemContext) -> String {
         match context {
             SystemContext::Start => {
-                "You arrived in a starter apartment with a need for useful names.".to_string()
+                "You arrived in a starter residence with a need for useful names.".to_string()
             }
             SystemContext::Travel { destination, duration } => format!(
                 "Arrived at {} after {}.",
@@ -391,7 +377,7 @@ impl WorldFormatter {
                 route,
                 duration,
             } => Some(format!(
-                "You travel to {} on {} in {}.",
+                "You travel to {} using {} in {}.",
                 self.place(destination),
                 route.kind.label(),
                 format_duration(*duration)
@@ -416,8 +402,6 @@ impl WorldFormatter {
 
 #[cfg(test)]
 mod tests {
-    use petgraph::stable_graph::NodeIndex;
-
     use super::{
         build_world_text, render_event_notice, render_interactable_label, render_route_label,
     };
@@ -427,13 +411,12 @@ mod tests {
     use crate::domain::seed::WorldSeed;
     use crate::domain::time::{GameTime, TimeDelta};
     use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
-    use crate::graph_ecs::{EntityId, NpcId, PlaceId};
     use crate::simulation::{
         ActorView, CityView, DialoguePartnerView, Interactable, PlayerStatusView, RouteView,
         UiMode, UiSnapshot,
     };
     use crate::world::{
-        CityId, DistrictId, EntityKind, PlaceKind, RouteKind, TravelRoute,
+        CityId, EntityId, EntityKind, NpcId, PlaceId, PlaceKind, RouteKind, TravelRoute,
         entity_name_from_parts, place_name_from_parts,
     };
 
@@ -446,22 +429,12 @@ mod tests {
         assert!(rendered.contains(&place_name_from_parts(
             snapshot.world_seed,
             snapshot.place.id,
-            snapshot.place.district_id,
+            snapshot.place.city_id,
             snapshot.place.kind
         )));
         assert!(rendered.contains(&snapshot.city.id.name(snapshot.world_seed)));
         assert!(rendered.contains("Current conversation:"));
-        assert!(
-            rendered.contains(
-                &snapshot
-                    .dialogue_partner
-                    .as_ref()
-                    .unwrap()
-                    .actor
-                    .id
-                    .name(snapshot.world_seed)
-            )
-        );
+        assert!(rendered.contains("Connected cities:"));
         assert!(rendered.contains("Routes from here:"));
         assert!(rendered.contains("Recent Context"));
     }
@@ -505,11 +478,11 @@ mod tests {
         assert_eq!(
             label,
             format!(
-                "{} via arterial road (10m 00s)",
+                "{} via transit line (10m 00s)",
                 place_name_from_parts(
                     snapshot.world_seed,
                     snapshot.routes[0].destination.id,
-                    snapshot.routes[0].destination.district_id,
+                    snapshot.routes[0].destination.city_id,
                     snapshot.routes[0].destination.kind,
                 )
             )
@@ -524,7 +497,7 @@ mod tests {
             &crate::domain::events::GameEvent::TravelCompleted {
                 destination: PlaceSummary {
                     id: snapshot.routes[0].destination.id,
-                    district_id: snapshot.routes[0].destination.district_id,
+                    city_id: snapshot.routes[0].destination.city_id,
                     kind: snapshot.routes[0].destination.kind,
                 },
                 route: snapshot.routes[0].route,
@@ -532,11 +505,11 @@ mod tests {
             },
         );
         let expected = format!(
-            "You travel to {} on arterial road in 10m 00s.",
+            "You travel to {} using transit line in 10m 00s.",
             place_name_from_parts(
                 snapshot.world_seed,
                 snapshot.routes[0].destination.id,
-                snapshot.routes[0].destination.district_id,
+                snapshot.routes[0].destination.city_id,
                 snapshot.routes[0].destination.kind,
             )
         );
@@ -545,28 +518,20 @@ mod tests {
 
     fn sample_snapshot() -> UiSnapshot {
         let world_seed = WorldSeed::new(42);
-        let city_id = CityId(NodeIndex::new(0));
-        let place_id = PlaceId(NodeIndex::new(1));
-        let market_district = DistrictId {
-            city_id,
-            district_index: 0,
-        };
-        let station_district = DistrictId {
-            city_id,
-            district_index: 1,
-        };
+        let city_id = CityId(0.into());
+        let place_id = PlaceId(1.into());
         let route_destination = PlaceSummary {
-            id: PlaceId(NodeIndex::new(2)),
-            district_id: station_district,
-            kind: PlaceKind::StationPlatform,
+            id: PlaceId(2.into()),
+            city_id,
+            kind: PlaceKind::Station,
         };
         let actor = ActorView {
-            id: NpcId(NodeIndex::new(3)),
+            id: NpcId(3.into()),
             occupation: Occupation::Journalist,
             archetype: NpcArchetype::Watcher,
         };
         let bag = EntitySummary {
-            id: EntityId(NodeIndex::new(4)),
+            id: EntityId(4.into()),
             kind: EntityKind::Bag,
         };
 
@@ -582,19 +547,15 @@ mod tests {
                 biome: Biome::Coastal,
                 economy: Economy::Trade,
                 culture: Culture::CivicMinded,
-                districts: vec![market_district, station_district],
-                landmarks: vec![crate::world::LandmarkId {
-                    city_id,
-                    landmark_index: 0,
-                }],
+                connected_cities: vec![CityId(1.into()), CityId(2.into())],
             },
             place: PlaceSummary {
                 id: place_id,
-                district_id: market_district,
-                kind: PlaceKind::SidewalkLeft,
+                city_id,
+                kind: PlaceKind::Street,
             },
             dialogue_partner: Some(DialoguePartnerView {
-                actor: actor.clone(),
+                actor,
                 memory: Some(crate::domain::memory::ConversationMemory {
                     summary: "The player followed up on a local lead.".to_string(),
                 }),
@@ -602,7 +563,7 @@ mod tests {
             routes: vec![RouteView {
                 destination: route_destination,
                 route: TravelRoute {
-                    kind: RouteKind::ArterialRoad,
+                    kind: RouteKind::Transit,
                     travel_time: crate::domain::time::TimeDelta::from_seconds(600),
                 },
                 travel_time: TimeDelta::from_seconds(600),
@@ -615,7 +576,7 @@ mod tests {
                 },
                 ContextEntry::Dialogue(DialogueLine {
                     timestamp: GameTime::from_seconds(28_830),
-                    speaker: DialogueSpeaker::Npc(NpcId(NodeIndex::new(3))),
+                    speaker: DialogueSpeaker::Npc(NpcId(3.into())),
                     text: "You should start at the station before the crowds thicken.".to_string(),
                 }),
             ],

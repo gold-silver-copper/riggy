@@ -10,7 +10,9 @@ pub fn place_summary(world: &World, place_id: PlaceId) -> PlaceSummary {
     let place = world.place(place_id);
     PlaceSummary {
         id: place_id,
-        district_id: place.district_id,
+        city_id: world
+            .place_city_id(place_id)
+            .expect("place should belong to a city"),
         kind: place.kind,
     }
 }
@@ -39,8 +41,7 @@ pub fn city_view(world: &World, city_id: CityId) -> CityView {
         biome: city.biome,
         economy: city.economy,
         culture: city.culture,
-        districts: city.districts.iter().map(|district| district.id).collect(),
-        landmarks: city.landmarks.iter().map(|landmark| landmark.id).collect(),
+        connected_cities: world.city_connections(city_id),
     }
 }
 
@@ -88,8 +89,6 @@ pub fn city_context(world: &World, city_id: CityId) -> CityContext {
         biome: city.biome,
         economy: city.economy,
         culture: city.culture,
-        districts: city.districts.iter().map(|district| district.id).collect(),
-        landmarks: city.landmarks.iter().map(|landmark| landmark.id).collect(),
         connected_cities: world.city_connections(city_id),
     }
 }
@@ -102,6 +101,6 @@ pub fn npc_context(world: &World, npc_id: NpcId) -> NpcContext {
         occupation: profile.occupation,
         traits: profile.traits,
         goal: profile.goal,
-        home_district: profile.home_district,
+        home_place: place_summary(world, profile.home_place_id),
     }
 }

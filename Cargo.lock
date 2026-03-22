@@ -105,6 +105,7 @@ name = "bfo"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "ttl2ofn",
 ]
 
 [[package]]
@@ -2025,7 +2026,6 @@ name = "riggy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bfo",
  "crossterm",
  "futures",
  "petgraph",
@@ -2033,8 +2033,6 @@ dependencies = [
  "rand_chacha 0.9.0",
  "ratatui",
  "rig-core",
- "riggy_model",
- "riggy_ontology",
  "schemars",
  "serde",
  "serde_json",

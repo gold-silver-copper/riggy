@@ -42,7 +42,7 @@ impl<B: LlmBackend> GameService<B> {
         let start_place_id = city_places
             .iter()
             .copied()
-            .find(|place_id| matches!(world.place(*place_id).kind, PlaceKind::ApartmentLobby))
+            .find(|place_id| matches!(world.place(*place_id).kind, PlaceKind::Residence))
             .or_else(|| {
                 city_places
                     .iter()
@@ -352,10 +352,9 @@ mod tests {
     use crate::domain::events::{DialogueLine, GameEvent};
     use crate::domain::memory::ConversationMemory;
     use crate::domain::time::TimeDelta;
-    use crate::graph_ecs::WorldEdge;
     use crate::llm::{DialogueResponse, LlmBackend, MockBackend};
     use crate::simulation::{Interactable, UiMode};
-    use crate::world::NpcId;
+    use crate::world::{NpcId, WorldNode, WorldRelation};
 
     use super::GameService;
 
@@ -552,14 +551,6 @@ mod tests {
         let mut game = GameService::new(MockBackend).unwrap();
         let npc_id = game.state.world.npc_ids()[0];
         let resident_city_id = game.state.world.npc_resident_city_ids(npc_id)[0];
-        let present_edge_id = game
-            .state
-            .world
-            .graph
-            .edges_directed(npc_id.0, petgraph::Direction::Incoming)
-            .find(|edge| matches!(edge.weight(), WorldEdge::PresentAt))
-            .map(|edge| edge.id())
-            .expect("npc should have place");
         let other_city_id = game
             .state
             .world
@@ -568,11 +559,26 @@ mod tests {
             .find(|city_id| *city_id != resident_city_id)
             .expect("world should have another city");
         let other_place_id = game.state.world.city_places(other_city_id)[0];
-        game.state.world.graph.remove_edge(present_edge_id);
-        game.state
+        let present_edge_id = game
+            .state
             .world
             .graph
-            .add_edge(other_place_id.0, npc_id.0, WorldEdge::PresentAt);
+            .edges_directed(npc_id.0, petgraph::Direction::Outgoing)
+            .find(|edge| {
+                matches!(edge.weight(), WorldRelation::LocatedAt)
+                    && matches!(
+                        game.state.world.graph.node_weight(edge.target()),
+                        Some(WorldNode::Place(_))
+                    )
+            })
+            .map(|edge| edge.id())
+            .expect("npc should have a present place");
+        game.state.world.graph.remove_edge(present_edge_id);
+        game.state.world.graph.add_edge(
+            npc_id.0,
+            other_place_id.0,
+            WorldRelation::LocatedAt,
+        );
 
         let invalid_path = Path::new("/tmp/riggy-invalid-save.json");
         std::fs::write(invalid_path, to_vec_pretty(&game.state).unwrap()).unwrap();

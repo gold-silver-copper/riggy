@@ -5,7 +5,7 @@ use crate::domain::memory::ConversationMemory;
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, NpcArchetype, Occupation};
-use crate::world::{CityId, DistrictId, LandmarkId, NpcId, World};
+use crate::world::{CityId, NpcId, World};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameState {
@@ -50,8 +50,7 @@ pub struct CityView {
     pub biome: Biome,
     pub economy: Economy,
     pub culture: Culture,
-    pub districts: Vec<DistrictId>,
-    pub landmarks: Vec<LandmarkId>,
+    pub connected_cities: Vec<CityId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

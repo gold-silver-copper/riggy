@@ -1,0 +1,86 @@
+use serde::{Deserialize, Serialize};
+
+use crate::domain::time::{GameTime, TimeDelta};
+use crate::world::{CityId, EntityId, EntityKind, NpcId, PlaceId, PlaceKind, TravelRoute};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceSummary {
+    pub id: PlaceId,
+    pub city_id: CityId,
+    pub kind: PlaceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntitySummary {
+    pub id: EntityId,
+    pub kind: EntityKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DialogueLine {
+    pub timestamp: GameTime,
+    pub speaker: DialogueSpeaker,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DialogueSpeaker {
+    Player,
+    Npc(NpcId),
+    System,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextEntry {
+    System {
+        timestamp: GameTime,
+        context: SystemContext,
+    },
+    Dialogue(DialogueLine),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SystemContext {
+    Start,
+    Travel {
+        destination: PlaceSummary,
+        duration: TimeDelta,
+    },
+}
+
+impl SystemContext {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Travel { .. } => "travel",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GameEvent {
+    DialogueStarted {
+        npc_id: NpcId,
+    },
+    DialogueLineRecorded {
+        line: DialogueLine,
+    },
+    DialogueEnded {
+        npc_id: NpcId,
+    },
+    TravelCompleted {
+        destination: PlaceSummary,
+        route: TravelRoute,
+        duration: TimeDelta,
+    },
+    EntityInspected {
+        entity: EntitySummary,
+    },
+    WaitCompleted {
+        duration: TimeDelta,
+        current_time: GameTime,
+    },
+    ContextAppended {
+        entry: ContextEntry,
+    },
+}

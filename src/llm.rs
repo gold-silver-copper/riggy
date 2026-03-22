@@ -80,15 +80,14 @@ impl LlmBackend for MockBackend {
         )];
 
         if lower.contains("job") || lower.contains("work") || lower.contains("favor") {
-            let landmark = context
-                .city
-                .landmarks
-                .first()
-                .map(|landmark| landmark.name(context.world_seed))
-                .unwrap_or_else(|| "the transit station".to_string());
             lines.push(format!(
                 "\"I might have something for you if you're reliable. Check around {} and see whether anything looks out of place.\"",
-                landmark
+                crate::world::place_name_from_parts(
+                    context.world_seed,
+                    context.current_place.id,
+                    context.current_place.city_id,
+                    context.current_place.kind,
+                )
             ));
         } else if lower.contains("where") || lower.contains("city") || lower.contains("travel") {
             lines.push(format!(
@@ -97,7 +96,7 @@ impl LlmBackend for MockBackend {
                 context.city.biome.label(),
                 context.city.economy.label(),
                 context.city.culture.label(),
-                context.npc.home_district_name(context.world_seed),
+                context.npc.home_place_name(context.world_seed),
                 if context.city.connected_cities.is_empty() {
                     "nowhere worth naming".to_string()
                 } else {
@@ -114,7 +113,7 @@ impl LlmBackend for MockBackend {
             lines.push(format!(
                 "\"You don't sound like most people passing through {}. That can be useful or it can get noticed. I spend most of my time around {}, so I hear things early.\"",
                 context.city.name(context.world_seed),
-                context.npc.home_district_name(context.world_seed)
+                context.npc.home_place_name(context.world_seed)
             ));
         }
 
@@ -384,16 +383,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(context.npc.id, npc_id);
-        assert_eq!(context.npc.home_district.city_id, city_id);
+        assert_eq!(context.npc.home_place.city_id, city_id);
         assert_eq!(context.city.id, city_id);
-        assert!(!context.city.districts.is_empty());
+        assert_eq!(context.current_place.city_id, city_id);
         assert!(!context.city.connected_cities.is_empty());
         assert_eq!(context.memory.summary, memory.summary);
     }
 
     #[test]
     fn fallback_conversation_memory_preserves_summary() {
-        let npc_id = crate::world::NpcId(petgraph::stable_graph::NodeIndex::new(2));
+        let npc_id = crate::world::NpcId(2.into());
         let transcript = vec![
             DialogueLine {
                 timestamp: GameTime::from_seconds(0),

@@ -6,7 +6,7 @@ pub fn player_id(state: &GameState) -> PlayerId {
     state
         .world
         .player_id()
-        .expect("player should exist in world graph")
+        .expect("player should exist in world")
 }
 
 pub fn current_time(state: &GameState) -> GameTime {

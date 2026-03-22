@@ -1,9 +1,12 @@
 use crate::ai::context::NpcDialogueContext;
+use crate::domain::events::PlaceSummary;
 use crate::domain::memory::ConversationMemory;
+use crate::domain::seed::WorldSeed;
+use crate::world::place_name_from_parts;
 
 pub fn build_dialogue_prompt(context: &NpcDialogueContext) -> String {
     format!(
-        "World seed: {world_seed}\nTime: {time_label} ({time_seconds} seconds)\nCity: {city} ({biome}, {economy}, {culture})\nDistricts: {districts}\nLandmarks: {landmarks}\nConnected cities: {connected_cities}\nNPC: {npc}, a {occupation} and {archetype}\nHome district: {home_district}\nTraits: {traits}\nGoal: {goal}\nConversation memory: {memory}\n\nPlayer says: {player_input}\n\nReply as the NPC in 2-4 sentences. Stay grounded in the city and the NPC's motives. Refer only to facts present in this context or naturally implied by them.",
+        "World seed: {world_seed}\nTime: {time_label} ({time_seconds} seconds)\nCity: {city} ({biome}, {economy}, {culture})\nConnected cities: {connected_cities}\nCurrent place: {current_place}\nNPC: {npc}, a {occupation} and {archetype}\nHome place: {home_place}\nTraits: {traits}\nGoal: {goal}\nConversation memory: {memory}\n\nPlayer says: {player_input}\n\nReply as the NPC in 2-4 sentences. Stay grounded in the city, the current place, and the NPC's motives. Refer only to facts present in this context or naturally implied by them.",
         world_seed = context.world_seed,
         time_label = context.current_time.format(),
         time_seconds = context.current_time.seconds(),
@@ -11,20 +14,6 @@ pub fn build_dialogue_prompt(context: &NpcDialogueContext) -> String {
         biome = context.city.biome.label(),
         economy = context.city.economy.label(),
         culture = context.city.culture.label(),
-        districts = render_list(
-            context
-                .city
-                .districts
-                .iter()
-                .map(|district| district.name(context.world_seed))
-        ),
-        landmarks = render_list(
-            context
-                .city
-                .landmarks
-                .iter()
-                .map(|landmark| landmark.name(context.world_seed))
-        ),
         connected_cities = render_list(
             context
                 .city
@@ -32,10 +21,11 @@ pub fn build_dialogue_prompt(context: &NpcDialogueContext) -> String {
                 .iter()
                 .map(|city| city.name(context.world_seed))
         ),
+        current_place = render_place(context.world_seed, context.current_place),
         npc = context.npc.name(context.world_seed),
         occupation = context.npc.occupation.label(),
         archetype = context.npc.archetype.label(),
-        home_district = context.npc.home_district_name(context.world_seed),
+        home_place = context.npc.home_place_name(context.world_seed),
         traits = render_list(
             context
                 .npc
@@ -46,6 +36,14 @@ pub fn build_dialogue_prompt(context: &NpcDialogueContext) -> String {
         goal = context.npc.goal.label(),
         memory = render_conversation_memory(&context.memory),
         player_input = context.turn.player_input
+    )
+}
+
+fn render_place(world_seed: WorldSeed, place: PlaceSummary) -> String {
+    format!(
+        "{} ({})",
+        place_name_from_parts(world_seed, place.id, place.city_id, place.kind),
+        place.kind.label()
     )
 }
 
@@ -68,16 +66,16 @@ fn render_conversation_memory(memory: &ConversationMemory) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::build_dialogue_prompt;
+
     use crate::ai::context::{CityContext, DialogueTurnContext, NpcContext, NpcDialogueContext};
-    use crate::domain::events::{DialogueLine, DialogueSpeaker};
+    use crate::domain::events::{DialogueLine, DialogueSpeaker, PlaceSummary};
     use crate::domain::memory::ConversationMemory;
     use crate::domain::seed::WorldSeed;
     use crate::domain::vocab::{
         Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag,
     };
-    use crate::world::{DistrictId, LandmarkId};
-
-    use super::build_dialogue_prompt;
+    use crate::world::{CityId, NpcId, PlaceKind, PlaceId};
 
     #[test]
     fn dialogue_prompt_renders_from_context_fixture() {
@@ -91,7 +89,8 @@ mod tests {
         assert!(prompt.contains("What is this city like?"));
         assert!(prompt.contains(&context.current_time.format()));
         assert!(prompt.contains(&context.npc.name(context.world_seed)));
-        assert!(prompt.contains(&context.npc.home_district_name(context.world_seed)));
+        assert!(prompt.contains(&context.npc.home_place_name(context.world_seed)));
+        assert!(prompt.contains("Current place"));
         assert!(prompt.contains("Conversation memory"));
         assert!(prompt.contains("The player followed up on a local lead."));
     }
@@ -101,37 +100,27 @@ mod tests {
             world_seed: WorldSeed::new(42),
             current_time: crate::domain::time::GameTime::from_seconds(29_400),
             city: CityContext {
-                id: crate::world::CityId(petgraph::stable_graph::NodeIndex::new(1)),
+                id: CityId(1.into()),
                 biome: Biome::Coastal,
                 economy: Economy::Trade,
                 culture: Culture::CivicMinded,
-                districts: vec![
-                    DistrictId {
-                        city_id: crate::world::CityId(petgraph::stable_graph::NodeIndex::new(1)),
-                        district_index: 0,
-                    },
-                    DistrictId {
-                        city_id: crate::world::CityId(petgraph::stable_graph::NodeIndex::new(1)),
-                        district_index: 1,
-                    },
-                ],
-                landmarks: vec![LandmarkId {
-                    city_id: crate::world::CityId(petgraph::stable_graph::NodeIndex::new(1)),
-                    landmark_index: 0,
-                }],
-                connected_cities: vec![crate::world::CityId(
-                    petgraph::stable_graph::NodeIndex::new(7),
-                )],
+                connected_cities: vec![CityId(7.into())],
+            },
+            current_place: PlaceSummary {
+                id: PlaceId(3.into()),
+                city_id: CityId(1.into()),
+                kind: PlaceKind::Venue,
             },
             npc: NpcContext {
-                id: crate::world::NpcId(petgraph::stable_graph::NodeIndex::new(9)),
+                id: NpcId(9.into()),
                 archetype: NpcArchetype::Watcher,
                 occupation: Occupation::Journalist,
                 traits: vec![TraitTag::Guarded, TraitTag::Ambitious],
                 goal: GoalTag::ExposeRecordsLeak,
-                home_district: DistrictId {
-                    city_id: crate::world::CityId(petgraph::stable_graph::NodeIndex::new(1)),
-                    district_index: 1,
+                home_place: PlaceSummary {
+                    id: PlaceId(1.into()),
+                    city_id: CityId(1.into()),
+                    kind: PlaceKind::Residence,
                 },
             },
             memory: ConversationMemory {
