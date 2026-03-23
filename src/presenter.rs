@@ -9,7 +9,7 @@ use crate::simulation::{ActorView, Interactable, RouteView, UiSnapshot};
 use crate::world::{entity_name_from_parts, place_name_from_parts};
 
 pub fn build_world_title(snapshot: &UiSnapshot) -> Line<'static> {
-    let formatter = WorldFormatter::new(snapshot.world_seed, snapshot.actor_id);
+    let formatter = WorldFormatter::new(snapshot.world_seed, snapshot.focused_actor_id);
     Line::from(vec![
         Span::styled(
             format!(
@@ -30,7 +30,7 @@ pub fn build_world_title(snapshot: &UiSnapshot) -> Line<'static> {
 }
 
 pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'static> {
-    let formatter = WorldFormatter::new(snapshot.world_seed, snapshot.actor_id);
+    let formatter = WorldFormatter::new(snapshot.world_seed, snapshot.focused_actor_id);
     let mut lines = vec![
         Line::from(vec![
             Span::raw("You are in "),
@@ -52,6 +52,20 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
         Line::from(vec![
             Span::raw("This area is a "),
             highlighted(snapshot.place.kind.label().to_string(), Color::Yellow),
+            Span::raw("."),
+        ]),
+        Line::from(vec![
+            Span::raw("You are "),
+            highlighted(snapshot.focused_actor.id.name(snapshot.world_seed), Color::Yellow),
+            Span::raw(", a "),
+            highlighted(
+                format!(
+                    "{} and {}",
+                    snapshot.focused_actor.occupation.label(),
+                    snapshot.focused_actor.archetype.label()
+                ),
+                Color::Magenta,
+            ),
             Span::raw("."),
         ]),
         Line::from(vec![
@@ -83,7 +97,7 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
         .filter_map(|interactable| match interactable {
             Interactable::Talk(actor) => Some(format!(
                 "{} - {}, {}",
-                formatter.actor(actor),
+                actor_display_name(snapshot, actor),
                 actor.occupation.label(),
                 actor.archetype.label()
             )),
@@ -161,15 +175,12 @@ pub fn render_route_label(world_seed: WorldSeed, option: &RouteView) -> String {
     )
 }
 
-pub fn render_interactable_label(world_seed: WorldSeed, interactable: &Interactable) -> String {
-    let formatter = WorldFormatter::new(world_seed, match interactable {
-        Interactable::Talk(actor) => actor.id,
-        Interactable::Inspect(_) => crate::world::ActorId(0.into()),
-    });
+pub fn render_interactable_label(snapshot: &UiSnapshot, interactable: &Interactable) -> String {
+    let formatter = WorldFormatter::new(snapshot.world_seed, snapshot.focused_actor_id);
     match interactable {
         Interactable::Talk(actor) => format!(
             "{} - talk ({}, {})",
-            formatter.actor(actor),
+            actor_display_name(snapshot, actor),
             actor.occupation.label(),
             actor.archetype.label()
         ),
@@ -209,7 +220,7 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
                     Span::raw("  "),
                     Span::raw(clean_inline_text(&render_system_context(
                         snapshot.world_seed,
-                        snapshot.actor_id,
+                        snapshot.focused_actor_id,
                         context,
                     ))),
                 ]));
@@ -218,9 +229,16 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
-                        dialogue_speaker_label(snapshot.world_seed, snapshot.actor_id, line.speaker),
+                        dialogue_speaker_label(
+                            snapshot.world_seed,
+                            snapshot.focused_actor_id,
+                            line.speaker,
+                        ),
                         Style::default()
-                            .fg(dialogue_speaker_color(snapshot.actor_id, line.speaker))
+                            .fg(dialogue_speaker_color(
+                                snapshot.focused_actor_id,
+                                line.speaker,
+                            ))
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
@@ -280,6 +298,27 @@ fn clean_inline_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn actor_display_name(snapshot: &UiSnapshot, actor: &ActorView) -> String {
+    if actor.id == snapshot.focused_actor_id {
+        return "You".to_string();
+    }
+
+    let base_name = actor.id.name(snapshot.world_seed);
+    let duplicate_count = std::iter::once(snapshot.focused_actor.id)
+        .chain(snapshot.interactables.iter().filter_map(|interactable| match interactable {
+            Interactable::Talk(actor) => Some(actor.id),
+            Interactable::Inspect(_) => None,
+        }))
+        .filter(|actor_id| actor_id.name(snapshot.world_seed) == base_name)
+        .count();
+
+    if duplicate_count > 1 {
+        format!("{base_name} (#{})", actor.id.index())
+    } else {
+        base_name
+    }
+}
+
 pub fn format_duration(duration: crate::domain::time::TimeDelta) -> String {
     duration.format()
 }
@@ -328,14 +367,6 @@ impl WorldFormatter {
         entity_name_from_parts(self.seed, entity.id, entity.kind)
     }
 
-    fn actor(&self, actor: &ActorView) -> String {
-        if actor.id == self.manual_actor_id {
-            "You".to_string()
-        } else {
-            actor.id.name(self.seed)
-        }
-    }
-
     fn speaker(&self, speaker: DialogueSpeaker) -> String {
         match speaker {
             DialogueSpeaker::Actor(actor_id) if actor_id == self.manual_actor_id => {
@@ -361,7 +392,11 @@ impl WorldFormatter {
 
     fn event_notice(&self, event: &GameEvent) -> Option<String> {
         match event {
-            GameEvent::SpeechLineRecorded { .. } => None,
+            GameEvent::SpeechLineRecorded { line } => Some(format!(
+                "{} says: {}",
+                self.speaker(line.speaker),
+                clean_inline_text(&line.text)
+            )),
             GameEvent::TravelCompleted {
                 destination,
                 route,

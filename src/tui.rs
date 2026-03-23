@@ -10,9 +10,10 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use ratatui::{DefaultTerminal, Frame};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::{LocalSet, spawn_local};
+use tracing::{debug, error, info};
 
 use crate::app::service::GameService;
-use crate::domain::commands::{ActionKind, ActionRequest};
+use crate::domain::commands::{ActionKind, ActionRequest, AvailableAction};
 use crate::domain::events::ActionResult;
 use crate::domain::time::TimeDelta;
 use crate::llm::LlmBackend;
@@ -20,7 +21,7 @@ use crate::presenter::{
     build_world_text, build_world_title, format_duration, render_event_notice,
     render_interactable_label, render_route_label,
 };
-use crate::simulation::{ActorView, Interactable, UiSnapshot};
+use crate::simulation::{ActorView, AgentDebugSnapshot, Interactable, UiSnapshot};
 
 const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
 const NOTICE_HISTORY_LIMIT: usize = 48;
@@ -50,33 +51,35 @@ impl ListMenuKind {
 
     fn hint(self) -> Line<'static> {
         match self {
-            Self::Travel => Line::from("Up/Down route  Enter travel  Esc back  Ctrl+C quit"),
-            Self::Interact => Line::from("Up/Down target  Enter select  Esc back  Ctrl+C quit"),
+            Self::Travel => Line::from("Up/Down route  Enter travel  Esc back  F2 debug  Ctrl+C quit"),
+            Self::Interact => Line::from("Up/Down target  Enter select  Esc back  F2 debug  Ctrl+C quit"),
         }
     }
 
     fn len(self, snapshot: &UiSnapshot) -> usize {
-        match self {
-            Self::Travel => snapshot.routes.len(),
-            Self::Interact => snapshot.interactables.len(),
-        }
+        self.actions(snapshot).len()
     }
 
     fn items(self, snapshot: &UiSnapshot) -> Vec<ListItem<'static>> {
-        match self {
-            Self::Travel => list_items(
-                snapshot
-                    .routes
-                    .iter()
-                    .map(|route| render_route_label(snapshot.world_seed, route)),
-            ),
-            Self::Interact => list_items(
-                snapshot
-                    .interactables
-                    .iter()
-                    .map(|option| render_interactable_label(snapshot.world_seed, option)),
-            ),
-        }
+        list_items(
+            self.actions(snapshot)
+                .into_iter()
+                .map(|action| render_available_action_label(snapshot, action)),
+        )
+    }
+
+    fn actions(self, snapshot: &UiSnapshot) -> Vec<AvailableAction> {
+        snapshot
+            .available_actions
+            .iter()
+            .copied()
+            .filter(|action| match (self, action) {
+                (Self::Travel, AvailableAction::MoveTo { .. }) => true,
+                (Self::Interact, AvailableAction::SpeakTo { .. }) => true,
+                (Self::Interact, AvailableAction::InspectEntity { .. }) => true,
+                _ => false,
+            })
+            .collect()
     }
 }
 
@@ -182,6 +185,9 @@ struct App {
     notices: Vec<String>,
     wait_duration: TimeDelta,
     spinner_frame: usize,
+    debug_panel_open: bool,
+    last_snapshot: Option<UiSnapshot>,
+    last_backend_label: String,
 }
 
 impl App {
@@ -191,6 +197,9 @@ impl App {
             notices: Vec::new(),
             wait_duration: TimeDelta::from_minutes(1),
             spinner_frame: 0,
+            debug_panel_open: false,
+            last_snapshot: None,
+            last_backend_label: String::new(),
         }
     }
 
@@ -201,18 +210,25 @@ impl App {
     ) -> Result<()> {
         let game = Arc::new(Mutex::new(game));
         loop {
+            tokio::task::yield_now().await;
+
             if let Some(should_quit) = self.poll_pending(&game).await? {
                 if should_quit {
                     break;
                 }
             }
 
-            let (snapshot, backend_name) = {
-                let game = game.lock().await;
-                (game.snapshot(), game.backend_name())
+            let (snapshot, backend_label) = if matches!(self.state, UiState::Pending(_)) {
+                let snapshot = self
+                    .last_snapshot
+                    .clone()
+                    .expect("pending state should keep the previous snapshot");
+                (snapshot, self.last_backend_label.clone())
+            } else {
+                self.refresh_cached_view(&game).await?
             };
             self.sync_state(&snapshot);
-            terminal.draw(|frame| self.render(frame, &snapshot, backend_name))?;
+            terminal.draw(|frame| self.render(frame, &snapshot, &backend_label))?;
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
 
             if event::poll(Duration::from_millis(50))? {
@@ -230,6 +246,19 @@ impl App {
         Ok(())
     }
 
+    async fn refresh_cached_view<B: LlmBackend + Clone + 'static>(
+        &mut self,
+        game: &Arc<Mutex<GameService<B>>>,
+    ) -> Result<(UiSnapshot, String)> {
+        let (snapshot, backend_label) = {
+            let game = game.lock().await;
+            (game.snapshot(), game.backend_label())
+        };
+        self.last_snapshot = Some(snapshot.clone());
+        self.last_backend_label = backend_label.clone();
+        Ok((snapshot, backend_label))
+    }
+
     fn handle_key<B: LlmBackend + Clone + 'static>(
         &mut self,
         key: KeyEvent,
@@ -238,6 +267,10 @@ impl App {
     ) -> Result<bool> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(true);
+        }
+        if key.code == KeyCode::F(2) {
+            self.debug_panel_open = !self.debug_panel_open;
+            return Ok(false);
         }
 
         match &self.state {
@@ -277,37 +310,39 @@ impl App {
             }
             KeyCode::Enter => match menu.kind {
                 ListMenuKind::Travel => {
-                    if let Some(route) = snapshot.routes.get(menu.selected) {
+                    if let Some(AvailableAction::MoveTo { destination }) =
+                        menu.kind.actions(snapshot).get(menu.selected).copied()
+                    {
                         return self.execute_action(
                             game,
                             ActionRequest {
-                                actor_id: snapshot.actor_id,
-                                action: ActionKind::MoveTo {
-                                    destination: route.destination.id,
-                                },
+                                actor_id: snapshot.focused_actor_id,
+                                action: ActionKind::MoveTo { destination },
                             },
                             None,
                         );
                     }
                 }
                 ListMenuKind::Interact => {
-                    if let Some(interactable) = snapshot.interactables.get(menu.selected) {
-                        match interactable {
-                            Interactable::Talk(actor) => {
-                                self.state = UiState::Conversation(ConversationState::new(*actor));
+                    if let Some(action) = menu.kind.actions(snapshot).get(menu.selected).copied() {
+                        match action {
+                            AvailableAction::SpeakTo { target } => {
+                                if let Some(actor) = actor_view_from_interactables(snapshot, target) {
+                                    self.state =
+                                        UiState::Conversation(ConversationState::new(actor));
+                                }
                             }
-                            Interactable::Inspect(entity) => {
+                            AvailableAction::InspectEntity { entity_id } => {
                                 return self.execute_action(
                                     game,
                                     ActionRequest {
-                                        actor_id: snapshot.actor_id,
-                                        action: ActionKind::InspectEntity {
-                                            entity_id: entity.id,
-                                        },
+                                        actor_id: snapshot.focused_actor_id,
+                                        action: ActionKind::InspectEntity { entity_id },
                                     },
                                     None,
                                 );
                             }
+                            AvailableAction::MoveTo { .. } | AvailableAction::Wait => {}
                         }
                     }
                 }
@@ -335,7 +370,7 @@ impl App {
                 return self.execute_action(
                     game,
                     ActionRequest {
-                        actor_id: snapshot.actor_id,
+                        actor_id: snapshot.focused_actor_id,
                         action: ActionKind::Wait {
                             duration: self.wait_duration,
                         },
@@ -368,7 +403,7 @@ impl App {
                     return self.execute_action(
                         game,
                         ActionRequest {
-                            actor_id: snapshot.actor_id,
+                            actor_id: snapshot.focused_actor_id,
                             action: ActionKind::Speak {
                                 target: target.id,
                                 text: submitted,
@@ -395,6 +430,12 @@ impl App {
         action: ActionRequest,
         resume_conversation: Option<ActorView>,
     ) -> Result<bool> {
+        info!(
+            actor_id = action.actor_id.index(),
+            action = ?action.action,
+            resume_conversation = resume_conversation.as_ref().map(|actor| actor.id.index()),
+            "submitting action from tui"
+        );
         let (tx, rx) = oneshot::channel();
         let game = Arc::clone(game);
         self.state = UiState::Pending(PendingState {
@@ -430,13 +471,15 @@ impl App {
                         events,
                         should_quit,
                     }) => {
-                        let snapshot = {
-                            let game = game.lock().await;
-                            game.snapshot()
-                        };
+                        debug!(event_count = events.len(), should_quit, "pending action completed");
+                        let snapshot = self.refresh_cached_view(game).await?.0;
                         for event in &events {
                             if let Some(text) =
-                                render_event_notice(snapshot.world_seed, snapshot.actor_id, event)
+                                render_event_notice(
+                                    snapshot.world_seed,
+                                    snapshot.focused_actor_id,
+                                    event,
+                                )
                             {
                                 self.push_notice(text);
                             }
@@ -444,14 +487,12 @@ impl App {
                         should_quit
                     }
                     Err(error) => {
+                        error!(error = %error, "pending action failed");
                         self.push_notice(format!("Action failed: {error:#}"));
                         false
                     }
                 };
-                let snapshot = {
-                    let game = game.lock().await;
-                    game.snapshot()
-                };
+                let snapshot = self.refresh_cached_view(game).await?.0;
                 self.state = if let Some(target) = pending.resume_conversation {
                     if snapshot
                         .interactables
@@ -503,13 +544,23 @@ impl App {
         }
     }
 
-    fn render(&mut self, frame: &mut Frame, snapshot: &UiSnapshot, backend_name: &str) {
+    fn render(&mut self, frame: &mut Frame, snapshot: &UiSnapshot, backend_label: &str) {
         let layout = Layout::vertical([Constraint::Min(12), Constraint::Length(1)]);
-        let [world_area, command_area] = frame.area().layout(&layout);
+        let [body_area, command_area] = frame.area().layout(&layout);
+        let (world_area, debug_area) = if self.debug_panel_open {
+            let horizontal = Layout::horizontal([Constraint::Min(32), Constraint::Length(58)]);
+            let [world_area, debug_area] = body_area.layout(&horizontal);
+            (world_area, Some(debug_area))
+        } else {
+            (body_area, None)
+        };
 
         frame.render_widget(self.world_paragraph(snapshot), world_area);
         self.render_overlay(frame, snapshot, world_area);
-        frame.render_widget(self.command_bar(backend_name), command_area);
+        if let Some(debug_area) = debug_area {
+            frame.render_widget(self.debug_widget(snapshot), debug_area);
+        }
+        frame.render_widget(self.command_bar(backend_label), command_area);
 
         if let UiState::Conversation(conversation) = &self.state {
             let area = self.overlay_area(world_area, 72, 6);
@@ -639,17 +690,17 @@ impl App {
         match &self.state {
             UiState::Pending(_) => Line::from(vec![
                 "Ctrl+C".bold(),
-                " quit  ".into(),
+                " quit  F2 debug  ".into(),
                 Span::raw(format!("Waiting on {}...", backend_name)),
             ]),
             UiState::Conversation(_) => {
-                Line::from("Enter speak  Esc close panel  Left/Right move  Ctrl+C quit")
+                Line::from("Enter speak  Esc close panel  Left/Right move  F2 debug  Ctrl+C quit")
             }
             UiState::ListMenu(menu) => menu.kind.hint(),
             UiState::WaitMenu => {
-                Line::from("Left/Right +/-1s  Up/Down +/-1m  Enter wait  Esc back  Ctrl+C quit")
+                Line::from("Left/Right +/-1s  Up/Down +/-1m  Enter wait  Esc back  F2 debug  Ctrl+C quit")
             }
-            UiState::Idle => Line::from("g travel  e interact  w wait  Ctrl+C quit"),
+            UiState::Idle => Line::from("g travel  e interact  w wait  F2 debug  Ctrl+C quit"),
         }
     }
 
@@ -708,6 +759,12 @@ impl App {
         let [_, center, _] = mid.layout(&horizontal);
         center
     }
+
+    fn debug_widget(&self, snapshot: &UiSnapshot) -> Paragraph<'static> {
+        Paragraph::new(build_agent_debug_lines(snapshot))
+            .block(Block::bordered().title("Agent Debug"))
+            .wrap(Wrap { trim: false })
+    }
 }
 
 fn is_actionable_key_event(key: KeyEvent) -> bool {
@@ -737,4 +794,244 @@ fn selected_style() -> Style {
         .fg(Color::Black)
         .bg(Color::Yellow)
         .add_modifier(Modifier::BOLD)
+}
+
+fn render_available_action_label(snapshot: &UiSnapshot, action: AvailableAction) -> String {
+    match action {
+        AvailableAction::MoveTo { destination } => snapshot
+            .routes
+            .iter()
+            .find(|route| route.destination.id == destination)
+            .map(|route| render_route_label(snapshot.world_seed, route))
+            .unwrap_or_else(|| format!("Travel to {:?}", destination)),
+        AvailableAction::SpeakTo { target } => actor_view_from_interactables(snapshot, target)
+            .map(|actor| render_interactable_label(snapshot, &Interactable::Talk(actor)))
+            .unwrap_or_else(|| format!("Talk to {:?}", target)),
+        AvailableAction::InspectEntity { entity_id } => entity_interactable(snapshot, entity_id)
+            .map(|entity| render_interactable_label(snapshot, &Interactable::Inspect(entity)))
+            .unwrap_or_else(|| format!("Inspect {:?}", entity_id)),
+        AvailableAction::Wait => "Wait".to_string(),
+    }
+}
+
+fn actor_view_from_interactables(snapshot: &UiSnapshot, target: crate::world::ActorId) -> Option<ActorView> {
+    snapshot
+        .interactables
+        .iter()
+        .find_map(|interactable| match interactable {
+            Interactable::Talk(actor) if actor.id == target => Some(*actor),
+            _ => None,
+        })
+}
+
+fn entity_interactable(
+    snapshot: &UiSnapshot,
+    entity_id: crate::world::EntityId,
+) -> Option<crate::domain::events::EntitySummary> {
+    snapshot
+        .interactables
+        .iter()
+        .find_map(|interactable| match interactable {
+            Interactable::Inspect(entity) if entity.id == entity_id => Some(*entity),
+            _ => None,
+        })
+}
+
+fn build_agent_debug_lines(snapshot: &UiSnapshot) -> Vec<Line<'static>> {
+    if snapshot.agent_debug.is_empty() {
+        return vec![
+            Line::from("F2 toggles this panel."),
+            Line::from(""),
+            Line::from("No autonomous NPC agents are currently in this place."),
+        ];
+    }
+
+    let mut lines = vec![Line::from("F2 toggles this panel."), Line::from("")];
+    for (index, agent) in snapshot.agent_debug.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.extend(render_agent_debug_snapshot(snapshot, agent));
+    }
+    lines
+}
+
+fn render_agent_debug_snapshot(
+    snapshot: &UiSnapshot,
+    agent: &AgentDebugSnapshot,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(format!(
+        "{} | {}, {}",
+        agent.actor.id.name(snapshot.world_seed),
+        agent.actor.occupation.label(),
+        agent.actor.archetype.label()
+    ))];
+
+    let Some(trace) = &agent.trace else {
+        lines.push(Line::from("  No agent decision trace yet."));
+        return lines;
+    };
+
+    lines.push(Line::from(format!("  Backend: {}", trace.backend_name)));
+    lines.push(Line::from(format!(
+        "  Selected: {}",
+        trace.selected_action
+            .as_ref()
+            .map(|action| render_action_kind(snapshot, action))
+            .unwrap_or_else(|| "none".to_string())
+    )));
+    if let Some(error) = &trace.error {
+        lines.push(Line::from(format!("  Error: {}", clean_debug_text(error))));
+    }
+    lines.push(Line::from(format!(
+        "  Tools: {}",
+        if trace.toolset.is_empty() {
+            "none".to_string()
+        } else {
+            trace.toolset.join(", ")
+        }
+    )));
+    lines.push(Line::from(format!(
+        "  Available: {}",
+        if trace.available_actions.is_empty() {
+            "none".to_string()
+        } else {
+            trace.available_actions
+                .iter()
+                .map(|action| render_agent_available_action(snapshot, action))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        }
+    )));
+
+    if trace.recent_speech.is_empty() {
+        lines.push(Line::from("  Recent speech: none"));
+    } else {
+        lines.push(Line::from("  Recent speech:"));
+        for line in trace.recent_speech.iter().rev().take(4).rev() {
+            let speaker = match line.speaker {
+                crate::domain::events::DialogueSpeaker::Actor(actor_id)
+                    if actor_id == snapshot.focused_actor_id =>
+                {
+                    "You".to_string()
+                }
+                crate::domain::events::DialogueSpeaker::Actor(actor_id) => {
+                    actor_id.name(snapshot.world_seed)
+                }
+                crate::domain::events::DialogueSpeaker::System => "System".to_string(),
+            };
+            lines.push(Line::from(format!(
+                "    [{}] {}: {}",
+                line.timestamp.format(),
+                speaker,
+                clean_debug_text(&line.text)
+            )));
+        }
+    }
+
+    lines.push(Line::from("  Decision prompt:"));
+    for prompt_line in trace.prompt.lines().take(8) {
+        lines.push(Line::from(format!("    {}", clean_debug_text(prompt_line))));
+    }
+    if trace.prompt.lines().count() > 8 {
+        lines.push(Line::from("    ..."));
+    }
+
+    if let Some(model_output) = &trace.model_output {
+        lines.push(Line::from("  Model output:"));
+        for line in model_output.lines().take(6) {
+            lines.push(Line::from(format!("    {}", clean_debug_text(line))));
+        }
+        if model_output.lines().count() > 6 {
+            lines.push(Line::from("    ..."));
+        }
+    }
+
+    if trace.tool_calls.is_empty() {
+        lines.push(Line::from("  Tool calls: none"));
+    } else {
+        lines.push(Line::from("  Tool calls:"));
+        for call in &trace.tool_calls {
+            lines.push(Line::from(format!("    {}", call.tool_name)));
+            lines.push(Line::from(format!(
+                "      args {}",
+                compact_debug_block(&call.arguments)
+            )));
+            if let Some(result) = &call.result {
+                lines.push(Line::from(format!(
+                    "      => {}",
+                    compact_debug_block(result)
+                )));
+            }
+            if let Some(error) = &call.error {
+                lines.push(Line::from(format!(
+                    "      !! {}",
+                    clean_debug_text(error)
+                )));
+            }
+        }
+    }
+
+    lines
+}
+
+fn render_action_kind(snapshot: &UiSnapshot, action: &ActionKind) -> String {
+    match action {
+        ActionKind::MoveTo { destination } => snapshot
+            .routes
+            .iter()
+            .find(|route| route.destination.id == *destination)
+            .map(|route| format!("move_to {}", render_route_label(snapshot.world_seed, route)))
+            .unwrap_or_else(|| format!("move_to place#{}", destination.index())),
+        ActionKind::Speak { target, text } => {
+            format!(
+                "speak to {}: {}",
+                render_actor_debug_name(snapshot.world_seed, *target),
+                clean_debug_text(text)
+            )
+        }
+        ActionKind::InspectEntity { entity_id } => format!("inspect entity#{}", entity_id.index()),
+        ActionKind::Wait { duration } => format!("wait {}", format_duration(*duration)),
+        ActionKind::DoNothing => "do_nothing".to_string(),
+    }
+}
+
+fn render_agent_available_action(
+    snapshot: &UiSnapshot,
+    action: &crate::domain::commands::AgentAvailableAction,
+) -> String {
+    match action {
+        crate::domain::commands::AgentAvailableAction::MoveTo { destination } => {
+            format!("move_to place#{}", destination.index())
+        }
+        crate::domain::commands::AgentAvailableAction::SpeakTo { target } => {
+            format!("speak {}", render_actor_debug_name(snapshot.world_seed, *target))
+        }
+        crate::domain::commands::AgentAvailableAction::InspectEntity { entity_id } => {
+            format!("inspect entity#{}", entity_id.index())
+        }
+        crate::domain::commands::AgentAvailableAction::DoNothing => "do_nothing".to_string(),
+    }
+}
+
+fn clean_debug_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn compact_debug_block(text: &str) -> String {
+    let cleaned = clean_debug_text(text);
+    if cleaned.len() > 160 {
+        format!("{}...", &cleaned[..160])
+    } else {
+        cleaned
+    }
+}
+
+fn render_actor_debug_name(
+    world_seed: crate::domain::seed::WorldSeed,
+    actor_id: crate::world::ActorId,
+) -> String {
+    format!("{} (#{} )", actor_id.name(world_seed), actor_id.index())
+        .replace("(#", "(#")
+        .replace(" )", ")")
 }

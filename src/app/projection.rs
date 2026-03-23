@@ -1,5 +1,5 @@
 use crate::ai::context::{ActorContext, CityContext};
-use crate::app::query::{current_place_id, manual_actor_id};
+use crate::app::query::current_place_id;
 use crate::domain::events::{EntitySummary, PlaceSummary};
 use crate::simulation::{ActorView, CityView, GameState, Interactable, RouteView};
 use crate::world::{ActorId, CityId, EntityId, PlaceId, World};
@@ -43,10 +43,10 @@ pub fn city_view(world: &World, city_id: CityId) -> CityView {
     }
 }
 
-pub fn route_views(state: &GameState) -> Vec<RouteView> {
+pub fn route_views(state: &GameState, focused_actor_id: ActorId) -> Vec<RouteView> {
     state
         .world
-        .place_routes(current_place_id(state))
+        .place_routes(current_place_id(state, focused_actor_id))
         .iter()
         .map(|(place_id, route)| RouteView {
             destination: place_summary(&state.world, *place_id),
@@ -56,19 +56,18 @@ pub fn route_views(state: &GameState) -> Vec<RouteView> {
         .collect()
 }
 
-pub fn interactables(state: &GameState) -> Vec<Interactable> {
-    let manual_actor_id = manual_actor_id(state);
+pub fn interactables(state: &GameState, focused_actor_id: ActorId) -> Vec<Interactable> {
     let mut interactables = state
         .world
-        .place_actors(current_place_id(state))
+        .place_actors(current_place_id(state, focused_actor_id))
         .into_iter()
-        .filter(|actor_id| *actor_id != manual_actor_id)
+        .filter(|actor_id| *actor_id != focused_actor_id)
         .map(|actor_id| Interactable::Talk(actor_view(&state.world, actor_id)))
         .collect::<Vec<_>>();
     interactables.extend(
         state
             .world
-            .place_entities(current_place_id(state))
+            .place_entities(current_place_id(state, focused_actor_id))
             .into_iter()
             .map(|entity_id| Interactable::Inspect(entity_summary(&state.world, entity_id))),
     );

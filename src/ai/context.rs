@@ -1,24 +1,28 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::app::projection::{actor_context, city_context, place_summary};
-use crate::domain::events::{DialogueLine, PlaceSummary};
+use crate::app::projection::{actor_context, city_context, entity_summary, place_summary};
+use crate::domain::commands::AgentAvailableAction;
+use crate::domain::events::{DialogueLine, EntitySummary, PlaceSummary};
 use crate::domain::memory::ConversationMemory;
 use crate::domain::seed::WorldSeed;
-use crate::domain::time::GameTime;
+use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
 use crate::world::{ActorId, CityId, ControllerMode, World, place_name_from_parts};
 
+const RECENT_SPEECH_LIMIT: usize = 16;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ActorDialogueContext {
+pub struct ActorTurnContext {
     pub world_seed: WorldSeed,
     pub current_time: GameTime,
     pub city: CityContext,
     pub current_place: PlaceSummary,
     pub actor: ActorContext,
-    pub counterpart: ActorContext,
     pub memory: ConversationMemory,
-    pub turn: DialogueTurnContext,
+    pub local_state: LocalStateContext,
+    pub recent_speech: Vec<DialogueLine>,
+    pub available_actions: Vec<AgentAvailableAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,50 +67,84 @@ impl ActorContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DialogueTurnContext {
-    pub transcript: Vec<DialogueLine>,
-    pub speaker_input: String,
+pub struct LocalStateContext {
+    pub nearby_actors: Vec<ActorContext>,
+    pub nearby_entities: Vec<EntitySummary>,
+    pub routes: Vec<RouteContext>,
 }
 
-pub fn build_actor_dialogue_context(
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteContext {
+    pub destination: PlaceSummary,
+    pub travel_time: TimeDelta,
+}
+
+pub fn build_actor_turn_context(
     world: &World,
     current_time: GameTime,
-    city_id: CityId,
     actor_id: ActorId,
-    counterpart_id: ActorId,
-    memory: &ConversationMemory,
-    speaker_input: String,
-) -> Result<ActorDialogueContext> {
+    available_actions: Vec<AgentAvailableAction>,
+) -> Result<ActorTurnContext> {
     let place_id = world
         .actor_place_id(actor_id)
-        .ok_or_else(|| anyhow::anyhow!("dialogue actor is missing a place"))?;
-    if world.actor_place_id(counterpart_id) != Some(place_id) {
-        bail!("dialogue counterpart is no longer in the same place");
-    }
+        .ok_or_else(|| anyhow::anyhow!("turn actor is missing a place"))?;
+    let city_id = world
+        .place_city_id(place_id)
+        .ok_or_else(|| anyhow::anyhow!("turn actor place is missing a city"))?;
     if !world.city_ids().contains(&city_id) {
-        bail!("dialogue context city does not exist");
+        bail!("turn context city does not exist");
     }
     if !world.actor_ids().contains(&actor_id) {
-        bail!("dialogue context actor does not exist");
-    }
-    if !world.actor_ids().contains(&counterpart_id) {
-        bail!("dialogue context counterpart does not exist");
-    }
-    if world.place_city_id(place_id) != Some(city_id) {
-        bail!("dialogue context place does not belong to the provided city");
+        bail!("turn context actor does not exist");
     }
 
-    Ok(ActorDialogueContext {
+    let nearby_actor_ids = world
+        .place_actors(place_id)
+        .into_iter()
+        .filter(|candidate| *candidate != actor_id)
+        .collect::<Vec<_>>();
+    let local_state = LocalStateContext {
+        nearby_actors: nearby_actor_ids
+            .iter()
+            .copied()
+            .map(|nearby_actor_id| actor_context(world, nearby_actor_id))
+            .collect(),
+        nearby_entities: world
+            .place_entities(place_id)
+            .into_iter()
+            .map(|entity_id| entity_summary(world, entity_id))
+            .collect(),
+        routes: world
+            .place_routes(place_id)
+            .into_iter()
+            .map(|(destination_id, route)| RouteContext {
+                destination: place_summary(world, destination_id),
+                travel_time: route.travel_time,
+            })
+            .collect(),
+    };
+
+    let mut recent_speech = nearby_actor_ids
+        .iter()
+        .copied()
+        .flat_map(|nearby_actor_id| world.speech_lines_between(actor_id, nearby_actor_id, RECENT_SPEECH_LIMIT))
+        .collect::<Vec<_>>();
+    recent_speech.sort_by_key(|line| line.timestamp);
+    let speech_len = recent_speech.len();
+    let recent_speech = recent_speech
+        .into_iter()
+        .skip(speech_len.saturating_sub(RECENT_SPEECH_LIMIT))
+        .collect();
+
+    Ok(ActorTurnContext {
         world_seed: world.seed,
         current_time,
         city: city_context(world, city_id),
         current_place: place_summary(world, place_id),
         actor: actor_context(world, actor_id),
-        counterpart: actor_context(world, counterpart_id),
-        memory: memory.clone(),
-        turn: DialogueTurnContext {
-            transcript: world.speech_lines_between(actor_id, counterpart_id, 64),
-            speaker_input,
-        },
+        memory: world.actor_conversation_memory(actor_id).unwrap_or_default(),
+        local_state,
+        recent_speech,
+        available_actions,
     })
 }

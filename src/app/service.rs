@@ -1,32 +1,38 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Result, bail};
+use tracing::{debug, error, info, trace, warn};
 
-use crate::ai::context::build_actor_dialogue_context;
+use crate::ai::context::build_actor_turn_context;
 use crate::app::projection::{
     entity_summary as build_entity_summary, place_summary as build_place_summary,
 };
-use crate::app::query::manual_actor_id;
 use crate::app::read_model::build_ui_snapshot;
-use crate::domain::commands::{ActionKind, ActionRequest};
+use crate::domain::commands::{
+    ActionKind, ActionPlan, ActionRequest, AgentAvailableAction, AvailableAction, PlannedAction,
+};
 use crate::domain::events::{
-    ActionResult, ContextEntry, DialogueLine, DialogueSpeaker, EntitySummary, GameEvent,
-    PlaceSummary, SystemContext,
+    ActionResult, ContextEntry, DialogueLine, DialogueSpeaker, EntitySummary, GameEvent, PlaceSummary,
+    SystemContext,
 };
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
 use crate::llm::LlmBackend;
-use crate::simulation::GameState;
+use crate::simulation::{AgentDebugSnapshot, GameState};
 use crate::world::{ActorId, ControllerMode, EntityId, PlaceId, PlaceKind, World};
+use crate::llm::AgentDebugTrace;
+use crate::app::projection::actor_view as build_actor_view;
 
 const START_TIME: GameTime = GameTime::from_seconds(8 * 60 * 60);
 const INSPECT_TIME: TimeDelta = TimeDelta::from_seconds(10);
-
 #[derive(Debug)]
 pub struct GameService<B> {
     state: GameState,
     backend: B,
+    agent_debug_traces: BTreeMap<ActorId, AgentDebugTrace>,
 }
 
 impl<B: LlmBackend> GameService<B> {
@@ -65,36 +71,267 @@ impl<B: LlmBackend> GameService<B> {
             },
         );
         validate_world(&world)?;
+        info!(
+            backend = %backend.label(),
+            world_seed = seed.raw(),
+            manual_actor_id = actor_id.index(),
+            start_city_id = start_city_id.index(),
+            start_place_id = start_place_id.index(),
+            "initialized game service"
+        );
 
         Ok(Self {
             state: GameState { world },
             backend,
+            agent_debug_traces: BTreeMap::new(),
         })
     }
 
-    pub fn backend_name(&self) -> &'static str {
-        self.backend.name()
+    pub fn backend_label(&self) -> String {
+        self.backend.label()
     }
 
     pub fn snapshot(&self) -> crate::simulation::UiSnapshot {
-        build_ui_snapshot(&self.state)
+        self.snapshot_for(self.manual_actor_id())
     }
 
-    pub async fn apply_action(&mut self, request: ActionRequest) -> Result<ActionResult> {
+    pub fn snapshot_for(&self, focused_actor_id: ActorId) -> crate::simulation::UiSnapshot {
+        build_ui_snapshot(
+            &self.state,
+            focused_actor_id,
+            self.available_actions(focused_actor_id),
+            self.local_agent_debug_snapshots(focused_actor_id),
+        )
+    }
+
+    pub fn available_actions(&self, actor_id: ActorId) -> Vec<AvailableAction> {
+        let Some(place_id) = self.state.world.actor_place_id(actor_id) else {
+            return Vec::new();
+        };
+
+        let mut actions = self
+            .state
+            .world
+            .place_routes(place_id)
+            .into_iter()
+            .map(|(destination, _)| AvailableAction::MoveTo { destination })
+            .collect::<Vec<_>>();
+        actions.extend(
+            self.state
+                .world
+                .place_actors(place_id)
+                .into_iter()
+                .filter(|candidate| *candidate != actor_id)
+                .map(|target| AvailableAction::SpeakTo { target }),
+        );
+        actions.extend(
+            self.state
+                .world
+                .place_entities(place_id)
+                .into_iter()
+                .map(|entity_id| AvailableAction::InspectEntity { entity_id }),
+        );
+        actions.push(AvailableAction::Wait);
+        actions
+    }
+
+    pub fn available_agent_actions(&self, actor_id: ActorId) -> Vec<AgentAvailableAction> {
+        let Some(place_id) = self.state.world.actor_place_id(actor_id) else {
+            return vec![AgentAvailableAction::DoNothing];
+        };
+
+        let mut actions = self
+            .state
+            .world
+            .place_routes(place_id)
+            .into_iter()
+            .map(|(destination, _)| AgentAvailableAction::MoveTo { destination })
+            .collect::<Vec<_>>();
+        actions.extend(
+            self.state
+                .world
+                .place_actors(place_id)
+                .into_iter()
+                .filter(|candidate| *candidate != actor_id)
+                .map(|target| AgentAvailableAction::SpeakTo { target }),
+        );
+        actions.extend(
+            self.state
+                .world
+                .place_entities(place_id)
+                .into_iter()
+                .map(|entity_id| AgentAvailableAction::InspectEntity { entity_id }),
+        );
+        actions.push(AgentAvailableAction::DoNothing);
+        actions
+    }
+
+    pub fn plan_action(&self, request: ActionRequest) -> Result<ActionPlan> {
+        debug!(
+            actor_id = request.actor_id.index(),
+            action = ?request.action,
+            "planning action"
+        );
         if !self.state.world.actor_ids().contains(&request.actor_id) {
             bail!("Actor does not exist.");
         }
 
-        let events = match request.action {
-            ActionKind::MoveTo { destination } => self.move_to(request.actor_id, destination)?,
-            ActionKind::Speak { target, text } => self.speak(request.actor_id, target, text).await?,
+        let actor_place_id = self
+            .state
+            .world
+            .actor_place_id(request.actor_id)
+            .ok_or_else(|| anyhow::anyhow!("Actor is not in a place."))?;
+        let available_actions = self.available_actions(request.actor_id);
+
+        match request.action {
+            ActionKind::MoveTo { destination } => {
+                let route = self
+                    .state
+                    .world
+                    .place_routes(actor_place_id)
+                    .into_iter()
+                    .find_map(|(candidate, route)| (candidate == destination).then_some(route))
+                    .ok_or_else(|| anyhow::anyhow!("Selected route is no longer available."))?;
+                Ok(ActionPlan {
+                    actor_id: request.actor_id,
+                    duration: route.travel_time,
+                    action: PlannedAction::MoveTo {
+                        origin: actor_place_id,
+                        destination,
+                        route,
+                    },
+                })
+            }
+            ActionKind::Speak { target, text } => {
+                if !available_actions.contains(&AvailableAction::SpeakTo { target }) {
+                    bail!("That person is no longer here.");
+                }
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    bail!("You cannot say nothing.");
+                }
+                Ok(ActionPlan {
+                    actor_id: request.actor_id,
+                    duration: line_duration(trimmed),
+                    action: PlannedAction::Speak {
+                        place_id: actor_place_id,
+                        target,
+                        text: trimmed.to_string(),
+                    },
+                })
+            }
             ActionKind::InspectEntity { entity_id } => {
-                vec![self.inspect_entity(request.actor_id, entity_id)?]
+                if !available_actions.contains(&AvailableAction::InspectEntity { entity_id }) {
+                    bail!("That entity is no longer here.");
+                }
+                Ok(ActionPlan {
+                    actor_id: request.actor_id,
+                    duration: INSPECT_TIME,
+                    action: PlannedAction::InspectEntity {
+                        place_id: actor_place_id,
+                        entity_id,
+                    },
+                })
             }
             ActionKind::Wait { duration } => {
-                vec![self.wait_for(request.actor_id, duration.max(TimeDelta::ONE_SECOND))]
+                if !available_actions.contains(&AvailableAction::Wait) {
+                    bail!("This actor cannot wait right now.");
+                }
+                Ok(ActionPlan {
+                    actor_id: request.actor_id,
+                    duration: duration.max(TimeDelta::ONE_SECOND),
+                    action: PlannedAction::Wait {
+                        place_id: actor_place_id,
+                    },
+                })
+            }
+            ActionKind::DoNothing => Ok(ActionPlan {
+                actor_id: request.actor_id,
+                duration: TimeDelta::ZERO,
+                action: PlannedAction::DoNothing {
+                    place_id: actor_place_id,
+                },
+            }),
+        }
+    }
+
+    pub async fn choose_autonomous_action(&mut self, actor_id: ActorId) -> Result<Option<ActionRequest>> {
+        debug!(actor_id = actor_id.index(), "choosing autonomous action");
+        if !self.state.world.actor_ids().contains(&actor_id) {
+            bail!("Actor does not exist.");
+        }
+        if self.state.world.actor(actor_id).controller != ControllerMode::AiAgent {
+            return Ok(None);
+        }
+
+        let available_actions = self.available_agent_actions(actor_id);
+        let context = build_actor_turn_context(
+            &self.state.world,
+            self.current_time(),
+            actor_id,
+            available_actions,
+        )?;
+        trace!(
+            actor_id = actor_id.index(),
+            available_actions = ?context.available_actions,
+            recent_speech = ?context.recent_speech,
+            "built autonomous actor turn context"
+        );
+        let selection_started = Instant::now();
+        let selection = match self.backend.choose_action(&context).await {
+            Ok(selection) => selection,
+            Err(error) => {
+                let mut trace = AgentDebugTrace::from_context(&context, &self.backend.label());
+                trace.error = Some(error.to_string());
+                self.agent_debug_traces.insert(actor_id, trace);
+                error!(
+                    actor_id = actor_id.index(),
+                    error = %error,
+                    elapsed_ms = selection_started.elapsed().as_millis(),
+                    "autonomous action selection failed"
+                );
+                return Ok(None);
             }
         };
+        self.agent_debug_traces
+            .insert(actor_id, selection.trace.clone());
+        info!(
+            actor_id = actor_id.index(),
+            selected_action = ?selection.action,
+            tool_calls = selection.trace.tool_calls.len(),
+            elapsed_ms = selection_started.elapsed().as_millis(),
+            "autonomous actor selected action"
+        );
+
+        Ok(Some(ActionRequest {
+            actor_id,
+            action: selection.action,
+        }))
+    }
+
+    pub async fn apply_action(&mut self, request: ActionRequest) -> Result<ActionResult> {
+        info!(
+            actor_id = request.actor_id.index(),
+            action = ?request.action,
+            "applying action"
+        );
+        let actor_id = request.actor_id;
+        let plan = self.plan_action(request)?;
+        debug!(
+            actor_id = actor_id.index(),
+            duration_seconds = plan.duration.seconds(),
+            planned_action = ?plan.action,
+            "planned action"
+        );
+        let mut events = self.execute_plan(plan).await?;
+        if let Some(place_id) = self.state.world.actor_place_id(actor_id) {
+            events.extend(self.run_autonomous_turns(place_id).await?);
+        }
+        info!(
+            actor_id = actor_id.index(),
+            event_count = events.len(),
+            "action application complete"
+        );
         Ok(ActionResult {
             events,
             should_quit: false,
@@ -112,187 +349,184 @@ impl<B: LlmBackend> GameService<B> {
         let state = serde_json::from_str::<GameState>(&data)?;
         validate_world(&state.world)?;
         self.state = state;
+        self.agent_debug_traces.clear();
+        info!(path = %path.display(), "loaded game state");
         Ok(())
     }
 
-    async fn speak(
-        &mut self,
-        actor_id: ActorId,
-        target_id: ActorId,
-        text: String,
-    ) -> Result<Vec<GameEvent>> {
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Ok(Vec::new());
-        }
-        if actor_id == target_id {
-            bail!("You cannot talk to yourself.");
-        }
-
-        let actor_place_id = self
-            .state
-            .world
-            .actor_place_id(actor_id)
-            .ok_or_else(|| anyhow::anyhow!("Actor is not in a place."))?;
-        if self.state.world.actor_place_id(target_id) != Some(actor_place_id) {
-            bail!("That person is no longer here.");
-        }
-
-        let city_id = self
-            .state
-            .world
-            .place_city_id(actor_place_id)
-            .expect("actor place should belong to a city");
-        let started_at = self.current_time();
-        let actor_line = DialogueLine {
-            timestamp: started_at,
-            speaker: DialogueSpeaker::Actor(actor_id),
-            text: trimmed.to_string(),
-        };
-        let mut transcript = vec![actor_line.clone()];
-        let mut events = vec![GameEvent::SpeechLineRecorded { line: actor_line }];
-        let actor_duration = line_duration(trimmed);
-        let mut total_duration = actor_duration;
-
-        if self.state.world.actor(target_id).controller == ControllerMode::AiAgent {
-            let memory = self
-                .state
-                .world
-                .actor_conversation_memory(target_id)
-                .unwrap_or_default();
-            let context = build_actor_dialogue_context(
-                &self.state.world,
-                started_at,
-                city_id,
-                target_id,
-                actor_id,
-                &memory,
-                trimmed.to_string(),
-            )?;
-
-            let response = self.backend.generate_dialogue(&context).await?;
-            let response_duration = line_duration(&response.text);
-            let response_line = DialogueLine {
-                timestamp: started_at.advance(actor_duration),
-                speaker: DialogueSpeaker::Actor(target_id),
-                text: response.text,
-            };
-            total_duration = total_duration.saturating_add(response_duration);
-            transcript.push(response_line.clone());
-            events.push(GameEvent::SpeechLineRecorded {
-                line: response_line,
-            });
-        }
-
-        self.state.world.record_speech_process(
-            actor_id,
-            target_id,
-            actor_place_id,
-            started_at,
-            total_duration,
-            transcript.clone(),
+    async fn execute_plan(&mut self, plan: ActionPlan) -> Result<Vec<GameEvent>> {
+        debug!(
+            actor_id = plan.actor_id.index(),
+            duration_seconds = plan.duration.seconds(),
+            planned_action = ?plan.action,
+            "executing action plan"
         );
-        self.advance_time(total_duration);
-
-        let memory_summary = self.backend.summarize_memory(&transcript).await?;
-        self.state
-            .world
-            .merge_actor_conversation_memory(actor_id, memory_summary.clone());
-        self.state
-            .world
-            .merge_actor_conversation_memory(target_id, memory_summary);
-
-        Ok(events)
-    }
-
-    fn move_to(&mut self, actor_id: ActorId, destination_id: PlaceId) -> Result<Vec<GameEvent>> {
-        let current_place_id = self
-            .state
-            .world
-            .actor_place_id(actor_id)
-            .ok_or_else(|| anyhow::anyhow!("Actor is not in a place."))?;
-        let (resolved_destination_id, route) = self
-            .state
-            .world
-            .place_routes(current_place_id)
-            .into_iter()
-            .find(|(place_id, _)| *place_id == destination_id)
-            .ok_or_else(|| anyhow::anyhow!("Selected route is no longer available."))?;
-        let travel_time = route.travel_time;
-        let started_at = self.current_time();
-
-        self.state
-            .world
-            .record_travel_process(actor_id, resolved_destination_id, started_at, travel_time);
-        self.state.world.move_actor(actor_id, resolved_destination_id);
-        self.advance_time(travel_time);
-        self.learn_city(
-            actor_id,
-            self.state
-                .world
-                .place_city_id(resolved_destination_id)
-                .expect("destination should belong to a city"),
-        );
-
-        let destination = self.place_summary(resolved_destination_id);
-        let context_event = self.push_system_context(
-            actor_id,
-            self.current_time(),
-            SystemContext::Travel {
-                destination,
-                duration: travel_time,
-            },
-        );
-        Ok(vec![
-            context_event,
-            GameEvent::TravelCompleted {
+        match plan.action {
+            PlannedAction::MoveTo {
                 destination,
                 route,
-                duration: travel_time,
-            },
-        ])
+                ..
+            } => {
+                let started_at = self.current_time();
+                self.state.world.record_travel_process(
+                    plan.actor_id,
+                    destination,
+                    started_at,
+                    plan.duration,
+                );
+                self.state.world.move_actor(plan.actor_id, destination);
+                self.advance_time(plan.duration);
+                self.learn_city(
+                    plan.actor_id,
+                    self.state
+                        .world
+                        .place_city_id(destination)
+                        .expect("destination should belong to a city"),
+                );
+
+                let destination = self.place_summary(destination);
+                let context_event = self.push_system_context(
+                    plan.actor_id,
+                    self.current_time(),
+                    SystemContext::Travel {
+                        destination,
+                        duration: plan.duration,
+                    },
+                );
+                info!(
+                    actor_id = plan.actor_id.index(),
+                    destination_id = destination.id.index(),
+                    duration_seconds = plan.duration.seconds(),
+                    route_kind = route.kind.label(),
+                    "travel completed"
+                );
+                Ok(vec![
+                    context_event,
+                    GameEvent::TravelCompleted {
+                        destination,
+                        route,
+                        duration: plan.duration,
+                    },
+                ])
+            }
+            PlannedAction::Speak {
+                place_id,
+                target,
+                text,
+            } => {
+                let started_at = self.current_time();
+                let line = DialogueLine {
+                    timestamp: started_at,
+                    speaker: DialogueSpeaker::Actor(plan.actor_id),
+                    text,
+                };
+                self.state.world.record_speech_process(
+                    plan.actor_id,
+                    target,
+                    place_id,
+                    started_at,
+                    plan.duration,
+                    vec![line.clone()],
+                );
+                self.advance_time(plan.duration);
+
+                let transcript = self.state.world.speech_lines_between(plan.actor_id, target, 64);
+                let memory_summary = self.backend.summarize_memory(&transcript).await?;
+                self.state
+                    .world
+                    .merge_actor_conversation_memory(plan.actor_id, memory_summary.clone());
+                self.state
+                    .world
+                    .merge_actor_conversation_memory(target, memory_summary);
+                info!(
+                    actor_id = plan.actor_id.index(),
+                    target_id = target.index(),
+                    text = %line.text,
+                    duration_seconds = plan.duration.seconds(),
+                    "speech recorded"
+                );
+
+                Ok(vec![GameEvent::SpeechLineRecorded { line }])
+            }
+            PlannedAction::InspectEntity { entity_id, place_id } => {
+                let started_at = self.current_time();
+                self.state.world.record_inspect_process(
+                    plan.actor_id,
+                    entity_id,
+                    place_id,
+                    started_at,
+                    plan.duration,
+                );
+                self.advance_time(plan.duration);
+                info!(
+                    actor_id = plan.actor_id.index(),
+                    entity_id = entity_id.index(),
+                    duration_seconds = plan.duration.seconds(),
+                    "entity inspected"
+                );
+                Ok(vec![GameEvent::EntityInspected {
+                    entity: self.entity_summary(entity_id),
+                }])
+            }
+            PlannedAction::Wait { place_id } => {
+                let started_at = self.current_time();
+                self.state.world.record_waiting_process(
+                    plan.actor_id,
+                    place_id,
+                    started_at,
+                    plan.duration,
+                );
+                self.advance_time(plan.duration);
+                info!(
+                    actor_id = plan.actor_id.index(),
+                    duration_seconds = plan.duration.seconds(),
+                    "wait completed"
+                );
+                Ok(vec![GameEvent::WaitCompleted {
+                    duration: plan.duration,
+                    current_time: self.current_time(),
+                }])
+            }
+            PlannedAction::DoNothing { place_id } => {
+                self.state.world.record_do_nothing_process(
+                    plan.actor_id,
+                    place_id,
+                    self.current_time(),
+                );
+                info!(actor_id = plan.actor_id.index(), "actor chose do_nothing");
+                Ok(Vec::new())
+            }
+        }
     }
 
-    fn inspect_entity(&mut self, actor_id: ActorId, entity_id: EntityId) -> Result<GameEvent> {
-        let place_id = self
+    async fn run_autonomous_turns(&mut self, place_id: PlaceId) -> Result<Vec<GameEvent>> {
+        let mut events = Vec::new();
+        let ai_actors = self
             .state
             .world
-            .actor_place_id(actor_id)
-            .ok_or_else(|| anyhow::anyhow!("Actor is not in a place."))?;
-        let is_here = self.state.world.place_entities(place_id).contains(&entity_id);
-        if !is_here {
-            bail!("That entity is no longer here.");
-        }
-        let started_at = self.current_time();
-        self.state.world.record_inspect_process(
-            actor_id,
-            entity_id,
-            place_id,
-            started_at,
-            INSPECT_TIME,
+            .place_actors(place_id)
+            .into_iter()
+            .filter(|actor_id| self.state.world.actor(*actor_id).controller == ControllerMode::AiAgent)
+            .collect::<Vec<_>>();
+        debug!(
+            place_id = place_id.index(),
+            ai_actor_ids = ?ai_actors.iter().map(|id| id.index()).collect::<Vec<_>>(),
+            "running autonomous turns"
         );
-        self.advance_time(INSPECT_TIME);
-        Ok(GameEvent::EntityInspected {
-            entity: self.entity_summary(entity_id),
-        })
-    }
 
-    fn wait_for(&mut self, actor_id: ActorId, duration: TimeDelta) -> GameEvent {
-        let duration = duration.max(TimeDelta::ONE_SECOND);
-        let place_id = self
-            .state
-            .world
-            .actor_place_id(actor_id)
-            .expect("actor should occupy a place");
-        let started_at = self.current_time();
-        self.state
-            .world
-            .record_waiting_process(actor_id, place_id, started_at, duration);
-        self.advance_time(duration);
-        GameEvent::WaitCompleted {
-            duration,
-            current_time: self.current_time(),
+        for actor_id in ai_actors {
+            if self.state.world.actor_place_id(actor_id) != Some(place_id) {
+                warn!(actor_id = actor_id.index(), place_id = place_id.index(), "skipping autonomous actor that moved before its turn");
+                continue;
+            }
+            let Some(request) = self.choose_autonomous_action(actor_id).await? else {
+                continue;
+            };
+            let plan = self.plan_action(request)?;
+            events.extend(self.execute_plan(plan).await?);
         }
+
+        Ok(events)
     }
 
     fn push_system_context(
@@ -326,8 +560,39 @@ impl<B: LlmBackend> GameService<B> {
         self.state.world.current_time()
     }
 
+    fn local_agent_debug_snapshots(&self, focused_actor_id: ActorId) -> Vec<AgentDebugSnapshot> {
+        let Some(place_id) = self.state.world.actor_place_id(focused_actor_id) else {
+            return Vec::new();
+        };
+
+        self.state
+            .world
+            .place_actors(place_id)
+            .into_iter()
+            .filter(|actor_id| {
+                *actor_id != focused_actor_id
+                    && self.state.world.actor(*actor_id).controller == ControllerMode::AiAgent
+            })
+            .map(|actor_id| AgentDebugSnapshot {
+                actor: build_actor_view(&self.state.world, actor_id),
+                trace: self.agent_debug_traces.get(&actor_id).cloned(),
+            })
+            .collect()
+    }
+
     pub fn manual_actor_id(&self) -> ActorId {
-        manual_actor_id(&self.state)
+        self.state
+            .world
+            .manual_actor_id()
+            .expect("world should contain a manual actor")
+    }
+
+    pub fn actor_exists(&self, actor_id: ActorId) -> bool {
+        self.state.world.actor_ids().contains(&actor_id)
+    }
+
+    pub fn agent_debug_trace(&self, actor_id: ActorId) -> Option<AgentDebugTrace> {
+        self.agent_debug_traces.get(&actor_id).cloned()
     }
 
     fn place_summary(&self, place_id: PlaceId) -> PlaceSummary {
@@ -337,6 +602,7 @@ impl<B: LlmBackend> GameService<B> {
     fn entity_summary(&self, entity_id: EntityId) -> EntitySummary {
         build_entity_summary(&self.state.world, entity_id)
     }
+
 }
 
 fn line_duration(text: &str) -> TimeDelta {
@@ -360,7 +626,9 @@ mod tests {
     use petgraph::visit::EdgeRef;
     use serde_json::to_vec_pretty;
 
-    use crate::domain::commands::{ActionKind, ActionRequest};
+    use crate::domain::commands::{
+        ActionKind, ActionRequest, AgentAvailableAction, AvailableAction, PlannedAction,
+    };
     use crate::domain::events::GameEvent;
     use crate::domain::time::TimeDelta;
     use crate::llm::{LlmBackend, MockBackend};
@@ -381,7 +649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn speak_action_uses_typed_action_path() {
+    async fn speak_action_triggers_autonomous_ai_reply_turn() {
         let mut game = GameService::new(MockBackend).unwrap();
         let actor_id = game.manual_actor_id();
         let target_id = nearby_actor_id(&game);
@@ -397,18 +665,125 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            result
-                .events
-                .iter()
-                .any(|event| matches!(event, GameEvent::SpeechLineRecorded { .. }))
-        );
+        assert_eq!(result.events.len(), 2);
+        assert!(result
+            .events
+            .iter()
+            .all(|event| matches!(event, GameEvent::SpeechLineRecorded { .. })));
         assert!(
             game.snapshot()
                 .context_feed
                 .iter()
                 .any(|entry| matches!(entry, crate::domain::events::ContextEntry::Dialogue(_)))
         );
+        assert_eq!(
+            game.state.world.speech_lines_between(actor_id, target_id, 8).len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn choose_autonomous_action_can_choose_do_nothing() {
+        let mut game = GameService::new(MockBackend).unwrap();
+        let actor_id = game.manual_actor_id();
+        let target_id = nearby_actor_id(&game);
+
+        game.apply_action(ActionRequest {
+            actor_id,
+            action: ActionKind::Speak {
+                target: target_id,
+                text: "hello".to_string(),
+            },
+        })
+        .await
+        .unwrap();
+
+        let follow_up = game.choose_autonomous_action(target_id).await.unwrap();
+        assert!(matches!(
+            follow_up,
+            Some(ActionRequest {
+                actor_id,
+                action: ActionKind::DoNothing,
+            }) if actor_id == target_id
+        ));
+    }
+
+    #[test]
+    fn snapshot_for_renders_any_focused_actor() {
+        let game = GameService::new(MockBackend).unwrap();
+        let target_id = nearby_actor_id(&game);
+
+        let snapshot = game.snapshot_for(target_id);
+
+        assert_eq!(snapshot.focused_actor_id, target_id);
+        assert_eq!(snapshot.status.id, target_id);
+        assert!(
+            snapshot
+                .available_actions
+                .contains(&AvailableAction::Wait)
+        );
+    }
+
+    #[test]
+    fn available_actions_and_plan_action_share_the_same_surface() {
+        let game = GameService::new(MockBackend).unwrap();
+        let actor_id = game.manual_actor_id();
+        let actions = game.available_actions(actor_id);
+
+        let move_destination = actions
+            .iter()
+            .find_map(|action| match action {
+                AvailableAction::MoveTo { destination } => Some(*destination),
+                _ => None,
+            })
+            .expect("expected at least one move action");
+        let talk_target = actions
+            .iter()
+            .find_map(|action| match action {
+                AvailableAction::SpeakTo { target } => Some(*target),
+                _ => None,
+            })
+            .expect("expected at least one speak action");
+
+        let move_plan = game
+            .plan_action(ActionRequest {
+                actor_id,
+                action: ActionKind::MoveTo {
+                    destination: move_destination,
+                },
+            })
+            .unwrap();
+        let speak_plan = game
+            .plan_action(ActionRequest {
+                actor_id,
+                action: ActionKind::Speak {
+                    target: talk_target,
+                    text: "hello".to_string(),
+                },
+            })
+            .unwrap();
+
+        assert!(move_plan.duration > TimeDelta::ZERO);
+        assert!(matches!(
+            move_plan.action,
+            PlannedAction::MoveTo { destination, .. } if destination == move_destination
+        ));
+        assert!(matches!(
+            speak_plan.action,
+            PlannedAction::Speak { target, .. } if target == talk_target
+        ));
+    }
+
+    #[test]
+    fn agent_action_surface_exposes_do_nothing_but_not_wait() {
+        let game = GameService::new(MockBackend).unwrap();
+        let actor_id = nearby_actor_id(&game);
+        let actions = game.available_agent_actions(actor_id);
+
+        assert!(actions.contains(&AgentAvailableAction::DoNothing));
+        assert!(actions
+            .iter()
+            .any(|action| matches!(action, AgentAvailableAction::SpeakTo { .. })));
     }
 
     #[tokio::test]

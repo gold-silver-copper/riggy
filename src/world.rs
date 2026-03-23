@@ -181,6 +181,7 @@ pub enum ProcessKind {
     Travel,
     Waiting,
     Inspect,
+    DoNothing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -681,6 +682,20 @@ impl World {
                         ));
                     }
                 }
+                ProcessKind::DoNothing => {
+                    if self.process_actor_participants(process_id).len() != 1 {
+                        issues.push(format!(
+                            "do_nothing process {} should have exactly one actor participant",
+                            process_id.index()
+                        ));
+                    }
+                    if self.process_place(process_id).is_none() {
+                        issues.push(format!(
+                            "do_nothing process {} should occur at exactly one place",
+                            process_id.index()
+                        ));
+                    }
+                }
             }
         }
 
@@ -1145,6 +1160,28 @@ impl World {
             process_id.0,
             entity_id.0,
             WorldRelation::Targets,
+        );
+        add_edge(
+            &mut self.graph,
+            process_id.0,
+            place_id.0,
+            WorldRelation::OccursAt,
+        );
+        process_id
+    }
+
+    pub fn record_do_nothing_process(
+        &mut self,
+        actor_id: ActorId,
+        place_id: PlaceId,
+        started_at: GameTime,
+    ) -> ProcessId {
+        let process_id = self.add_process(ProcessKind::DoNothing, started_at, TimeDelta::ZERO);
+        add_edge(
+            &mut self.graph,
+            process_id.0,
+            actor_id.0,
+            WorldRelation::Participates,
         );
         add_edge(
             &mut self.graph,
