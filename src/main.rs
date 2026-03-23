@@ -1,4 +1,8 @@
-use riggy::{app::service::GameService, llm::{AnyBackend, LlmBackend}, logging, tui};
+use riggy::{
+    app::service::GameService,
+    llm::{AnyBackend, LlmBackend},
+    logging, tui,
+};
 use tracing::info;
 
 #[tokio::main]

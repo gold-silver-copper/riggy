@@ -127,7 +127,9 @@ pub fn build_actor_turn_context(
     let mut recent_speech = nearby_actor_ids
         .iter()
         .copied()
-        .flat_map(|nearby_actor_id| world.speech_lines_between(actor_id, nearby_actor_id, RECENT_SPEECH_LIMIT))
+        .flat_map(|nearby_actor_id| {
+            world.speech_lines_between(actor_id, nearby_actor_id, RECENT_SPEECH_LIMIT)
+        })
         .collect::<Vec<_>>();
     recent_speech.sort_by_key(|line| line.timestamp);
     let speech_len = recent_speech.len();
@@ -142,7 +144,9 @@ pub fn build_actor_turn_context(
         city: city_context(world, city_id),
         current_place: place_summary(world, place_id),
         actor: actor_context(world, actor_id),
-        memory: world.actor_conversation_memory(actor_id).unwrap_or_default(),
+        memory: world
+            .actor_conversation_memory(actor_id)
+            .unwrap_or_default(),
         local_state,
         recent_speech,
         available_actions,

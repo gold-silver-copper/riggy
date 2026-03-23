@@ -141,7 +141,8 @@ impl LlmBackend for MockBackend {
         let mut trace = AgentDebugTrace::from_context(context, self.name());
         let Some((speaker_id, speaker_input)) = latest_inbound_speech(context) else {
             trace.toolset = vec!["do_nothing".to_string()];
-            trace.model_output = Some("mock policy: no recent inbound speech, staying idle".to_string());
+            trace.model_output =
+                Some("mock policy: no recent inbound speech, staying idle".to_string());
             trace.selected_action = Some(ActionKind::DoNothing);
             return Ok(ActionSelection {
                 action: ActionKind::DoNothing,
@@ -490,7 +491,9 @@ impl RigBackend {
                     "conversation request ended after committed-action grace period"
                 );
             }
-            None => unreachable!("conversation request should either complete, time out, or cancel after commit"),
+            None => unreachable!(
+                "conversation request should either complete, time out, or cancel after commit"
+            ),
         }
 
         if selected.is_none() && matches!(action, ActionKind::DoNothing) {
@@ -590,7 +593,6 @@ impl RigBackend {
             }
         }
     }
-
 }
 
 impl LlmBackend for RigBackend {
@@ -724,7 +726,13 @@ impl Tool for ReplyToSpeakerTool {
         let text = args.text.trim();
         if text.is_empty() {
             let error = "reply_to_speaker requires non-empty text".to_string();
-            push_tool_trace(&self.tool_calls, Self::NAME, &args, None, Some(error.clone()));
+            push_tool_trace(
+                &self.tool_calls,
+                Self::NAME,
+                &args,
+                None,
+                Some(error.clone()),
+            );
             return Err(IoError::other(error));
         }
 
@@ -738,7 +746,13 @@ impl Tool for ReplyToSpeakerTool {
             .map_err(|_| IoError::other("selected action lock poisoned"))?;
         if guard.is_some() {
             let error = "an action was already selected".to_string();
-            push_tool_trace(&self.tool_calls, Self::NAME, &args, None, Some(error.clone()));
+            push_tool_trace(
+                &self.tool_calls,
+                Self::NAME,
+                &args,
+                None,
+                Some(error.clone()),
+            );
             return Err(IoError::other(error));
         }
         *guard = Some(action.clone());
@@ -769,10 +783,7 @@ struct DoNothingTool {
 }
 
 impl DoNothingTool {
-    fn new(
-        selected_action: Arc<Mutex<Option<ActionKind>>>,
-        tool_calls: ToolTraceSink,
-    ) -> Self {
+    fn new(selected_action: Arc<Mutex<Option<ActionKind>>>, tool_calls: ToolTraceSink) -> Self {
         Self {
             selected_action,
             tool_calls,
@@ -805,7 +816,13 @@ impl Tool for DoNothingTool {
             .map_err(|_| IoError::other("selected action lock poisoned"))?;
         if guard.is_some() {
             let error = "an action was already selected".to_string();
-            push_tool_trace(&self.tool_calls, Self::NAME, &args, None, Some(error.clone()));
+            push_tool_trace(
+                &self.tool_calls,
+                Self::NAME,
+                &args,
+                None,
+                Some(error.clone()),
+            );
             return Err(IoError::other(error));
         }
 
@@ -1063,7 +1080,9 @@ mod tests {
         let actor_id = world
             .actor_ids()
             .into_iter()
-            .find(|candidate| world.actor(*candidate).controller == crate::world::ControllerMode::AiAgent)
+            .find(|candidate| {
+                world.actor(*candidate).controller == crate::world::ControllerMode::AiAgent
+            })
             .unwrap();
         let context = build_actor_turn_context(
             &world,

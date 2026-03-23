@@ -68,11 +68,18 @@ fn render_recent_speech(context: &ActorTurnContext) -> String {
         .iter()
         .map(|line| {
             let speaker = match line.speaker {
-                DialogueSpeaker::Actor(actor_id) if actor_id == context.actor.id => "you".to_string(),
+                DialogueSpeaker::Actor(actor_id) if actor_id == context.actor.id => {
+                    "you".to_string()
+                }
                 DialogueSpeaker::Actor(actor_id) => actor_id.name(context.world_seed),
                 DialogueSpeaker::System => "system".to_string(),
             };
-            format!("- {} at {}: {}", speaker, line.timestamp.format(), line.text)
+            format!(
+                "- {} at {}: {}",
+                speaker,
+                line.timestamp.format(),
+                line.text
+            )
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -140,16 +147,28 @@ fn render_available_actions(world_seed: WorldSeed, context: &ActorTurnContext) -
             AgentAvailableAction::MoveTo { destination } => format!(
                 "- move_to destination={} ({})",
                 destination.index(),
-                render_place(world_seed, context.local_state.routes.iter().find_map(|route| {
-                    (route.destination.id == *destination).then_some(route.destination)
-                }).unwrap_or(PlaceSummary {
-                    id: *destination,
-                    city_id: context.current_place.city_id,
-                    kind: context.current_place.kind,
-                }))
+                render_place(
+                    world_seed,
+                    context
+                        .local_state
+                        .routes
+                        .iter()
+                        .find_map(|route| {
+                            (route.destination.id == *destination).then_some(route.destination)
+                        })
+                        .unwrap_or(PlaceSummary {
+                            id: *destination,
+                            city_id: context.current_place.city_id,
+                            kind: context.current_place.kind,
+                        })
+                )
             ),
             AgentAvailableAction::SpeakTo { target } => {
-                format!("- speak target={} ({})", target.index(), target.name(world_seed))
+                format!(
+                    "- speak target={} ({})",
+                    target.index(),
+                    target.name(world_seed)
+                )
             }
             AgentAvailableAction::InspectEntity { entity_id } => {
                 format!("- inspect_entity entity_id={}", entity_id.index())

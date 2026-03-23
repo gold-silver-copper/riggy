@@ -201,7 +201,7 @@ mod cco_tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use super::cco::{self, artifact, event, CcoClassId, CcoModule, CcoRelation};
+    use super::cco::{self, CcoClassId, CcoModule, CcoRelation, artifact, event};
     use super::{BfoClass, RelationKind};
 
     fn ofn_path() -> PathBuf {
@@ -241,13 +241,22 @@ mod cco_tests {
             CcoClassId::from_id("ont00000001"),
             Some(artifact::ArtifactClass::DeflectingPrism.into())
         );
-        assert_eq!(artifact::ArtifactClass::DeflectingPrism.label(), "Deflecting Prism");
         assert_eq!(
-            artifact::ArtifactClass::DeflectingPrism.class().definition(),
-            Some("A Prism designed to deflect a beam of light entering the Prism by a fixed angle.")
+            artifact::ArtifactClass::DeflectingPrism.label(),
+            "Deflecting Prism"
         );
         assert_eq!(
-            artifact::ArtifactClass::DeflectingPrism.class().direct_cco_parents(),
+            artifact::ArtifactClass::DeflectingPrism
+                .class()
+                .definition(),
+            Some(
+                "A Prism designed to deflect a beam of light entering the Prism by a fixed angle."
+            )
+        );
+        assert_eq!(
+            artifact::ArtifactClass::DeflectingPrism
+                .class()
+                .direct_cco_parents(),
             &[artifact::ArtifactClass::Prism.into()]
         );
         assert_eq!(
@@ -263,9 +272,11 @@ mod cco_tests {
             CcoModule::Artifact
         );
         assert_eq!(event::EventClass::Change.module(), CcoModule::Event);
-        assert!(CcoModule::Artifact
-            .classes()
-            .contains(&artifact::ArtifactClass::Prism.into()));
+        assert!(
+            CcoModule::Artifact
+                .classes()
+                .contains(&artifact::ArtifactClass::Prism.into())
+        );
         assert!(artifact::ArtifactClass::from_id("ont00000001").is_some());
         assert!(event::EventClass::from_id("ont00000001").is_none());
     }

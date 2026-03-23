@@ -18,8 +18,8 @@ use crate::domain::events::ActionResult;
 use crate::domain::time::TimeDelta;
 use crate::llm::LlmBackend;
 use crate::presenter::{
-    build_world_text, build_world_title, format_duration, render_event_notice,
-    render_interactable_label, render_route_label,
+    build_world_text, build_world_title, format_duration, render_interactable_label,
+    render_route_label,
 };
 use crate::simulation::{ActorView, AgentDebugSnapshot, Interactable, UiSnapshot};
 
@@ -51,8 +51,12 @@ impl ListMenuKind {
 
     fn hint(self) -> Line<'static> {
         match self {
-            Self::Travel => Line::from("Up/Down route  Enter travel  Esc back  F2 debug  Ctrl+C quit"),
-            Self::Interact => Line::from("Up/Down target  Enter select  Esc back  F2 debug  Ctrl+C quit"),
+            Self::Travel => {
+                Line::from("Up/Down route  Enter travel  Esc back  F2 debug  Ctrl+C quit")
+            }
+            Self::Interact => {
+                Line::from("Up/Down target  Enter select  Esc back  F2 debug  Ctrl+C quit")
+            }
         }
     }
 
@@ -327,7 +331,8 @@ impl App {
                     if let Some(action) = menu.kind.actions(snapshot).get(menu.selected).copied() {
                         match action {
                             AvailableAction::SpeakTo { target } => {
-                                if let Some(actor) = actor_view_from_interactables(snapshot, target) {
+                                if let Some(actor) = actor_view_from_interactables(snapshot, target)
+                                {
                                     self.state =
                                         UiState::Conversation(ConversationState::new(actor));
                                 }
@@ -471,19 +476,10 @@ impl App {
                         events,
                         should_quit,
                     }) => {
-                        debug!(event_count = events.len(), should_quit, "pending action completed");
-                        let snapshot = self.refresh_cached_view(game).await?.0;
-                        for event in &events {
-                            if let Some(text) =
-                                render_event_notice(
-                                    snapshot.world_seed,
-                                    snapshot.focused_actor_id,
-                                    event,
-                                )
-                            {
-                                self.push_notice(text);
-                            }
-                        }
+                        debug!(
+                            event_count = events.len(),
+                            should_quit, "pending action completed"
+                        );
                         should_quit
                     }
                     Err(error) => {
@@ -697,9 +693,9 @@ impl App {
                 Line::from("Enter speak  Esc close panel  Left/Right move  F2 debug  Ctrl+C quit")
             }
             UiState::ListMenu(menu) => menu.kind.hint(),
-            UiState::WaitMenu => {
-                Line::from("Left/Right +/-1s  Up/Down +/-1m  Enter wait  Esc back  F2 debug  Ctrl+C quit")
-            }
+            UiState::WaitMenu => Line::from(
+                "Left/Right +/-1s  Up/Down +/-1m  Enter wait  Esc back  F2 debug  Ctrl+C quit",
+            ),
             UiState::Idle => Line::from("g travel  e interact  w wait  F2 debug  Ctrl+C quit"),
         }
     }
@@ -814,7 +810,10 @@ fn render_available_action_label(snapshot: &UiSnapshot, action: AvailableAction)
     }
 }
 
-fn actor_view_from_interactables(snapshot: &UiSnapshot, target: crate::world::ActorId) -> Option<ActorView> {
+fn actor_view_from_interactables(
+    snapshot: &UiSnapshot,
+    target: crate::world::ActorId,
+) -> Option<ActorView> {
     snapshot
         .interactables
         .iter()
@@ -875,7 +874,8 @@ fn render_agent_debug_snapshot(
     lines.push(Line::from(format!("  Backend: {}", trace.backend_name)));
     lines.push(Line::from(format!(
         "  Selected: {}",
-        trace.selected_action
+        trace
+            .selected_action
             .as_ref()
             .map(|action| render_action_kind(snapshot, action))
             .unwrap_or_else(|| "none".to_string())
@@ -896,7 +896,8 @@ fn render_agent_debug_snapshot(
         if trace.available_actions.is_empty() {
             "none".to_string()
         } else {
-            trace.available_actions
+            trace
+                .available_actions
                 .iter()
                 .map(|action| render_agent_available_action(snapshot, action))
                 .collect::<Vec<_>>()
@@ -964,10 +965,7 @@ fn render_agent_debug_snapshot(
                 )));
             }
             if let Some(error) = &call.error {
-                lines.push(Line::from(format!(
-                    "      !! {}",
-                    clean_debug_text(error)
-                )));
+                lines.push(Line::from(format!("      !! {}", clean_debug_text(error))));
             }
         }
     }
@@ -1005,7 +1003,10 @@ fn render_agent_available_action(
             format!("move_to place#{}", destination.index())
         }
         crate::domain::commands::AgentAvailableAction::SpeakTo { target } => {
-            format!("speak {}", render_actor_debug_name(snapshot.world_seed, *target))
+            format!(
+                "speak {}",
+                render_actor_debug_name(snapshot.world_seed, *target)
+            )
         }
         crate::domain::commands::AgentAvailableAction::InspectEntity { entity_id } => {
             format!("inspect entity#{}", entity_id.index())

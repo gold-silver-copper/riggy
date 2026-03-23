@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::ai::context::build_actor_turn_context;
+use crate::app::projection::actor_view as build_actor_view;
 use crate::app::projection::{
     entity_summary as build_entity_summary, place_summary as build_place_summary,
 };
@@ -15,16 +16,15 @@ use crate::domain::commands::{
     ActionKind, ActionPlan, ActionRequest, AgentAvailableAction, AvailableAction, PlannedAction,
 };
 use crate::domain::events::{
-    ActionResult, ContextEntry, DialogueLine, DialogueSpeaker, EntitySummary, GameEvent, PlaceSummary,
-    SystemContext,
+    ActionResult, ContextEntry, DialogueLine, DialogueSpeaker, EntitySummary, GameEvent,
+    PlaceSummary, SystemContext,
 };
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
+use crate::llm::AgentDebugTrace;
 use crate::llm::LlmBackend;
 use crate::simulation::{AgentDebugSnapshot, GameState};
-use crate::world::{ActorId, ControllerMode, EntityId, PlaceId, PlaceKind, World};
-use crate::llm::AgentDebugTrace;
-use crate::app::projection::actor_view as build_actor_view;
+use crate::world::{ActorId, ControllerMode, EntityId, PlaceId, World};
 
 const START_TIME: GameTime = GameTime::from_seconds(8 * 60 * 60);
 const INSPECT_TIME: TimeDelta = TimeDelta::from_seconds(10);
@@ -37,23 +37,22 @@ pub struct GameService<B> {
 
 impl<B: LlmBackend> GameService<B> {
     pub fn new(backend: B) -> Result<Self> {
-        let seed = WorldSeed::new(42);
+        Self::new_with_seed(backend, current_world_seed())
+    }
+
+    pub fn new_with_seed(backend: B, seed: WorldSeed) -> Result<Self> {
         let mut world = World::generate(seed, 18);
         let actor_id = world
             .manual_actor_id()
             .expect("generated world should contain a manual actor");
-        let start_city_id = world.actor_city_id(actor_id).unwrap_or_else(|| world.city_ids()[0]);
+        let start_city_id = world
+            .actor_city_id(actor_id)
+            .unwrap_or_else(|| world.city_ids()[0]);
         let city_places = world.city_places(start_city_id);
         let start_place_id = city_places
             .iter()
             .copied()
-            .find(|place_id| matches!(world.place(*place_id).kind, PlaceKind::Residence))
-            .or_else(|| {
-                city_places
-                    .iter()
-                    .copied()
-                    .find(|place_id| world.place(*place_id).kind.supports_people())
-            })
+            .find(|place_id| world.place(*place_id).kind.supports_people())
             .or_else(|| city_places.first().copied())
             .expect("generated city should have places");
         world.set_actor_home(actor_id, start_place_id);
@@ -63,13 +62,6 @@ impl<B: LlmBackend> GameService<B> {
         for city_id in world.city_connections(start_city_id) {
             world.discover_city(actor_id, city_id, START_TIME);
         }
-        world.append_context_entry(
-            actor_id,
-            ContextEntry::System {
-                timestamp: START_TIME,
-                context: SystemContext::Start,
-            },
-        );
         validate_world(&world)?;
         info!(
             backend = %backend.label(),
@@ -255,7 +247,10 @@ impl<B: LlmBackend> GameService<B> {
         }
     }
 
-    pub async fn choose_autonomous_action(&mut self, actor_id: ActorId) -> Result<Option<ActionRequest>> {
+    pub async fn choose_autonomous_action(
+        &mut self,
+        actor_id: ActorId,
+    ) -> Result<Option<ActionRequest>> {
         debug!(actor_id = actor_id.index(), "choosing autonomous action");
         if !self.state.world.actor_ids().contains(&actor_id) {
             bail!("Actor does not exist.");
@@ -363,9 +358,7 @@ impl<B: LlmBackend> GameService<B> {
         );
         match plan.action {
             PlannedAction::MoveTo {
-                destination,
-                route,
-                ..
+                destination, route, ..
             } => {
                 let started_at = self.current_time();
                 self.state.world.record_travel_process(
@@ -430,7 +423,10 @@ impl<B: LlmBackend> GameService<B> {
                 );
                 self.advance_time(plan.duration);
 
-                let transcript = self.state.world.speech_lines_between(plan.actor_id, target, 64);
+                let transcript = self
+                    .state
+                    .world
+                    .speech_lines_between(plan.actor_id, target, 64);
                 let memory_summary = self.backend.summarize_memory(&transcript).await?;
                 self.state
                     .world
@@ -448,7 +444,10 @@ impl<B: LlmBackend> GameService<B> {
 
                 Ok(vec![GameEvent::SpeechLineRecorded { line }])
             }
-            PlannedAction::InspectEntity { entity_id, place_id } => {
+            PlannedAction::InspectEntity {
+                entity_id,
+                place_id,
+            } => {
                 let started_at = self.current_time();
                 self.state.world.record_inspect_process(
                     plan.actor_id,
@@ -464,9 +463,13 @@ impl<B: LlmBackend> GameService<B> {
                     duration_seconds = plan.duration.seconds(),
                     "entity inspected"
                 );
-                Ok(vec![GameEvent::EntityInspected {
-                    entity: self.entity_summary(entity_id),
-                }])
+                let entity = self.entity_summary(entity_id);
+                let context_event = self.push_system_context(
+                    plan.actor_id,
+                    self.current_time(),
+                    SystemContext::Inspect { entity },
+                );
+                Ok(vec![context_event, GameEvent::EntityInspected { entity }])
             }
             PlannedAction::Wait { place_id } => {
                 let started_at = self.current_time();
@@ -482,10 +485,22 @@ impl<B: LlmBackend> GameService<B> {
                     duration_seconds = plan.duration.seconds(),
                     "wait completed"
                 );
-                Ok(vec![GameEvent::WaitCompleted {
-                    duration: plan.duration,
-                    current_time: self.current_time(),
-                }])
+                let current_time = self.current_time();
+                let context_event = self.push_system_context(
+                    plan.actor_id,
+                    current_time,
+                    SystemContext::Wait {
+                        duration: plan.duration,
+                        current_time,
+                    },
+                );
+                Ok(vec![
+                    context_event,
+                    GameEvent::WaitCompleted {
+                        duration: plan.duration,
+                        current_time,
+                    },
+                ])
             }
             PlannedAction::DoNothing { place_id } => {
                 self.state.world.record_do_nothing_process(
@@ -506,7 +521,9 @@ impl<B: LlmBackend> GameService<B> {
             .world
             .place_actors(place_id)
             .into_iter()
-            .filter(|actor_id| self.state.world.actor(*actor_id).controller == ControllerMode::AiAgent)
+            .filter(|actor_id| {
+                self.state.world.actor(*actor_id).controller == ControllerMode::AiAgent
+            })
             .collect::<Vec<_>>();
         debug!(
             place_id = place_id.index(),
@@ -516,7 +533,11 @@ impl<B: LlmBackend> GameService<B> {
 
         for actor_id in ai_actors {
             if self.state.world.actor_place_id(actor_id) != Some(place_id) {
-                warn!(actor_id = actor_id.index(), place_id = place_id.index(), "skipping autonomous actor that moved before its turn");
+                warn!(
+                    actor_id = actor_id.index(),
+                    place_id = place_id.index(),
+                    "skipping autonomous actor that moved before its turn"
+                );
                 continue;
             }
             let Some(request) = self.choose_autonomous_action(actor_id).await? else {
@@ -536,7 +557,9 @@ impl<B: LlmBackend> GameService<B> {
         context: SystemContext,
     ) -> GameEvent {
         let entry = ContextEntry::System { timestamp, context };
-        self.state.world.append_context_entry(actor_id, entry.clone());
+        self.state
+            .world
+            .append_context_entry(actor_id, entry.clone());
         GameEvent::ContextAppended { entry }
     }
 
@@ -602,7 +625,13 @@ impl<B: LlmBackend> GameService<B> {
     fn entity_summary(&self, entity_id: EntityId) -> EntitySummary {
         build_entity_summary(&self.state.world, entity_id)
     }
+}
 
+fn current_world_seed() -> WorldSeed {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    WorldSeed::new(duration.as_nanos() as u64)
 }
 
 fn line_duration(text: &str) -> TimeDelta {
@@ -623,17 +652,17 @@ fn validate_world(world: &World) -> Result<()> {
 mod tests {
     use std::path::Path;
 
-    use petgraph::visit::EdgeRef;
     use serde_json::to_vec_pretty;
 
     use crate::domain::commands::{
         ActionKind, ActionRequest, AgentAvailableAction, AvailableAction, PlannedAction,
     };
     use crate::domain::events::GameEvent;
+    use crate::domain::seed::WorldSeed;
     use crate::domain::time::TimeDelta;
     use crate::llm::{LlmBackend, MockBackend};
     use crate::simulation::Interactable;
-    use crate::world::{WorldNode, WorldRelation};
+    use crate::world::WorldRelation;
 
     use super::GameService;
 
@@ -648,9 +677,39 @@ mod tests {
             .expect("expected a nearby actor")
     }
 
+    fn place_with_entity<B: LlmBackend>(
+        game: &GameService<B>,
+    ) -> Option<(crate::world::PlaceId, crate::world::EntityId)> {
+        game.state.world.city_ids().into_iter().find_map(|city_id| {
+            game.state
+                .world
+                .city_places(city_id)
+                .into_iter()
+                .find_map(|place_id| {
+                    game.state
+                        .world
+                        .place_entities(place_id)
+                        .into_iter()
+                        .next()
+                        .map(|entity_id| (place_id, entity_id))
+                })
+        })
+    }
+
+    fn test_game() -> GameService<MockBackend> {
+        GameService::new_with_seed(MockBackend, WorldSeed::new(42)).unwrap()
+    }
+
+    #[test]
+    fn new_game_starts_with_empty_recent_activity() {
+        let game = test_game();
+
+        assert!(game.snapshot().context_feed.is_empty());
+    }
+
     #[tokio::test]
     async fn speak_action_triggers_autonomous_ai_reply_turn() {
-        let mut game = GameService::new(MockBackend).unwrap();
+        let mut game = test_game();
         let actor_id = game.manual_actor_id();
         let target_id = nearby_actor_id(&game);
 
@@ -666,10 +725,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.events.len(), 2);
-        assert!(result
-            .events
-            .iter()
-            .all(|event| matches!(event, GameEvent::SpeechLineRecorded { .. })));
+        assert!(
+            result
+                .events
+                .iter()
+                .all(|event| matches!(event, GameEvent::SpeechLineRecorded { .. }))
+        );
         assert!(
             game.snapshot()
                 .context_feed
@@ -677,14 +738,17 @@ mod tests {
                 .any(|entry| matches!(entry, crate::domain::events::ContextEntry::Dialogue(_)))
         );
         assert_eq!(
-            game.state.world.speech_lines_between(actor_id, target_id, 8).len(),
+            game.state
+                .world
+                .speech_lines_between(actor_id, target_id, 8)
+                .len(),
             2
         );
     }
 
     #[tokio::test]
     async fn choose_autonomous_action_can_choose_do_nothing() {
-        let mut game = GameService::new(MockBackend).unwrap();
+        let mut game = test_game();
         let actor_id = game.manual_actor_id();
         let target_id = nearby_actor_id(&game);
 
@@ -708,25 +772,60 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn wait_and_inspect_actions_append_system_context() {
+        let mut game = test_game();
+        let actor_id = game.manual_actor_id();
+        let (place_id, entity_id) =
+            place_with_entity(&game).expect("expected a place with an entity");
+        game.state.world.move_actor(actor_id, place_id);
+
+        game.apply_action(ActionRequest {
+            actor_id,
+            action: ActionKind::InspectEntity { entity_id },
+        })
+        .await
+        .unwrap();
+        game.apply_action(ActionRequest {
+            actor_id,
+            action: ActionKind::Wait {
+                duration: TimeDelta::from_seconds(30),
+            },
+        })
+        .await
+        .unwrap();
+
+        assert!(game.snapshot().context_feed.iter().any(|entry| matches!(
+            entry,
+            crate::domain::events::ContextEntry::System {
+                context: crate::domain::events::SystemContext::Inspect { .. },
+                ..
+            }
+        )));
+        assert!(game.snapshot().context_feed.iter().any(|entry| matches!(
+            entry,
+            crate::domain::events::ContextEntry::System {
+                context: crate::domain::events::SystemContext::Wait { .. },
+                ..
+            }
+        )));
+    }
+
     #[test]
     fn snapshot_for_renders_any_focused_actor() {
-        let game = GameService::new(MockBackend).unwrap();
+        let game = test_game();
         let target_id = nearby_actor_id(&game);
 
         let snapshot = game.snapshot_for(target_id);
 
         assert_eq!(snapshot.focused_actor_id, target_id);
         assert_eq!(snapshot.status.id, target_id);
-        assert!(
-            snapshot
-                .available_actions
-                .contains(&AvailableAction::Wait)
-        );
+        assert!(snapshot.available_actions.contains(&AvailableAction::Wait));
     }
 
     #[test]
     fn available_actions_and_plan_action_share_the_same_surface() {
-        let game = GameService::new(MockBackend).unwrap();
+        let game = test_game();
         let actor_id = game.manual_actor_id();
         let actions = game.available_actions(actor_id);
 
@@ -776,19 +875,21 @@ mod tests {
 
     #[test]
     fn agent_action_surface_exposes_do_nothing_but_not_wait() {
-        let game = GameService::new(MockBackend).unwrap();
+        let game = test_game();
         let actor_id = nearby_actor_id(&game);
         let actions = game.available_agent_actions(actor_id);
 
         assert!(actions.contains(&AgentAvailableAction::DoNothing));
-        assert!(actions
-            .iter()
-            .any(|action| matches!(action, AgentAvailableAction::SpeakTo { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, AgentAvailableAction::SpeakTo { .. }))
+        );
     }
 
     #[tokio::test]
     async fn save_and_load_round_trip() {
-        let mut game = GameService::new(MockBackend).unwrap();
+        let mut game = test_game();
         game.apply_action(ActionRequest {
             actor_id: game.manual_actor_id(),
             action: ActionKind::Wait {
@@ -799,7 +900,7 @@ mod tests {
         .unwrap();
         game.save(Path::new("/tmp/riggy-test-save.json")).unwrap();
 
-        let mut loaded = GameService::new(MockBackend).unwrap();
+        let mut loaded = test_game();
         loaded.load(Path::new("/tmp/riggy-test-save.json")).unwrap();
         assert_eq!(
             game.state.world.current_time(),
@@ -815,7 +916,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_rejects_invalid_world_snapshot() {
-        let mut game = GameService::new(MockBackend).unwrap();
+        let mut game = test_game();
         let actor_id = game
             .state
             .world
@@ -823,40 +924,24 @@ mod tests {
             .into_iter()
             .find(|candidate| *candidate != game.manual_actor_id())
             .unwrap();
-        let resident_city_id = game.state.world.actor_resident_city_ids(actor_id)[0];
-        let other_city_id = game
+        let current_place_id = game.state.world.actor_place_id(actor_id).unwrap();
+        let city_id = game.state.world.actor_resident_city_ids(actor_id)[0];
+        let other_place_id = game
             .state
             .world
-            .city_ids()
+            .city_places(city_id)
             .into_iter()
-            .find(|city_id| *city_id != resident_city_id)
-            .expect("world should have another city");
-        let other_place_id = game.state.world.city_places(other_city_id)[0];
-        let present_edge_id = game
-            .state
+            .find(|place_id| *place_id != current_place_id)
+            .expect("world should have another room");
+        game.state
             .world
             .graph
-            .edges_directed(actor_id.0, petgraph::Direction::Outgoing)
-            .find(|edge| {
-                matches!(edge.weight(), WorldRelation::LocatedAt)
-                    && matches!(
-                        game.state.world.graph.node_weight(edge.target()),
-                        Some(WorldNode::Place(_))
-                    )
-            })
-            .map(|edge| edge.id())
-            .expect("actor should have a present place");
-        game.state.world.graph.remove_edge(present_edge_id);
-        game.state.world.graph.add_edge(
-            actor_id.0,
-            other_place_id.0,
-            WorldRelation::LocatedAt,
-        );
+            .add_edge(actor_id.0, other_place_id.0, WorldRelation::LocatedAt);
 
         let invalid_path = Path::new("/tmp/riggy-invalid-save.json");
         std::fs::write(invalid_path, to_vec_pretty(&game.state).unwrap()).unwrap();
 
-        let mut loaded = GameService::new(MockBackend).unwrap();
+        let mut loaded = test_game();
         let err = loaded.load(invalid_path).unwrap_err();
         assert!(err.to_string().contains("world validation failed"));
     }

@@ -56,7 +56,10 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
         ]),
         Line::from(vec![
             Span::raw("You are "),
-            highlighted(snapshot.focused_actor.id.name(snapshot.world_seed), Color::Yellow),
+            highlighted(
+                snapshot.focused_actor.id.name(snapshot.world_seed),
+                Color::Yellow,
+            ),
             Span::raw(", a "),
             highlighted(
                 format!(
@@ -149,16 +152,28 @@ pub fn build_world_text(snapshot: &UiSnapshot, notices: &[String]) -> Text<'stat
         );
     }
 
-    let recent_context = build_recent_context_lines(snapshot, notices);
+    let recent_context = build_recent_context_lines(snapshot);
     if !recent_context.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
-            "Recent Context",
+            "Recent Activity",
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )]));
         lines.extend(recent_context);
+    }
+
+    let status_lines = build_status_lines(notices);
+    if !status_lines.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![Span::styled(
+            "Status",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        lines.extend(status_lines);
     }
 
     Text::from(lines)
@@ -194,11 +209,15 @@ pub fn render_interactable_label(snapshot: &UiSnapshot, interactable: &Interacta
     }
 }
 
-pub fn render_event_notice(world_seed: WorldSeed, actor_id: crate::world::ActorId, event: &GameEvent) -> Option<String> {
+pub fn render_event_notice(
+    world_seed: WorldSeed,
+    actor_id: crate::world::ActorId,
+    event: &GameEvent,
+) -> Option<String> {
     WorldFormatter::new(world_seed, actor_id).event_notice(event)
 }
 
-fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<Line<'static>> {
+fn build_recent_context_lines(snapshot: &UiSnapshot) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     for entry in &snapshot.context_feed {
@@ -248,7 +267,13 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
         }
     }
 
-    for notice in notices.iter().rev().take(4).rev() {
+    lines
+}
+
+fn build_status_lines(notices: &[String]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    for notice in notices.iter().rev().take(3).rev() {
         for line in notice
             .lines()
             .map(clean_inline_text)
@@ -257,9 +282,9 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
-                    "note",
+                    "!",
                     Style::default()
-                        .fg(Color::LightBlue)
+                        .fg(Color::LightRed)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
@@ -271,7 +296,11 @@ fn build_recent_context_lines(snapshot: &UiSnapshot, notices: &[String]) -> Vec<
     lines
 }
 
-fn render_system_context(world_seed: WorldSeed, actor_id: crate::world::ActorId, context: &SystemContext) -> String {
+fn render_system_context(
+    world_seed: WorldSeed,
+    actor_id: crate::world::ActorId,
+    context: &SystemContext,
+) -> String {
     WorldFormatter::new(world_seed, actor_id).system_context(context)
 }
 
@@ -305,10 +334,15 @@ fn actor_display_name(snapshot: &UiSnapshot, actor: &ActorView) -> String {
 
     let base_name = actor.id.name(snapshot.world_seed);
     let duplicate_count = std::iter::once(snapshot.focused_actor.id)
-        .chain(snapshot.interactables.iter().filter_map(|interactable| match interactable {
-            Interactable::Talk(actor) => Some(actor.id),
-            Interactable::Inspect(_) => None,
-        }))
+        .chain(
+            snapshot
+                .interactables
+                .iter()
+                .filter_map(|interactable| match interactable {
+                    Interactable::Talk(actor) => Some(actor.id),
+                    Interactable::Inspect(_) => None,
+                }),
+        )
         .filter(|actor_id| actor_id.name(snapshot.world_seed) == base_name)
         .count();
 
@@ -379,13 +413,26 @@ impl WorldFormatter {
 
     fn system_context(&self, context: &SystemContext) -> String {
         match context {
-            SystemContext::Start => {
-                "You arrived in a starter residence with a need for useful names.".to_string()
-            }
-            SystemContext::Travel { destination, duration } => format!(
+            SystemContext::Travel {
+                destination,
+                duration,
+            } => format!(
                 "Arrived at {} after {}.",
                 self.place(destination),
                 format_duration(*duration)
+            ),
+            SystemContext::Inspect { entity } => format!(
+                "You inspect {}. It looks like a {} left out in plain view.",
+                self.entity(entity),
+                entity.kind.label()
+            ),
+            SystemContext::Wait {
+                duration,
+                current_time,
+            } => format!(
+                "You wait for {}. The time is now {}.",
+                format_duration(*duration),
+                current_time.format()
             ),
         }
     }

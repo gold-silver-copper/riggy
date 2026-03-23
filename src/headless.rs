@@ -78,7 +78,10 @@ impl<B: LlmBackend> HeadlessSession<B> {
         self.execute_non_source_command(command).await
     }
 
-    async fn execute_non_source_command(&mut self, command: HeadlessCommand) -> Result<CommandOutput> {
+    async fn execute_non_source_command(
+        &mut self,
+        command: HeadlessCommand,
+    ) -> Result<CommandOutput> {
         match command {
             HeadlessCommand::Help => Ok(CommandOutput {
                 text: help_text(),
@@ -212,7 +215,11 @@ impl<B: LlmBackend> HeadlessSession<B> {
                     self.focused_actor_id = self.game.manual_actor_id();
                 }
                 Ok(CommandOutput {
-                    text: format!("Loaded game state from {}.\n\n{}", path.display(), self.render_snapshot()),
+                    text: format!(
+                        "Loaded game state from {}.\n\n{}",
+                        path.display(),
+                        self.render_snapshot()
+                    ),
                     should_quit: false,
                 })
             }
@@ -252,7 +259,10 @@ impl<B: LlmBackend> HeadlessSession<B> {
         }
 
         if sections.is_empty() {
-            Ok(format!("Script {} contained no executable commands.", path.display()))
+            Ok(format!(
+                "Script {} contained no executable commands.",
+                path.display()
+            ))
         } else {
             Ok(sections.join("\n\n"))
         }
@@ -316,7 +326,13 @@ impl<B: LlmBackend> HeadlessSession<B> {
             .city
             .connected_cities
             .iter()
-            .map(|city_id| format!("city#{} {}", city_id.index(), city_id.name(snapshot.world_seed)))
+            .map(|city_id| {
+                format!(
+                    "city#{} {}",
+                    city_id.index(),
+                    city_id.name(snapshot.world_seed)
+                )
+            })
             .collect::<Vec<_>>();
         lines.push(format_list("Connected cities", connected_cities));
 
@@ -326,7 +342,11 @@ impl<B: LlmBackend> HeadlessSession<B> {
             lines.push("  (none)".to_string());
         } else {
             for (index, actor) in talk_targets.iter().enumerate() {
-                lines.push(format!("  [{}] {}", index, actor_view_label(&snapshot, *actor)));
+                lines.push(format!(
+                    "  [{}] {}",
+                    index,
+                    actor_view_label(&snapshot, *actor)
+                ));
             }
         }
 
@@ -388,7 +408,11 @@ impl<B: LlmBackend> HeadlessSession<B> {
             lines.push("  (none)".to_string());
         } else {
             for (index, actor) in talk_targets.iter().enumerate() {
-                lines.push(format!("  [{}] {}", index, actor_view_label(&snapshot, *actor)));
+                lines.push(format!(
+                    "  [{}] {}",
+                    index,
+                    actor_view_label(&snapshot, *actor)
+                ));
             }
         }
         lines.join("\n")
@@ -434,7 +458,7 @@ impl<B: LlmBackend> HeadlessSession<B> {
 
     fn render_context(&self) -> String {
         let snapshot = self.snapshot();
-        let mut lines = vec!["Recent context:".to_string()];
+        let mut lines = vec!["Recent activity:".to_string()];
         if snapshot.context_feed.is_empty() {
             lines.push("  (none)".to_string());
         } else {
@@ -488,10 +512,12 @@ pub async fn run_cli(args: impl IntoIterator<Item = String>) -> Result<()> {
     info!(backend = %backend_label, "starting headless session");
 
     if let Some(script_path) = options.script {
-            let output = session.execute_parsed_command(HeadlessCommand::Source { path: script_path }).await?;
-            if !output.text.is_empty() {
-                println!("{}", output.text);
-            }
+        let output = session
+            .execute_parsed_command(HeadlessCommand::Source { path: script_path })
+            .await?;
+        if !output.text.is_empty() {
+            println!("{}", output.text);
+        }
         return Ok(());
     }
 
@@ -675,7 +701,9 @@ fn parse_duration_token(token: Option<&str>) -> Result<TimeDelta> {
         bail!("wait requires a duration like `30s`, `2m`, or `1h`");
     };
     let (value, unit) = match token.chars().last() {
-        Some('s') | Some('m') | Some('h') => (&token[..token.len() - 1], token.chars().last().unwrap()),
+        Some('s') | Some('m') | Some('h') => {
+            (&token[..token.len() - 1], token.chars().last().unwrap())
+        }
         _ => (token, 's'),
     };
     let amount = value
@@ -788,10 +816,10 @@ fn render_system_context(
     context: &crate::domain::events::SystemContext,
 ) -> String {
     match context {
-        crate::domain::events::SystemContext::Start => {
-            "You arrived in a starter residence with a need for useful names.".to_string()
-        }
-        crate::domain::events::SystemContext::Travel { destination, duration } => format!(
+        crate::domain::events::SystemContext::Travel {
+            destination,
+            duration,
+        } => format!(
             "Arrived at {} after {}.",
             place_label(
                 snapshot.world_seed,
@@ -800,6 +828,19 @@ fn render_system_context(
                 destination.kind,
             ),
             duration.format()
+        ),
+        crate::domain::events::SystemContext::Inspect { entity } => format!(
+            "You inspect {}. It looks like a {} left out in plain view.",
+            entity_label(snapshot, *entity),
+            entity.kind.label()
+        ),
+        crate::domain::events::SystemContext::Wait {
+            duration,
+            current_time,
+        } => format!(
+            "You wait for {}. The time is now {}.",
+            duration.format(),
+            current_time.format()
         ),
     }
 }
@@ -810,7 +851,11 @@ fn speaker_label(snapshot: &UiSnapshot, speaker: DialogueSpeaker) -> String {
             format!("You (actor#{})", actor_id.index())
         }
         DialogueSpeaker::Actor(actor_id) => {
-            format!("{} (actor#{})", actor_id.name(snapshot.world_seed), actor_id.index())
+            format!(
+                "{} (actor#{})",
+                actor_id.name(snapshot.world_seed),
+                actor_id.index()
+            )
         }
         DialogueSpeaker::System => "System".to_string(),
     }
@@ -820,7 +865,11 @@ fn actor_label(snapshot: &UiSnapshot, actor_id: ActorId) -> String {
     if actor_id == snapshot.focused_actor_id {
         format!("You (actor#{})", actor_id.index())
     } else {
-        format!("{} (actor#{})", actor_id.name(snapshot.world_seed), actor_id.index())
+        format!(
+            "{} (actor#{})",
+            actor_id.name(snapshot.world_seed),
+            actor_id.index()
+        )
     }
 }
 
@@ -833,16 +882,29 @@ fn actor_view_label(snapshot: &UiSnapshot, actor: ActorView) -> String {
     )
 }
 
-fn available_action_label(snapshot: &UiSnapshot, action: &crate::domain::commands::AvailableAction) -> String {
+fn available_action_label(
+    snapshot: &UiSnapshot,
+    action: &crate::domain::commands::AvailableAction,
+) -> String {
     match action {
         crate::domain::commands::AvailableAction::MoveTo { destination } => snapshot
             .routes
             .iter()
             .find(|route| route.destination.id == *destination)
-            .map(|route| format!("travel to place#{} {}", destination.index(), render_route_label(snapshot.world_seed, route)))
+            .map(|route| {
+                format!(
+                    "travel to place#{} {}",
+                    destination.index(),
+                    render_route_label(snapshot.world_seed, route)
+                )
+            })
             .unwrap_or_else(|| format!("travel to place#{}", destination.index())),
         crate::domain::commands::AvailableAction::SpeakTo { target } => {
-            format!("say to {} (actor#{})", target.name(snapshot.world_seed), target.index())
+            format!(
+                "say to {} (actor#{})",
+                target.name(snapshot.world_seed),
+                target.index()
+            )
         }
         crate::domain::commands::AvailableAction::InspectEntity { entity_id } => {
             format!("inspect entity#{}", entity_id.index())
@@ -864,7 +926,8 @@ fn render_agent_debug_block(
     lines.push(format!("  Backend: {}", trace.backend_name));
     lines.push(format!(
         "  Selected: {}",
-        trace.selected_action
+        trace
+            .selected_action
             .as_ref()
             .map(|action| format!("{action:?}"))
             .unwrap_or_else(|| "none".to_string())
@@ -888,11 +951,7 @@ fn render_agent_debug_block(
     if !trace.recent_speech.is_empty() {
         lines.push("  Recent speech:".to_string());
         for line in &trace.recent_speech {
-            lines.push(format!(
-                "    [{}] {}",
-                line.timestamp.format(),
-                line.text
-            ));
+            lines.push(format!("    [{}] {}", line.timestamp.format(), line.text));
         }
     }
     if let Some(model_output) = &trace.model_output {
@@ -930,6 +989,15 @@ fn place_label(
         place_id.index(),
         place_name_from_parts(world_seed, place_id, city_id, kind),
         kind.label()
+    )
+}
+
+fn entity_label(snapshot: &UiSnapshot, entity: crate::domain::events::EntitySummary) -> String {
+    format!(
+        "entity#{} {} ({})",
+        entity.id.index(),
+        entity_name_from_parts(snapshot.world_seed, entity.id, entity.kind),
+        entity.kind.label()
     )
 }
 
@@ -984,36 +1052,45 @@ fn cli_help_text() -> String {
 mod tests {
     use super::{HeadlessSession, parse_command};
     use crate::app::service::GameService;
+    use crate::domain::seed::WorldSeed;
     use crate::llm::MockBackend;
+
+    fn test_game() -> GameService<MockBackend> {
+        GameService::new_with_seed(MockBackend, WorldSeed::new(42)).unwrap()
+    }
 
     #[test]
     fn parse_say_command_keeps_full_text() {
-        let manual_actor = GameService::new(MockBackend).unwrap().manual_actor_id();
+        let manual_actor = test_game().manual_actor_id();
         let command = parse_command("say 0 hello there", manual_actor)
             .unwrap()
             .unwrap();
-        assert!(matches!(command, super::HeadlessCommand::Say { selector: 0, text } if text == "hello there"));
+        assert!(
+            matches!(command, super::HeadlessCommand::Say { selector: 0, text } if text == "hello there")
+        );
     }
 
     #[tokio::test]
     async fn headless_session_can_drive_mock_conversation() {
-        let game = GameService::new(MockBackend).unwrap();
+        let game = test_game();
         let mut session = HeadlessSession::new(game);
 
         let output = session.execute_line("say 0 hello").await.unwrap().unwrap();
 
         assert!(output.text.contains("Events:"));
         assert!(output.text.contains("says:"));
-        assert!(session
-            .snapshot()
-            .context_feed
-            .iter()
-            .any(|entry| matches!(entry, crate::domain::events::ContextEntry::Dialogue(_))));
+        assert!(
+            session
+                .snapshot()
+                .context_feed
+                .iter()
+                .any(|entry| matches!(entry, crate::domain::events::ContextEntry::Dialogue(_)))
+        );
     }
 
     #[tokio::test]
     async fn focus_command_switches_snapshot_actor() {
-        let game = GameService::new(MockBackend).unwrap();
+        let game = test_game();
         let mut session = HeadlessSession::new(game);
         let target_id = super::talk_targets(&session.snapshot())[0].id;
 

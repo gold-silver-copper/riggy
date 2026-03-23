@@ -3,7 +3,10 @@ use std::fs;
 use std::path::PathBuf;
 
 mod cco_codegen {
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/build_support/cco_codegen.rs"));
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build_support/cco_codegen.rs"
+    ));
 }
 
 #[derive(Debug, Clone, Default)]
@@ -343,9 +346,14 @@ fn generate(ofn: &str) -> String {
 
     push_doc_lines(
         &mut output,
-        &["Returns direct named superclasses declared by simple `SubClassOf(...)` axioms.".to_string()],
+        &[
+            "Returns direct named superclasses declared by simple `SubClassOf(...)` axioms."
+                .to_string(),
+        ],
     );
-    output.push_str("    pub const fn direct_parents(self) -> &'static [Self] {\n        match self.0 {\n");
+    output.push_str(
+        "    pub const fn direct_parents(self) -> &'static [Self] {\n        match self.0 {\n",
+    );
     for (index, _) in class_defs.iter().enumerate() {
         output.push_str(&format!(
             "            {index} => {},\n",
@@ -722,7 +730,13 @@ fn generate(ofn: &str) -> String {
         "BfoRelationId",
         &relation_defs
             .iter()
-            .map(|def| resolve_id_indices(&def.direct_parent_ids, &relation_index_by_id, "BFO relation"))
+            .map(|def| {
+                resolve_id_indices(
+                    &def.direct_parent_ids,
+                    &relation_index_by_id,
+                    "BFO relation",
+                )
+            })
             .collect::<Vec<_>>(),
         |index| format!("BfoRelationId({index})"),
     );
@@ -810,7 +824,9 @@ fn generate(ofn: &str) -> String {
         &mut output,
         &["Returns direct parent relations declared by `SubObjectPropertyOf(...)`.".to_string()],
     );
-    output.push_str("    pub const fn direct_parents(self) -> &'static [Self] {\n        match self.0 {\n");
+    output.push_str(
+        "    pub const fn direct_parents(self) -> &'static [Self] {\n        match self.0 {\n",
+    );
     for (index, _) in relation_defs.iter().enumerate() {
         output.push_str(&format!(
             "            {index} => {},\n",
@@ -838,7 +854,8 @@ fn generate(ofn: &str) -> String {
     output.push_str("}\n\n");
 
     output.push_str("impl RelationKind {\n");
-    output.push_str("    pub const fn relation_id(self) -> BfoRelationId {\n        match self {\n");
+    output
+        .push_str("    pub const fn relation_id(self) -> BfoRelationId {\n        match self {\n");
     for (index, def) in relation_defs.iter().enumerate() {
         output.push_str(&format!(
             "            Self::{} => BfoRelationId::new({index}),\n",

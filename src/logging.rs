@@ -57,7 +57,14 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |panic_info| {
         let location = panic_info
             .location()
-            .map(|location| format!("{}:{}:{}", location.file(), location.line(), location.column()))
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
             .unwrap_or_else(|| "<unknown>".to_string());
 
         let payload = if let Some(message) = panic_info.payload().downcast_ref::<&str>() {

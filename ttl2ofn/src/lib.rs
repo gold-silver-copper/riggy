@@ -20,7 +20,8 @@ const OWL_DISJOINT_WITH: &str = "http://www.w3.org/2002/07/owl#disjointWith";
 const OWL_EQUIVALENT_CLASS: &str = "http://www.w3.org/2002/07/owl#equivalentClass";
 const OWL_FUNCTIONAL_PROPERTY: &str = "http://www.w3.org/2002/07/owl#FunctionalProperty";
 const OWL_INTERSECTION_OF: &str = "http://www.w3.org/2002/07/owl#intersectionOf";
-const OWL_INVERSE_FUNCTIONAL_PROPERTY: &str = "http://www.w3.org/2002/07/owl#InverseFunctionalProperty";
+const OWL_INVERSE_FUNCTIONAL_PROPERTY: &str =
+    "http://www.w3.org/2002/07/owl#InverseFunctionalProperty";
 const OWL_INVERSE_OF: &str = "http://www.w3.org/2002/07/owl#inverseOf";
 const OWL_IRREFLEXIVE_PROPERTY: &str = "http://www.w3.org/2002/07/owl#IrreflexiveProperty";
 const OWL_MEMBERS: &str = "http://www.w3.org/2002/07/owl#members";
@@ -49,8 +50,14 @@ enum ClassExpr {
     Union(Vec<ClassExpr>),
     Intersection(Vec<ClassExpr>),
     Complement(Box<ClassExpr>),
-    AllValuesFrom { property: String, filler: Box<ClassExpr> },
-    SomeValuesFrom { property: String, filler: Box<ClassExpr> },
+    AllValuesFrom {
+        property: String,
+        filler: Box<ClassExpr>,
+    },
+    SomeValuesFrom {
+        property: String,
+        filler: Box<ClassExpr>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -65,8 +72,8 @@ struct RenderConfig {
 }
 
 pub fn convert_file(input: &Path) -> Result<String> {
-    let source = fs::read_to_string(input)
-        .with_context(|| format!("failed to read {}", input.display()))?;
+    let source =
+        fs::read_to_string(input).with_context(|| format!("failed to read {}", input.display()))?;
     let prefixes = parse_prefixes(&source);
     let graph = load_graph(source.as_bytes())?;
     convert_graph(&graph, &RenderConfig { prefixes })
@@ -85,10 +92,7 @@ fn convert_graph(graph: &Graph, render: &RenderConfig) -> Result<String> {
     let annotation_properties = annotation_properties(graph);
     let ontology_iri = ontology_iri(graph)?;
     let version_iri = graph
-        .object_for_subject_predicate(
-            nnob(&ontology_iri),
-            nn(OWL_VERSION_IRI),
-        )
+        .object_for_subject_predicate(nnob(&ontology_iri), nn(OWL_VERSION_IRI))
         .and_then(named_node_term_iri)
         .map(|iri| rewrite_version_iri(&iri));
 
@@ -100,7 +104,12 @@ fn convert_graph(graph: &Graph, render: &RenderConfig) -> Result<String> {
         true,
     )?;
     let declarations = collect_declarations(graph, render)?;
-    let annotation_assertions = collect_annotation_assertions(graph, render, &annotation_properties, ontology_iri.as_str())?;
+    let annotation_assertions = collect_annotation_assertions(
+        graph,
+        render,
+        &annotation_properties,
+        ontology_iri.as_str(),
+    )?;
     let object_property_axioms = collect_object_property_axioms(graph, render)?;
     let class_axioms = collect_class_axioms(graph, render)?;
     let general_axioms = collect_general_axioms(graph, render)?;
@@ -128,7 +137,12 @@ fn convert_graph(graph: &Graph, render: &RenderConfig) -> Result<String> {
         output.push_str(&line);
         output.push('\n');
     }
-    if !declarations.is_empty() || !annotation_assertions.is_empty() || !object_property_axioms.is_empty() || !class_axioms.is_empty() || !general_axioms.is_empty() {
+    if !declarations.is_empty()
+        || !annotation_assertions.is_empty()
+        || !object_property_axioms.is_empty()
+        || !class_axioms.is_empty()
+        || !general_axioms.is_empty()
+    {
         output.push('\n');
     }
     for line in declarations {
@@ -159,7 +173,10 @@ fn convert_graph(graph: &Graph, render: &RenderConfig) -> Result<String> {
 fn collect_declarations(graph: &Graph, render: &RenderConfig) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     for iri in declared_named_subjects(graph, OWL_CLASS) {
-        out.insert(format!("Declaration(Class({}))", render_entity_iri(render, &iri)));
+        out.insert(format!(
+            "Declaration(Class({}))",
+            render_entity_iri(render, &iri)
+        ));
     }
     for iri in declared_named_subjects(graph, OWL_OBJECT_PROPERTY) {
         out.insert(format!(
@@ -233,7 +250,10 @@ fn annotation_assertions_for_subject(
     Ok(out)
 }
 
-fn collect_object_property_axioms(graph: &Graph, render: &RenderConfig) -> Result<BTreeSet<String>> {
+fn collect_object_property_axioms(
+    graph: &Graph,
+    render: &RenderConfig,
+) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     let properties = declared_named_subjects(graph, OWL_OBJECT_PROPERTY);
     for property in properties {
@@ -261,7 +281,8 @@ fn collect_object_property_axioms(graph: &Graph, render: &RenderConfig) -> Resul
                 render_class_expr(render, &parse_class_expr(graph, object)?)?
             ));
         }
-        for object in graph.objects_for_subject_predicate(nnob(&property), nn(RDFS_SUBPROPERTY_OF)) {
+        for object in graph.objects_for_subject_predicate(nnob(&property), nn(RDFS_SUBPROPERTY_OF))
+        {
             let parent = named_node_term_iri(object)
                 .ok_or_else(|| anyhow!("rdfs:subPropertyOf must point to a named property"))?;
             out.insert(format!(
@@ -327,7 +348,9 @@ fn collect_class_axioms(graph: &Graph, render: &RenderConfig) -> Result<BTreeSet
 
 fn collect_general_axioms(graph: &Graph, render: &RenderConfig) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
-    for subject in graph.subjects_for_predicate_object(nn(RDF_TYPE), nn_term(OWL_ALL_DISJOINT_CLASSES)) {
+    for subject in
+        graph.subjects_for_predicate_object(nn(RDF_TYPE), nn_term(OWL_ALL_DISJOINT_CLASSES))
+    {
         let NamedOrBlankNodeRef::BlankNode(blank) = subject else {
             continue;
         };
@@ -336,7 +359,10 @@ fn collect_general_axioms(graph: &Graph, render: &RenderConfig) -> Result<BTreeS
             .ok_or_else(|| anyhow!("owl:AllDisjointClasses without owl:members"))?;
         let mut rendered = Vec::new();
         for member in parse_list(graph, members)? {
-            rendered.push(render_class_expr(render, &parse_class_expr(graph, member)?)?);
+            rendered.push(render_class_expr(
+                render,
+                &parse_class_expr(graph, member)?,
+            )?);
         }
         out.insert(format!("DisjointClasses({})", rendered.join(" ")));
     }
@@ -347,21 +373,27 @@ fn parse_class_expr(graph: &Graph, term: TermRef<'_>) -> Result<ClassExpr> {
     match term {
         TermRef::NamedNode(node) => Ok(ClassExpr::Named(node.as_str().to_owned())),
         TermRef::BlankNode(node) => {
-            if let Some(filler) = graph.object_for_subject_predicate(node, nn(OWL_ALL_VALUES_FROM)) {
+            if let Some(filler) = graph.object_for_subject_predicate(node, nn(OWL_ALL_VALUES_FROM))
+            {
                 let property = graph
                     .object_for_subject_predicate(node, nn(OWL_ON_PROPERTY))
                     .and_then(named_node_term_iri)
-                    .ok_or_else(|| anyhow!("owl:allValuesFrom restriction without owl:onProperty"))?;
+                    .ok_or_else(|| {
+                        anyhow!("owl:allValuesFrom restriction without owl:onProperty")
+                    })?;
                 return Ok(ClassExpr::AllValuesFrom {
                     property,
                     filler: Box::new(parse_class_expr(graph, filler)?),
                 });
             }
-            if let Some(filler) = graph.object_for_subject_predicate(node, nn(OWL_SOME_VALUES_FROM)) {
+            if let Some(filler) = graph.object_for_subject_predicate(node, nn(OWL_SOME_VALUES_FROM))
+            {
                 let property = graph
                     .object_for_subject_predicate(node, nn(OWL_ON_PROPERTY))
                     .and_then(named_node_term_iri)
-                    .ok_or_else(|| anyhow!("owl:someValuesFrom restriction without owl:onProperty"))?;
+                    .ok_or_else(|| {
+                        anyhow!("owl:someValuesFrom restriction without owl:onProperty")
+                    })?;
                 return Ok(ClassExpr::SomeValuesFrom {
                     property,
                     filler: Box::new(parse_class_expr(graph, filler)?),
@@ -382,9 +414,14 @@ fn parse_class_expr(graph: &Graph, term: TermRef<'_>) -> Result<ClassExpr> {
                 return Ok(ClassExpr::Intersection(parts));
             }
             if let Some(value) = graph.object_for_subject_predicate(node, nn(OWL_COMPLEMENT_OF)) {
-                return Ok(ClassExpr::Complement(Box::new(parse_class_expr(graph, value)?)));
+                return Ok(ClassExpr::Complement(Box::new(parse_class_expr(
+                    graph, value,
+                )?)));
             }
-            bail!("unsupported blank-node class expression: _:{}", node.as_str());
+            bail!(
+                "unsupported blank-node class expression: _:{}",
+                node.as_str()
+            );
         }
         TermRef::Literal(_) => bail!("literals are not valid class expressions"),
     }
@@ -428,7 +465,10 @@ fn render_annotation_assertion(
 fn render_annotation_value(render: &RenderConfig, object: TermRef<'_>) -> Result<String> {
     match object {
         TermRef::NamedNode(node) => Ok(render_full_iri(node.as_str())),
-        TermRef::BlankNode(node) => bail!("blank node annotation values are not supported: _:{}", node.as_str()),
+        TermRef::BlankNode(node) => bail!(
+            "blank node annotation values are not supported: _:{}",
+            node.as_str()
+        ),
         TermRef::Literal(literal) => Ok(render_literal(render, literal)),
     }
 }
@@ -534,7 +574,8 @@ fn is_qname_local(value: &str) -> bool {
 }
 
 fn declared_named_subjects(graph: &Graph, class_iri: &str) -> BTreeSet<String> {
-    graph.subjects_for_predicate_object(nn(RDF_TYPE), term_named_node(class_iri))
+    graph
+        .subjects_for_predicate_object(nn(RDF_TYPE), term_named_node(class_iri))
         .filter_map(named_subject_iri)
         .collect()
 }

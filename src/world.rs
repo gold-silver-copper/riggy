@@ -15,7 +15,9 @@ use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occup
 
 macro_rules! node_id_type {
     ($name:ident) => {
-        #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(
+            Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+        )]
         pub struct $name(pub NodeIndex);
 
         impl $name {
@@ -75,12 +77,22 @@ impl CityId {
 
 impl ActorId {
     pub fn name(self, seed: WorldSeed) -> String {
-        let key = mix_seed(seed, &[1, self.index() as u64]);
-        format!(
+        let combination_count = ACTOR_FIRST_NAMES.len() * ACTOR_LAST_NAMES.len();
+        let offset = (mix_seed(seed, &[1, 0]) as usize) % combination_count;
+        let stride = actor_name_stride(seed, combination_count);
+        let slot = (offset + self.index().saturating_mul(stride)) % combination_count;
+        let first_index = slot % ACTOR_FIRST_NAMES.len();
+        let last_index = slot / ACTOR_FIRST_NAMES.len();
+        let base = format!(
             "{} {}",
-            ACTOR_FIRST_NAMES[(key as usize) % ACTOR_FIRST_NAMES.len()],
-            ACTOR_LAST_NAMES[((key >> 16) as usize) % ACTOR_LAST_NAMES.len()]
-        )
+            ACTOR_FIRST_NAMES[first_index], ACTOR_LAST_NAMES[last_index]
+        );
+        let cycle = self.index() / combination_count;
+        if cycle == 0 {
+            base
+        } else {
+            format!("{base} {}", cycle + 1)
+        }
     }
 }
 
@@ -113,10 +125,7 @@ pub struct TravelRoute {
 }
 
 labeled_enum!(PlaceKind {
-    Residence => "residence",
-    Street => "street",
-    Venue => "public venue",
-    Station => "transit station",
+    Room => "room",
 });
 
 impl PlaceKind {
@@ -258,9 +267,9 @@ impl PartialEq for World {
 impl Eq for World {}
 
 impl World {
-    pub fn generate(seed: WorldSeed, city_count: usize) -> Self {
+    pub fn generate(seed: WorldSeed, world_size_hint: usize) -> Self {
         let mut rng = ChaCha8Rng::seed_from_u64(seed.raw());
-        let target_cities = city_count.clamp(16, 24);
+        let room_count = world_size_hint.clamp(4, 6);
         let mut world = Self {
             seed,
             graph: WorldGraph::default(),
@@ -269,54 +278,20 @@ impl World {
         let country_id = world.add_country();
         world.add_clock(GameTime::from_seconds(0));
 
-        let mut station_ids = Vec::with_capacity(target_cities);
-        let mut city_ids = Vec::with_capacity(target_cities);
+        let city_id = world.add_city(City {
+            biome: *Biome::ALL.choose(&mut rng).unwrap(),
+            economy: *Economy::ALL.choose(&mut rng).unwrap(),
+            culture: *Culture::ALL.choose(&mut rng).unwrap(),
+        });
+        add_edge(
+            &mut world.graph,
+            country_id.0,
+            city_id.0,
+            WorldRelation::Contains,
+        );
+        let start_place_id = world.build_building_rooms(&mut rng, city_id, room_count);
+        world.spawn_room_ai_actors(&mut rng, city_id, 3);
 
-        for _ in 0..target_cities {
-            let city_id = world.add_city(City {
-                biome: *Biome::ALL.choose(&mut rng).unwrap(),
-                economy: *Economy::ALL.choose(&mut rng).unwrap(),
-                culture: *Culture::ALL.choose(&mut rng).unwrap(),
-            });
-            add_edge(&mut world.graph, country_id.0, city_id.0, WorldRelation::Contains);
-            let station_id = world.build_city_places(&mut rng, city_id);
-            city_ids.push(city_id);
-            station_ids.push(station_id);
-        }
-
-        for city_index in 0..target_cities {
-            let a = city_ids[city_index];
-            let b = city_ids[(city_index + 1) % target_cities];
-            let route = random_transit_route(&mut rng, true);
-            world.connect_cities(a, b, route);
-            world.connect_places(
-                station_ids[city_index],
-                station_ids[(city_index + 1) % target_cities],
-                route,
-            );
-        }
-
-        for _ in 0..(target_cities / 2) {
-            let a_index = rng.random_range(0..target_cities);
-            let mut b_index = rng.random_range(0..target_cities);
-            while b_index == a_index {
-                b_index = rng.random_range(0..target_cities);
-            }
-            let route = random_transit_route(&mut rng, false);
-            world.connect_cities(city_ids[a_index], city_ids[b_index], route);
-            world.connect_places(station_ids[a_index], station_ids[b_index], route);
-        }
-
-        for city_id in city_ids.iter().copied() {
-            world.spawn_city_ai_actors(&mut rng, city_id);
-        }
-
-        let start_city_id = city_ids[0];
-        let start_place_id = world
-            .city_places(start_city_id)
-            .into_iter()
-            .find(|place_id| matches!(world.place(*place_id).kind, PlaceKind::Residence))
-            .unwrap_or_else(|| world.city_places(start_city_id)[0]);
         world.add_actor(
             ControllerMode::Manual,
             Occupation::SoftwareEngineer,
@@ -423,7 +398,10 @@ impl World {
             _ => None,
         });
         if clock_ids.len() != 1 {
-            issues.push(format!("expected exactly one clock node, found {}", clock_ids.len()));
+            issues.push(format!(
+                "expected exactly one clock node, found {}",
+                clock_ids.len()
+            ));
         }
 
         let manual_actor_ids = self
@@ -444,7 +422,10 @@ impl World {
                 .edges_directed(city_id.0, Incoming)
                 .filter(|edge| {
                     matches!(edge.weight(), WorldRelation::Contains)
-                        && matches!(self.graph.node_weight(edge.source()), Some(WorldNode::Country(_)))
+                        && matches!(
+                            self.graph.node_weight(edge.source()),
+                            Some(WorldNode::Country(_))
+                        )
                 })
                 .count();
             if incoming_country_count != 1 {
@@ -483,7 +464,8 @@ impl World {
             _ => None,
         }) {
             let containing_cities = self.collect_incoming(place_id.0, |source, node, relation| {
-                if matches!(relation, WorldRelation::Contains) && matches!(node, WorldNode::City(_)) {
+                if matches!(relation, WorldRelation::Contains) && matches!(node, WorldNode::City(_))
+                {
                     Some(CityId(source))
                 } else {
                     None
@@ -506,13 +488,11 @@ impl World {
                     ));
                     continue;
                 }
-                if !self
-                    .place_routes(destination)
-                    .iter()
-                    .any(|(reverse_destination, reverse_route)| {
+                if !self.place_routes(destination).iter().any(
+                    |(reverse_destination, reverse_route)| {
                         *reverse_destination == place_id && *reverse_route == route
-                    })
-                {
+                    },
+                ) {
                     issues.push(format!(
                         "route {} -> {} is not symmetric",
                         place_id.index(),
@@ -539,7 +519,8 @@ impl World {
             }
 
             let present_places = self.collect_outgoing(actor_id.0, |target, node, relation| {
-                if matches!(relation, WorldRelation::LocatedAt) && matches!(node, WorldNode::Place(_))
+                if matches!(relation, WorldRelation::LocatedAt)
+                    && matches!(node, WorldNode::Place(_))
                 {
                     Some(PlaceId(target))
                 } else {
@@ -575,7 +556,10 @@ impl World {
                 .edges_directed(actor_id.0, Outgoing)
                 .filter(|edge| {
                     matches!(edge.weight(), WorldRelation::HasMemory)
-                        && matches!(self.graph.node_weight(edge.target()), Some(WorldNode::Record(Record::ConversationMemory(_))))
+                        && matches!(
+                            self.graph.node_weight(edge.target()),
+                            Some(WorldNode::Record(Record::ConversationMemory(_)))
+                        )
                 })
                 .count();
             if memory_count != 1 {
@@ -595,7 +579,10 @@ impl World {
                 .graph
                 .edges_directed(entity_id.0, Outgoing)
                 .filter(|edge| {
-                    matches!(edge.weight(), WorldRelation::LocatedAt | WorldRelation::InInventoryOf)
+                    matches!(
+                        edge.weight(),
+                        WorldRelation::LocatedAt | WorldRelation::InInventoryOf
+                    )
                 })
                 .count();
             if location_edges != 1 {
@@ -853,7 +840,8 @@ impl World {
 
     pub fn city_connections(&self, city_id: CityId) -> Vec<CityId> {
         let mut ids = self.collect_outgoing(city_id.0, |target, node, relation| {
-            if matches!(relation, WorldRelation::Connected(_)) && matches!(node, WorldNode::City(_)) {
+            if matches!(relation, WorldRelation::Connected(_)) && matches!(node, WorldNode::City(_))
+            {
                 Some(CityId(target))
             } else {
                 None
@@ -929,8 +917,7 @@ impl World {
 
     pub fn actor_present_place_ids(&self, actor_id: ActorId) -> Vec<PlaceId> {
         self.collect_outgoing(actor_id.0, |target, node, relation| {
-            if matches!(relation, WorldRelation::LocatedAt) && matches!(node, WorldNode::Place(_))
-            {
+            if matches!(relation, WorldRelation::LocatedAt) && matches!(node, WorldNode::Place(_)) {
                 Some(PlaceId(target))
             } else {
                 None
@@ -939,24 +926,29 @@ impl World {
     }
 
     pub fn actor_conversation_memory(&self, actor_id: ActorId) -> Option<ConversationMemory> {
-        let record_id = self.collect_outgoing(actor_id.0, |target, node, relation| {
-            if matches!(relation, WorldRelation::HasMemory)
-                && matches!(node, WorldNode::Record(Record::ConversationMemory(_)))
-            {
-                Some(RecordId(target))
-            } else {
-                None
-            }
-        })
-        .into_iter()
-        .next()?;
+        let record_id = self
+            .collect_outgoing(actor_id.0, |target, node, relation| {
+                if matches!(relation, WorldRelation::HasMemory)
+                    && matches!(node, WorldNode::Record(Record::ConversationMemory(_)))
+                {
+                    Some(RecordId(target))
+                } else {
+                    None
+                }
+            })
+            .into_iter()
+            .next()?;
         match self.record(record_id) {
             Record::ConversationMemory(memory) if !memory.is_empty() => Some(memory.clone()),
             _ => None,
         }
     }
 
-    pub fn merge_actor_conversation_memory(&mut self, actor_id: ActorId, update: ConversationMemory) {
+    pub fn merge_actor_conversation_memory(
+        &mut self,
+        actor_id: ActorId,
+        update: ConversationMemory,
+    ) {
         if !self.has_actor(actor_id) {
             return;
         }
@@ -987,9 +979,10 @@ impl World {
             return;
         }
 
-        let record_id = RecordId(self.graph.add_node(WorldNode::Record(Record::ConversationMemory(
-            update,
-        ))));
+        let record_id = RecordId(
+            self.graph
+                .add_node(WorldNode::Record(Record::ConversationMemory(update))),
+        );
         add_edge(
             &mut self.graph,
             actor_id.0,
@@ -1004,7 +997,8 @@ impl World {
         }
 
         let mut ids = self.collect_outgoing(actor_id.0, |target, node, relation| {
-            if matches!(relation, WorldRelation::KnowsCity { .. }) && matches!(node, WorldNode::City(_))
+            if matches!(relation, WorldRelation::KnowsCity { .. })
+                && matches!(node, WorldNode::City(_))
             {
                 Some(CityId(target))
             } else {
@@ -1043,7 +1037,9 @@ impl World {
     ) -> Vec<DialogueLine> {
         let mut lines = self
             .collect_node_ids(|index, node| match node {
-                WorldNode::Process(process) if process.kind == ProcessKind::Speak => Some(ProcessId(index)),
+                WorldNode::Process(process) if process.kind == ProcessKind::Speak => {
+                    Some(ProcessId(index))
+                }
                 _ => None,
             })
             .into_iter()
@@ -1196,7 +1192,10 @@ impl World {
         if !self.has_actor(actor_id) {
             return;
         }
-        let record_id = RecordId(self.graph.add_node(WorldNode::Record(Record::Context(entry))));
+        let record_id = RecordId(
+            self.graph
+                .add_node(WorldNode::Record(Record::Context(entry))),
+        );
         add_edge(
             &mut self.graph,
             actor_id.0,
@@ -1224,7 +1223,7 @@ impl World {
                 _ => None,
             }
         });
-        entries.sort_by_key(|(timestamp, _)| *timestamp);
+        entries.sort_by_key(|(timestamp, entry)| (*timestamp, context_sort_rank(entry)));
         let len = entries.len();
         entries
             .into_iter()
@@ -1254,7 +1253,8 @@ impl World {
 
     fn process_actor_participants(&self, process_id: ProcessId) -> Vec<ActorId> {
         let mut ids = self.collect_outgoing(process_id.0, |target, node, relation| {
-            if matches!(relation, WorldRelation::Participates) && matches!(node, WorldNode::Actor(_))
+            if matches!(relation, WorldRelation::Participates)
+                && matches!(node, WorldNode::Actor(_))
             {
                 Some(ActorId(target))
             } else {
@@ -1307,7 +1307,8 @@ impl World {
             if matches!(relation, WorldRelation::HasTranscript)
                 && matches!(node, WorldNode::Record(Record::Dialogue(_)))
             {
-                let Some(WorldNode::Record(Record::Dialogue(line))) = self.graph.node_weight(target)
+                let Some(WorldNode::Record(Record::Dialogue(line))) =
+                    self.graph.node_weight(target)
                 else {
                     return None;
                 };
@@ -1332,7 +1333,10 @@ impl World {
     }
 
     fn add_clock(&mut self, current_time: GameTime) -> ClockId {
-        ClockId(self.graph.add_node(WorldNode::Clock(Clock { current_time })))
+        ClockId(
+            self.graph
+                .add_node(WorldNode::Clock(Clock { current_time })),
+        )
     }
 
     fn add_city(&mut self, city: City) -> CityId {
@@ -1340,7 +1344,10 @@ impl World {
     }
 
     fn add_place(&mut self, city_id: CityId, kind: PlaceKind, description: String) -> PlaceId {
-        let place_id = PlaceId(self.graph.add_node(WorldNode::Place(Place { kind, description })));
+        let place_id = PlaceId(
+            self.graph
+                .add_node(WorldNode::Place(Place { kind, description })),
+        );
         add_edge(
             &mut self.graph,
             city_id.0,
@@ -1381,9 +1388,9 @@ impl World {
             current_place_id.0,
             WorldRelation::LocatedAt,
         );
-        let memory_id = RecordId(self.graph.add_node(WorldNode::Record(Record::ConversationMemory(
-            ConversationMemory::default(),
-        ))));
+        let memory_id = RecordId(self.graph.add_node(WorldNode::Record(
+            Record::ConversationMemory(ConversationMemory::default()),
+        )));
         add_edge(
             &mut self.graph,
             actor_id.0,
@@ -1424,9 +1431,10 @@ impl World {
         context_actors: &[ActorId],
         line: DialogueLine,
     ) {
-        let record_id = RecordId(self.graph.add_node(WorldNode::Record(Record::Dialogue(
-            line.clone(),
-        ))));
+        let record_id = RecordId(
+            self.graph
+                .add_node(WorldNode::Record(Record::Dialogue(line.clone()))),
+        );
         add_edge(
             &mut self.graph,
             process_id.0,
@@ -1443,122 +1451,92 @@ impl World {
         }
     }
 
-    fn build_city_places(&mut self, rng: &mut ChaCha8Rng, city_id: CityId) -> PlaceId {
+    fn build_building_rooms(
+        &mut self,
+        rng: &mut ChaCha8Rng,
+        city_id: CityId,
+        room_count: usize,
+    ) -> PlaceId {
         let city_name = city_id.name(self.seed);
-        let residence_id = self.add_place(
-            city_id,
-            PlaceKind::Residence,
-            format!(
-                "A modest residential block in {} where tenants know which lights stay on late.",
-                city_name
-            ),
-        );
-        let street_id = self.add_place(
-            city_id,
-            PlaceKind::Street,
-            format!(
-                "A busy street in {} where most errands, chance meetings, and quiet surveillance happen.",
-                city_name
-            ),
-        );
-        let venue_id = self.add_place(
-            city_id,
-            PlaceKind::Venue,
-            format!(
-                "A public-facing venue in {} where people linger long enough to trade impressions.",
-                city_name
-            ),
-        );
-        let station_id = self.add_place(
-            city_id,
-            PlaceKind::Station,
-            format!(
-                "The regional transit station for {} where departures are public and arrivals are easy to miss.",
-                city_name
-            ),
-        );
+        let mut room_ids = Vec::with_capacity(room_count);
 
-        self.connect_places(residence_id, street_id, random_walk_route(rng, (20, 70)));
-        self.connect_places(street_id, venue_id, random_walk_route(rng, (30, 90)));
-        self.connect_places(street_id, station_id, random_walk_route(rng, (45, 150)));
-        if rng.random_bool(0.5) {
-            self.connect_places(venue_id, station_id, random_walk_route(rng, (60, 180)));
+        for room_index in 0..room_count {
+            let room_id = self.add_place(
+                city_id,
+                PlaceKind::Room,
+                format!(
+                    "Room {} inside a cramped building in {} where every conversation leaks under a door somewhere.",
+                    room_index + 1,
+                    city_name,
+                ),
+            );
+            room_ids.push(room_id);
         }
 
-        if rng.random_bool(0.2) {
-            let entity_kind = if rng.random_bool(0.1) {
-                EntityKind::Gun
-            } else if rng.random_bool(0.4) {
-                EntityKind::Knife
-            } else {
-                EntityKind::Bag
-            };
-            let entity_place = if rng.random_bool(0.5) {
-                street_id
-            } else {
-                venue_id
-            };
-            self.add_entity_to_place(entity_place, entity_kind);
+        for window in room_ids.windows(2) {
+            self.connect_places(window[0], window[1], random_walk_route(rng, (4, 12)));
+        }
+        if room_ids.len() >= 4 {
+            self.connect_places(
+                room_ids[0],
+                room_ids[room_ids.len() - 1],
+                random_walk_route(rng, (8, 18)),
+            );
+        }
+        if room_ids.len() >= 5 {
+            self.connect_places(room_ids[1], room_ids[3], random_walk_route(rng, (3, 10)));
         }
 
-        station_id
-    }
+        for room_id in room_ids.iter().copied() {
+            if rng.random_bool(0.35) {
+                let entity_kind = if rng.random_bool(0.15) {
+                    EntityKind::Gun
+                } else if rng.random_bool(0.45) {
+                    EntityKind::Knife
+                } else {
+                    EntityKind::Bag
+                };
+                self.add_entity_to_place(room_id, entity_kind);
+            }
+        }
 
-    fn connect_cities(&mut self, a: CityId, b: CityId, route: TravelRoute) {
-        add_edge(
-            &mut self.graph,
-            a.0,
-            b.0,
-            WorldRelation::Connected(route),
-        );
-        add_edge(
-            &mut self.graph,
-            b.0,
-            a.0,
-            WorldRelation::Connected(route),
-        );
+        room_ids[0]
     }
 
     fn connect_places(&mut self, a: PlaceId, b: PlaceId, route: TravelRoute) {
-        add_edge(
-            &mut self.graph,
-            a.0,
-            b.0,
-            WorldRelation::Connected(route),
-        );
-        add_edge(
-            &mut self.graph,
-            b.0,
-            a.0,
-            WorldRelation::Connected(route),
-        );
+        add_edge(&mut self.graph, a.0, b.0, WorldRelation::Connected(route));
+        add_edge(&mut self.graph, b.0, a.0, WorldRelation::Connected(route));
     }
 
-    fn spawn_city_ai_actors(&mut self, rng: &mut ChaCha8Rng, city_id: CityId) {
+    fn spawn_room_ai_actors(
+        &mut self,
+        rng: &mut ChaCha8Rng,
+        city_id: CityId,
+        actors_per_room: usize,
+    ) {
         let possible_places = self
             .city_places(city_id)
             .into_iter()
             .filter(|place_id| self.place(*place_id).kind.supports_people())
             .collect::<Vec<_>>();
-        let actor_count = rng.random_range(3..=5);
 
-        for actor_offset in 0..actor_count {
-            let mut traits = TraitTag::ALL
-                .choose_multiple(rng, 2)
-                .copied()
-                .collect::<Vec<_>>();
-            traits.sort();
-            let home_place_id = *possible_places.choose(rng).unwrap();
-            let current_place_id = possible_places[actor_offset % possible_places.len()];
-            self.add_actor(
-                ControllerMode::AiAgent,
-                *Occupation::ALL.choose(rng).unwrap(),
-                *NpcArchetype::ALL.choose(rng).unwrap(),
-                traits,
-                *GoalTag::ALL.choose(rng).unwrap(),
-                home_place_id,
-                current_place_id,
-            );
+        for place_id in possible_places {
+            for _ in 0..actors_per_room {
+                let mut traits = TraitTag::ALL
+                    .choose_multiple(rng, 2)
+                    .copied()
+                    .collect::<Vec<_>>();
+                traits.sort();
+                self.add_actor(
+                    ControllerMode::AiAgent,
+                    *Occupation::ALL.choose(rng).unwrap(),
+                    *NpcArchetype::ALL.choose(rng).unwrap(),
+                    traits,
+                    *GoalTag::ALL.choose(rng).unwrap(),
+                    place_id,
+                    place_id,
+                );
+            }
         }
     }
 
@@ -1607,17 +1585,27 @@ impl World {
     }
 
     fn has_place(&self, place_id: PlaceId) -> bool {
-        matches!(self.graph.node_weight(place_id.0), Some(WorldNode::Place(_)))
+        matches!(
+            self.graph.node_weight(place_id.0),
+            Some(WorldNode::Place(_))
+        )
     }
 
     fn has_actor(&self, actor_id: ActorId) -> bool {
-        matches!(self.graph.node_weight(actor_id.0), Some(WorldNode::Actor(_)))
+        matches!(
+            self.graph.node_weight(actor_id.0),
+            Some(WorldNode::Actor(_))
+        )
     }
 
     fn collect_node_ids<T>(&self, map: impl Fn(NodeIndex, &WorldNode) -> Option<T>) -> Vec<T> {
         self.graph
             .node_indices()
-            .filter_map(|index| self.graph.node_weight(index).and_then(|node| map(index, node)))
+            .filter_map(|index| {
+                self.graph
+                    .node_weight(index)
+                    .and_then(|node| map(index, node))
+            })
             .collect()
     }
 
@@ -1698,42 +1686,69 @@ fn context_timestamp(entry: &ContextEntry) -> GameTime {
     }
 }
 
-pub fn place_name_from_parts(seed: WorldSeed, id: PlaceId, city_id: CityId, kind: PlaceKind) -> String {
+fn context_sort_rank(entry: &ContextEntry) -> u8 {
+    match entry {
+        ContextEntry::System { .. } => 0,
+        ContextEntry::Dialogue(_) => 1,
+    }
+}
+
+fn actor_name_stride(seed: WorldSeed, combination_count: usize) -> usize {
+    let mut stride = ((mix_seed(seed, &[1, 1]) as usize) % combination_count).max(1);
+    while gcd_usize(stride, combination_count) != 1 {
+        stride += 1;
+        if stride >= combination_count {
+            stride = 1;
+        }
+    }
+    stride
+}
+
+fn room_name_slot(seed: WorldSeed, id: PlaceId) -> usize {
+    let count = ROOM_NAMES.len();
+    let offset = (mix_seed(seed, &[2, 0]) as usize) % count;
+    let mut stride = ((mix_seed(seed, &[2, 1]) as usize) % count).max(1);
+    while gcd_usize(stride, count) != 1 {
+        stride += 1;
+        if stride >= count {
+            stride = 1;
+        }
+    }
+    (offset + id.index().saturating_mul(stride)) % count
+}
+
+fn gcd_usize(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
+}
+
+pub fn place_name_from_parts(
+    seed: WorldSeed,
+    id: PlaceId,
+    city_id: CityId,
+    kind: PlaceKind,
+) -> String {
     let city_name = city_id.name(seed);
     match kind {
-        PlaceKind::Residence => format!(
-            "{} {}",
-            city_name,
-            RESIDENCE_NAMES[(mix_seed(seed, &[2, id.index() as u64]) as usize) % RESIDENCE_NAMES.len()]
-        ),
-        PlaceKind::Street => format!(
-            "{} {}",
-            city_name,
-            STREET_NAMES[(mix_seed(seed, &[3, id.index() as u64]) as usize) % STREET_NAMES.len()]
-        ),
-        PlaceKind::Venue => format!(
-            "{} {}",
-            city_name,
-            VENUE_NAMES[(mix_seed(seed, &[4, id.index() as u64]) as usize) % VENUE_NAMES.len()]
-        ),
-        PlaceKind::Station => format!("{} Station", city_name),
+        PlaceKind::Room => format!("{} {}", city_name, ROOM_NAMES[room_name_slot(seed, id)]),
     }
 }
 
 pub fn entity_name_from_parts(seed: WorldSeed, id: EntityId, kind: EntityKind) -> String {
     match kind {
-        EntityKind::Gun => {
-            GUN_NAMES[(mix_seed(seed, &[5, id.index() as u64]) as usize) % GUN_NAMES.len()]
-                .to_string()
-        }
-        EntityKind::Knife => {
-            KNIFE_NAMES[(mix_seed(seed, &[6, id.index() as u64]) as usize) % KNIFE_NAMES.len()]
-                .to_string()
-        }
-        EntityKind::Bag => {
-            BAG_NAMES[(mix_seed(seed, &[7, id.index() as u64]) as usize) % BAG_NAMES.len()]
-                .to_string()
-        }
+        EntityKind::Gun => GUN_NAMES
+            [(mix_seed(seed, &[5, id.index() as u64]) as usize) % GUN_NAMES.len()]
+        .to_string(),
+        EntityKind::Knife => KNIFE_NAMES
+            [(mix_seed(seed, &[6, id.index() as u64]) as usize) % KNIFE_NAMES.len()]
+        .to_string(),
+        EntityKind::Bag => BAG_NAMES
+            [(mix_seed(seed, &[7, id.index() as u64]) as usize) % BAG_NAMES.len()]
+        .to_string(),
     }
 }
 
@@ -1741,18 +1756,6 @@ fn random_walk_route(rng: &mut ChaCha8Rng, seconds: (u32, u32)) -> TravelRoute {
     TravelRoute {
         kind: RouteKind::Walk,
         travel_time: TimeDelta::from_seconds(rng.random_range(seconds.0..=seconds.1)),
-    }
-}
-
-fn random_transit_route(rng: &mut ChaCha8Rng, primary_link: bool) -> TravelRoute {
-    let range = if primary_link {
-        (20 * 60, 50 * 60)
-    } else {
-        (35 * 60, 90 * 60)
-    };
-    TravelRoute {
-        kind: RouteKind::Transit,
-        travel_time: TimeDelta::from_seconds(rng.random_range(range.0..=range.1)),
     }
 }
 
@@ -1774,32 +1777,24 @@ const CITY_SUFFIXES: [&str; 16] = [
     "gate", "harbor", "park", "field", "square", "junction",
 ];
 const ACTOR_FIRST_NAMES: [&str; 24] = [
-    "Ari", "Bryn", "Cato", "Dara", "Esme", "Finn", "Galen", "Hana", "Ivo", "Jora", "Kellan",
-    "Lio", "Mara", "Niko", "Orin", "Pia", "Quin", "Rhea", "Soren", "Talia", "Una", "Vero",
-    "Wren", "Yana",
+    "Ari", "Bryn", "Cato", "Dara", "Esme", "Finn", "Galen", "Hana", "Ivo", "Jora", "Kellan", "Lio",
+    "Mara", "Niko", "Orin", "Pia", "Quin", "Rhea", "Soren", "Talia", "Una", "Vero", "Wren", "Yana",
 ];
 const ACTOR_LAST_NAMES: [&str; 24] = [
     "Ashdown", "Briar", "Cask", "Dunfield", "Ember", "Farrow", "Gale", "Hearth", "Ives", "Jun",
     "Keene", "Lark", "Morrow", "Nettle", "Orchard", "Pell", "Quarry", "Reeve", "Sable", "Thorne",
     "Vale", "Wick", "Mercer", "Cross",
 ];
-const RESIDENCE_NAMES: [&str; 6] = [
-    "Apartments",
-    "Rowhouse",
-    "Walk-Up",
-    "Residences",
-    "Court Housing",
-    "Flats",
+const ROOM_NAMES: [&str; 8] = [
+    "Lobby",
+    "Common Room",
+    "Kitchen",
+    "Laundry Room",
+    "Boiler Room",
+    "Hallway",
+    "Storage Room",
+    "Office",
 ];
-const STREET_NAMES: [&str; 6] = [
-    "Main Street",
-    "Market Row",
-    "Harbor Road",
-    "Exchange Street",
-    "Service Lane",
-    "Old Road",
-];
-const VENUE_NAMES: [&str; 6] = ["Cafe", "Arcade", "Clinic", "Bookshop", "Diner", "Hall"];
 const GUN_NAMES: [&str; 3] = ["compact pistol", "service revolver", "polymer handgun"];
 const KNIFE_NAMES: [&str; 3] = ["pocket knife", "utility knife", "folding knife"];
 const BAG_NAMES: [&str; 3] = ["duffel bag", "messenger bag", "canvas tote"];
@@ -1826,20 +1821,27 @@ mod tests {
     #[test]
     fn world_is_connected_and_in_bounds() {
         let world = World::generate(WorldSeed::new(7), 24);
-        assert_eq!(world.city_ids().len(), 24);
+        assert_eq!(world.city_ids().len(), 1);
 
+        let city_id = world.city_ids()[0];
+        let places = world.city_places(city_id);
         let mut visited = std::collections::BTreeSet::new();
-        let mut stack = vec![world.city_ids()[0]];
-        while let Some(city_id) = stack.pop() {
-            if !visited.insert(city_id) {
+        let mut stack = vec![places[0]];
+        while let Some(place_id) = stack.pop() {
+            if !visited.insert(place_id) {
                 continue;
             }
-            stack.extend(world.city_connections(city_id));
+            stack.extend(
+                world
+                    .place_routes(place_id)
+                    .into_iter()
+                    .map(|(destination, _)| destination),
+            );
         }
 
-        assert_eq!(visited.len(), world.city_ids().len());
-        assert!(world.city_ids().iter().all(|city_id| world.city_places(*city_id).len() >= 4));
-        assert!(world.actor_ids().len() >= 24 * 3 + 1);
+        assert_eq!(visited.len(), places.len());
+        assert!((4..=6).contains(&places.len()));
+        assert_eq!(world.actor_ids().len(), places.len() * 3 + 1);
         assert!(world.validate().is_empty());
         assert!(world.manual_actor_id().is_some());
     }
@@ -1875,7 +1877,11 @@ mod tests {
             .into_iter()
             .find(|actor_id| *actor_id != manual_actor_id)
             .unwrap_or_else(|| {
-                let actor_id = world.actor_ids().into_iter().find(|actor_id| *actor_id != manual_actor_id).unwrap();
+                let actor_id = world
+                    .actor_ids()
+                    .into_iter()
+                    .find(|actor_id| *actor_id != manual_actor_id)
+                    .unwrap();
                 world.move_actor(actor_id, place_id);
                 actor_id
             });
@@ -1901,7 +1907,9 @@ mod tests {
 
         assert_eq!(world.process(process_id).kind, ProcessKind::Speak);
         assert_eq!(
-            world.speech_lines_between(manual_actor_id, target_id, 8).len(),
+            world
+                .speech_lines_between(manual_actor_id, target_id, 8)
+                .len(),
             2
         );
         assert!(world.validate().is_empty());
@@ -1910,10 +1918,8 @@ mod tests {
     #[test]
     fn item_locations_are_graph_edges() {
         let world = World::generate(WorldSeed::new(11), 16);
-        let maybe_item_place = world
-            .graph
-            .edge_references()
-            .find_map(|edge| match (
+        let maybe_item_place = world.graph.edge_references().find_map(|edge| {
+            match (
                 world.graph.node_weight(edge.source()),
                 world.graph.node_weight(edge.target()),
                 edge.weight(),
@@ -1922,7 +1928,8 @@ mod tests {
                     Some(PlaceId(edge.target()))
                 }
                 _ => None,
-            });
+            }
+        });
 
         if let Some(place_id) = maybe_item_place {
             assert!(!world.place_entities(place_id).is_empty());
@@ -1938,5 +1945,30 @@ mod tests {
             .filter(|actor_id| world.actor(*actor_id).controller == super::ControllerMode::Manual)
             .collect::<Vec<ActorId>>();
         assert_eq!(manual_actor_ids.len(), 1);
+    }
+
+    #[test]
+    fn actor_names_are_unique_for_generated_world_scale() {
+        let world = World::generate(WorldSeed::new(42), 18);
+        let names = world
+            .actor_ids()
+            .into_iter()
+            .map(|actor_id| actor_id.name(world.seed))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(names.len(), world.actor_ids().len());
+    }
+
+    #[test]
+    fn room_names_are_unique_within_the_building() {
+        let world = World::generate(WorldSeed::new(42), 18);
+        let city_id = world.city_ids()[0];
+        let names = world
+            .city_places(city_id)
+            .into_iter()
+            .map(|place_id| world.place_name(place_id))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(names.len(), world.city_places(city_id).len());
     }
 }

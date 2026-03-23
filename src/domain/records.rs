@@ -40,18 +40,25 @@ pub enum ContextEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SystemContext {
-    Start,
     Travel {
         destination: PlaceSummary,
         duration: TimeDelta,
+    },
+    Inspect {
+        entity: EntitySummary,
+    },
+    Wait {
+        duration: TimeDelta,
+        current_time: GameTime,
     },
 }
 
 impl SystemContext {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Start => "start",
             Self::Travel { .. } => "travel",
+            Self::Inspect { .. } => "inspect",
+            Self::Wait { .. } => "wait",
         }
     }
 }
