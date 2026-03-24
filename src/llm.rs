@@ -18,8 +18,12 @@ use crate::ai::prompting::build_turn_prompt;
 use crate::domain::commands::{ActionKind, AgentAvailableAction};
 use crate::domain::events::{DialogueLine, DialogueSpeaker};
 use crate::domain::memory::ConversationMemory;
-use crate::world::ActorId;
-const CONVERSATION_TOOL_NAMES: &[&str] = &["reply_to_speaker", "do_nothing"];
+use crate::world::{ActorId, EntityId, PlaceId, place_name_from_parts};
+
+const SPEAK_TO_TOOL_NAME: &str = "speak_to";
+const MOVE_TO_TOOL_NAME: &str = "move_to";
+const INSPECT_ENTITY_TOOL_NAME: &str = "inspect_entity";
+const DO_NOTHING_TOOL_NAME: &str = "do_nothing";
 
 #[allow(async_fn_in_trait)]
 pub trait LlmBackend {
@@ -139,41 +143,79 @@ impl LlmBackend for MockBackend {
             "mock backend choosing action"
         );
         let mut trace = AgentDebugTrace::from_context(context, self.name());
-        let Some((speaker_id, speaker_input)) = latest_inbound_speech(context) else {
-            trace.toolset = vec!["do_nothing".to_string()];
-            trace.model_output =
-                Some("mock policy: no recent inbound speech, staying idle".to_string());
-            trace.selected_action = Some(ActionKind::DoNothing);
-            return Ok(ActionSelection {
-                action: ActionKind::DoNothing,
-                trace,
-            });
-        };
+        trace.toolset = available_tool_names(context);
 
-        if !context
-            .available_actions
-            .contains(&AgentAvailableAction::SpeakTo { target: speaker_id })
+        let action = if let Some((speaker_id, speaker_input)) = latest_inbound_speech(context)
+            && context
+                .available_actions
+                .contains(&AgentAvailableAction::SpeakTo { target: speaker_id })
         {
-            trace.toolset = vec!["do_nothing".to_string()];
-            trace.model_output = Some(
-                "mock policy: latest speaker is not currently speakable, staying idle".to_string(),
-            );
-            trace.selected_action = Some(ActionKind::DoNothing);
-            return Ok(ActionSelection {
-                action: ActionKind::DoNothing,
-                trace,
-            });
-        }
-
-        let action = ActionKind::Speak {
-            target: speaker_id,
-            text: mock_reply_text(context, &speaker_input),
+            trace.model_output =
+                Some("mock policy: replying to the latest inbound speech".to_string());
+            ActionKind::Speak {
+                target: speaker_id,
+                text: mock_reply_text(context, &speaker_input),
+            }
+        } else if context.actor.id.index() % 4 == 0 {
+            if let Some(destination) = first_move_destination(context) {
+                trace.model_output =
+                    Some("mock policy: moving first when this actor tends to roam".to_string());
+                ActionKind::MoveTo { destination }
+            } else if let Some(entity_id) = first_nearby_entity(context) {
+                trace.model_output =
+                    Some("mock policy: inspecting because there is something nearby".to_string());
+                ActionKind::InspectEntity { entity_id }
+            } else if let Some(target) = preferred_speak_target(context) {
+                trace.model_output =
+                    Some("mock policy: proactively starting a conversation".to_string());
+                ActionKind::Speak {
+                    target,
+                    text: mock_initiation_text(context, target),
+                }
+            } else {
+                trace.model_output =
+                    Some("mock policy: nothing useful to do, staying idle".to_string());
+                ActionKind::DoNothing
+            }
+        } else if context.actor.id.index() % 4 == 1 {
+            if let Some(entity_id) = first_nearby_entity(context) {
+                trace.model_output =
+                    Some("mock policy: inspecting the most obvious nearby entity".to_string());
+                ActionKind::InspectEntity { entity_id }
+            } else if let Some(target) = preferred_speak_target(context) {
+                trace.model_output =
+                    Some("mock policy: proactively starting a conversation".to_string());
+                ActionKind::Speak {
+                    target,
+                    text: mock_initiation_text(context, target),
+                }
+            } else if let Some(destination) = first_move_destination(context) {
+                trace.model_output =
+                    Some("mock policy: moving because nothing else stands out".to_string());
+                ActionKind::MoveTo { destination }
+            } else {
+                trace.model_output =
+                    Some("mock policy: nothing useful to do, staying idle".to_string());
+                ActionKind::DoNothing
+            }
+        } else if let Some(target) = preferred_speak_target(context) {
+            trace.model_output =
+                Some("mock policy: proactively starting a conversation".to_string());
+            ActionKind::Speak {
+                target,
+                text: mock_initiation_text(context, target),
+            }
+        } else if let Some(destination) = first_move_destination(context) {
+            trace.model_output = Some("mock policy: moving to another room".to_string());
+            ActionKind::MoveTo { destination }
+        } else if let Some(entity_id) = first_nearby_entity(context) {
+            trace.model_output = Some("mock policy: inspecting a nearby entity".to_string());
+            ActionKind::InspectEntity { entity_id }
+        } else {
+            trace.model_output =
+                Some("mock policy: nothing useful to do, staying idle".to_string());
+            ActionKind::DoNothing
         };
-        trace.toolset = CONVERSATION_TOOL_NAMES
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect();
-        trace.model_output = Some("mock policy: replying to latest inbound speech".to_string());
         trace.selected_action = Some(action.clone());
         Ok(ActionSelection { action, trace })
     }
@@ -257,46 +299,71 @@ impl RigBackend {
         })
     }
 
-    async fn conversation_choose_action(
-        &self,
-        context: &ActorTurnContext,
-        speaker_id: ActorId,
-        speaker_input: &str,
-    ) -> Result<ActionSelection> {
-        let prompt = build_conversation_prompt(context, speaker_id, speaker_input);
+    async fn tool_choose_action(&self, context: &ActorTurnContext) -> Result<ActionSelection> {
+        let prompt = build_turn_prompt(context);
+        let tool_names = available_tool_names(context);
         debug!(
             actor_id = context.actor.id.index(),
-            speaker_id = speaker_id.index(),
             backend = %self.label(),
             prompt_length = prompt.len(),
-            "starting rig conversation action selection"
+            toolset = ?tool_names,
+            available_actions = ?context.available_actions,
+            recent_speech_count = context.recent_speech.len(),
+            "starting rig autonomous tool action selection"
         );
         trace!(
             actor_id = context.actor.id.index(),
-            speaker_id = speaker_id.index(),
             backend = %self.label(),
             prompt = %prompt,
-            "conversation prompt"
+            available_actions = ?context.available_actions,
+            recent_speech = ?context.recent_speech,
+            "autonomous turn prompt"
         );
         let selected_action = Arc::new(Mutex::new(None));
         let tool_calls = Arc::new(Mutex::new(Vec::new()));
-        let tools: Vec<Box<dyn ToolDyn>> = vec![
-            Box::new(ReplyToSpeakerTool::new(
-                speaker_id,
+        let mut tools: Vec<Box<dyn ToolDyn>> = Vec::new();
+        let speak_choices = speak_choices(context);
+        let move_choices = move_choices(context);
+        let inspect_choices = inspect_choices(context);
+
+        if !speak_choices.is_empty() {
+            tools.push(Box::new(SpeakToTool::new(
+                context.actor.id,
+                speak_choices.clone(),
                 Arc::clone(&selected_action),
                 Arc::clone(&tool_calls),
-            )),
-            Box::new(DoNothingTool::new(
+            )));
+        }
+        if !move_choices.is_empty() {
+            tools.push(Box::new(MoveToTool::new(
+                context.actor.id,
+                move_choices.clone(),
                 Arc::clone(&selected_action),
                 Arc::clone(&tool_calls),
-            )),
-        ];
+            )));
+        }
+        if !inspect_choices.is_empty() {
+            tools.push(Box::new(InspectEntityTool::new(
+                context.actor.id,
+                inspect_choices.clone(),
+                Arc::clone(&selected_action),
+                Arc::clone(&tool_calls),
+            )));
+        }
+        tools.push(Box::new(DoNothingTool::new(
+            context.actor.id,
+            Arc::clone(&selected_action),
+            Arc::clone(&tool_calls),
+        )));
+
         debug!(
             actor_id = context.actor.id.index(),
-            speaker_id = speaker_id.index(),
             backend = %self.label(),
-            toolset = ?CONVERSATION_TOOL_NAMES,
-            "conversation tools prepared"
+            toolset = ?tool_names,
+            speak_choices = ?speak_choices.iter().map(|choice| choice.id.index()).collect::<Vec<_>>(),
+            move_choices = ?move_choices.iter().map(|choice| choice.id.index()).collect::<Vec<_>>(),
+            inspect_choices = ?inspect_choices.iter().map(|choice| choice.id.index()).collect::<Vec<_>>(),
+            "autonomous tools prepared"
         );
         let request_started = Instant::now();
         let request_future = async {
@@ -304,17 +371,16 @@ impl RigBackend {
                 RigProvider::Ollama { client, model } => {
                     debug!(
                         actor_id = context.actor.id.index(),
-                        speaker_id = speaker_id.index(),
                         backend = %self.label(),
                         model,
-                        timeout_seconds = CONVERSATION_SELECTION_TIMEOUT.as_secs(),
-                        "dispatching ollama conversation agent request"
+                        timeout_seconds = TURN_SELECTION_TIMEOUT.as_secs(),
+                        "dispatching ollama autonomous agent request"
                     );
                     let agent = client
                         .agent(model.clone())
-                        .preamble(CONVERSATION_PREAMBLE)
+                        .preamble(TURN_PREAMBLE)
                         .temperature(0.0)
-                        .max_tokens(CONVERSATION_MAX_TOKENS)
+                        .max_tokens(TURN_MAX_TOKENS)
                         .additional_params(json!({ "think": false }))
                         .tools(tools)
                         .build();
@@ -323,17 +389,16 @@ impl RigBackend {
                 RigProvider::OpenAiCompatible { client, model } => {
                     debug!(
                         actor_id = context.actor.id.index(),
-                        speaker_id = speaker_id.index(),
                         backend = %self.label(),
                         model,
-                        timeout_seconds = CONVERSATION_SELECTION_TIMEOUT.as_secs(),
-                        "dispatching openai-compatible conversation agent request"
+                        timeout_seconds = TURN_SELECTION_TIMEOUT.as_secs(),
+                        "dispatching openai-compatible autonomous agent request"
                     );
                     let agent = client
                         .agent(model.clone())
-                        .preamble(CONVERSATION_PREAMBLE)
+                        .preamble(TURN_PREAMBLE)
                         .temperature(0.0)
-                        .max_tokens(CONVERSATION_MAX_TOKENS)
+                        .max_tokens(TURN_MAX_TOKENS)
                         .tools(tools)
                         .build();
                     agent.prompt(prompt.clone()).max_turns(1).await
@@ -348,7 +413,7 @@ impl RigBackend {
         let mut selected_seen_at: Option<Instant> = None;
 
         loop {
-            if request_started.elapsed() >= CONVERSATION_SELECTION_TIMEOUT {
+            if request_started.elapsed() >= TURN_SELECTION_TIMEOUT {
                 timed_out = true;
                 break;
             }
@@ -358,30 +423,28 @@ impl RigBackend {
                     completion = Some(result);
                     break;
                 }
-                _ = tokio::time::sleep(CONVERSATION_POLL_INTERVAL) => {
+                _ = tokio::time::sleep(TURN_POLL_INTERVAL) => {
                     let has_selected = selected_action
                         .lock()
-                        .map_err(|_| anyhow!("conversation action selection lock poisoned"))?
+                        .map_err(|_| anyhow!("autonomous action selection lock poisoned"))?
                         .is_some();
                     if has_selected {
                         let selected_since = selected_seen_at.get_or_insert_with(Instant::now);
                         debug!(
                             actor_id = context.actor.id.index(),
-                            speaker_id = speaker_id.index(),
                             backend = %self.label(),
                             since_commit_ms = selected_since.elapsed().as_millis(),
                             elapsed_ms = request_started.elapsed().as_millis(),
-                            "conversation action committed while provider request is still running"
+                            "autonomous action committed while provider request is still running"
                         );
-                        if selected_since.elapsed() >= CONVERSATION_POST_COMMIT_GRACE {
+                        if selected_since.elapsed() >= TURN_POST_COMMIT_GRACE {
                             cancelled_after_commit = true;
                             info!(
                                 actor_id = context.actor.id.index(),
-                                speaker_id = speaker_id.index(),
                                 backend = %self.label(),
                                 since_commit_ms = selected_since.elapsed().as_millis(),
                                 elapsed_ms = request_started.elapsed().as_millis(),
-                                "ending conversation request after committed-action grace period"
+                                "ending autonomous request after committed-action grace period"
                             );
                             break;
                         }
@@ -393,45 +456,39 @@ impl RigBackend {
 
         let selected = selected_action
             .lock()
-            .map_err(|_| anyhow!("conversation action selection lock poisoned"))?
+            .map_err(|_| anyhow!("autonomous action selection lock poisoned"))?
             .clone();
         let action = selected.clone().unwrap_or(ActionKind::DoNothing);
         let mut trace = AgentDebugTrace::from_context(context, &self.label());
         trace.prompt = prompt.clone();
-        trace.toolset = CONVERSATION_TOOL_NAMES
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect();
+        trace.toolset = tool_names.clone();
         trace.tool_calls = tool_calls
             .lock()
             .map_err(|_| anyhow!("tool call trace lock poisoned"))?
             .clone();
         debug!(
             actor_id = context.actor.id.index(),
-            speaker_id = speaker_id.index(),
             backend = %self.label(),
             elapsed_ms = request_elapsed.as_millis(),
             selected_action_present = selected.is_some(),
             tool_call_count = trace.tool_calls.len(),
-            "conversation agent request completed"
+            "autonomous agent request completed"
         );
 
         match completion {
             Some(Ok(model_output)) => {
                 debug!(
                     actor_id = context.actor.id.index(),
-                    speaker_id = speaker_id.index(),
                     backend = %self.label(),
                     elapsed_ms = request_elapsed.as_millis(),
                     model_output_len = model_output.len(),
-                    "conversation agent returned a completion payload"
+                    "autonomous agent returned a completion payload"
                 );
                 trace!(
                     actor_id = context.actor.id.index(),
-                    speaker_id = speaker_id.index(),
                     backend = %self.label(),
                     model_output = %model_output,
-                    "conversation agent raw completion"
+                    "autonomous agent raw completion"
                 );
                 trace.model_output = Some(model_output);
             }
@@ -444,7 +501,7 @@ impl RigBackend {
                         error = %error,
                         selected_action = ?action,
                         elapsed_ms = request_elapsed.as_millis(),
-                        "conversation agent returned an error after committing an action; accepting the committed action"
+                        "autonomous agent returned an error after committing an action; accepting the committed action"
                     );
                 } else {
                     warn!(
@@ -452,14 +509,14 @@ impl RigBackend {
                         backend = %self.label(),
                         error = %error,
                         elapsed_ms = request_elapsed.as_millis(),
-                        "conversation agent failed without a committed action"
+                        "autonomous agent failed without a committed action"
                     );
                 }
             }
             None if timed_out => {
                 let timeout_message = format!(
-                    "conversation selection timed out after {}s",
-                    CONVERSATION_SELECTION_TIMEOUT.as_secs()
+                    "autonomous selection timed out after {}s",
+                    TURN_SELECTION_TIMEOUT.as_secs()
                 );
                 trace.error = Some(timeout_message);
                 if selected.is_some() {
@@ -467,32 +524,31 @@ impl RigBackend {
                         actor_id = context.actor.id.index(),
                         backend = %self.label(),
                         selected_action = ?action,
-                        timeout_seconds = CONVERSATION_SELECTION_TIMEOUT.as_secs(),
+                        timeout_seconds = TURN_SELECTION_TIMEOUT.as_secs(),
                         elapsed_ms = request_elapsed.as_millis(),
-                        "conversation agent timed out after committing an action; accepting the committed action"
+                        "autonomous agent timed out after committing an action; accepting the committed action"
                     );
                 } else {
                     warn!(
                         actor_id = context.actor.id.index(),
                         backend = %self.label(),
-                        timeout_seconds = CONVERSATION_SELECTION_TIMEOUT.as_secs(),
+                        timeout_seconds = TURN_SELECTION_TIMEOUT.as_secs(),
                         elapsed_ms = request_elapsed.as_millis(),
-                        "conversation agent timed out without a committed action"
+                        "autonomous agent timed out without a committed action"
                     );
                 }
             }
             None if cancelled_after_commit => {
                 info!(
                     actor_id = context.actor.id.index(),
-                    speaker_id = speaker_id.index(),
                     backend = %self.label(),
                     elapsed_ms = request_elapsed.as_millis(),
                     tool_call_count = trace.tool_calls.len(),
-                    "conversation request ended after committed-action grace period"
+                    "autonomous request ended after committed-action grace period"
                 );
             }
             None => unreachable!(
-                "conversation request should either complete, time out, or cancel after commit"
+                "autonomous request should either complete, time out, or cancel after commit"
             ),
         }
 
@@ -504,12 +560,11 @@ impl RigBackend {
             });
             warn!(
                 actor_id = context.actor.id.index(),
-                speaker_id = speaker_id.index(),
                 backend = %self.label(),
                 elapsed_ms = request_elapsed.as_millis(),
                 model_output_present = trace.model_output.is_some(),
                 tool_call_count = trace.tool_calls.len(),
-                "conversation agent completed without a committed tool action"
+                "autonomous agent completed without a committed tool action"
             );
         }
 
@@ -520,49 +575,25 @@ impl RigBackend {
             selected_action = ?action,
             tool_call_count = trace.tool_calls.len(),
             elapsed_ms = request_elapsed.as_millis(),
-            "rig conversation action selection finished"
+            "rig autonomous action selection finished"
         );
         trace!(
             actor_id = context.actor.id.index(),
             backend = %self.label(),
             tool_calls = ?trace.tool_calls,
-            "rig conversation tool trace"
+            "rig autonomous tool trace"
         );
 
         Ok(ActionSelection { action, trace })
     }
 
     async fn agent_choose_action(&self, context: &ActorTurnContext) -> Result<ActionSelection> {
-        if let Some((speaker_id, speaker_input)) = latest_inbound_speech(context)
-            && context
-                .available_actions
-                .contains(&AgentAvailableAction::SpeakTo { target: speaker_id })
-        {
-            debug!(
-                actor_id = context.actor.id.index(),
-                speaker_id = speaker_id.index(),
-                backend = %self.label(),
-                available_actions = ?context.available_actions,
-                "recent inbound speech detected; entering conversation tool path"
-            );
-            return self
-                .conversation_choose_action(context, speaker_id, &speaker_input)
-                .await;
-        }
-
-        let mut trace = AgentDebugTrace::from_context(context, &self.label());
-        trace.toolset = vec!["do_nothing".to_string()];
-        trace.model_output = Some("no recent inbound speech; staying idle".to_string());
-        trace.selected_action = Some(ActionKind::DoNothing);
         debug!(
             actor_id = context.actor.id.index(),
             backend = %self.label(),
-            "no recent inbound speech; returning do_nothing"
+            "entering generic autonomous tool path"
         );
-        Ok(ActionSelection {
-            action: ActionKind::DoNothing,
-            trace,
-        })
+        self.tool_choose_action(context).await
     }
 
     async fn prompt_memory_summary_text(&self, transcript: &str) -> Result<String> {
@@ -655,63 +686,100 @@ impl LlmBackend for RigBackend {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ReplyAcknowledgement {
-    accepted: bool,
-    action: ActionKind,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct IdleAcknowledgement {
+struct ActionAcknowledgement {
     accepted: bool,
     action: ActionKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReplyToSpeakerArgs {
+struct SpeakToArgs {
+    target_actor_id: usize,
     text: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MoveToArgs {
+    destination_place_id: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InspectEntityArgs {
+    entity_id: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ActorTargetChoice {
+    id: ActorId,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct PlaceChoice {
+    id: PlaceId,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct EntityChoice {
+    id: EntityId,
+    label: String,
+}
+
+type SelectedActionSink = Arc<Mutex<Option<ActionKind>>>;
 type ToolTraceSink = Arc<Mutex<Vec<AgentToolTrace>>>;
 
-struct ReplyToSpeakerTool {
-    speaker_id: ActorId,
-    selected_action: Arc<Mutex<Option<ActionKind>>>,
+struct SpeakToTool {
+    actor_id: ActorId,
+    choices: Vec<ActorTargetChoice>,
+    selected_action: SelectedActionSink,
     tool_calls: ToolTraceSink,
 }
 
-impl ReplyToSpeakerTool {
+impl SpeakToTool {
     fn new(
-        speaker_id: ActorId,
-        selected_action: Arc<Mutex<Option<ActionKind>>>,
+        actor_id: ActorId,
+        choices: Vec<ActorTargetChoice>,
+        selected_action: SelectedActionSink,
         tool_calls: ToolTraceSink,
     ) -> Self {
         Self {
-            speaker_id,
+            actor_id,
+            choices,
             selected_action,
             tool_calls,
         }
     }
 }
 
-impl Tool for ReplyToSpeakerTool {
-    const NAME: &'static str = "reply_to_speaker";
+impl Tool for SpeakToTool {
+    const NAME: &'static str = SPEAK_TO_TOOL_NAME;
     type Error = IoError;
-    type Args = ReplyToSpeakerArgs;
-    type Output = ReplyAcknowledgement;
+    type Args = SpeakToArgs;
+    type Output = ActionAcknowledgement;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Reply directly to the actor who just spoke to you. Provide only the words you want to say.".to_string(),
+            description: format!(
+                "Speak to a nearby actor. Valid targets: {}. Provide only the exact in-character words to say.",
+                render_actor_choices(&self.choices)
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
+                    "target_actor_id": {
+                        "type": "integer",
+                        "description": format!(
+                            "Nearby actor id. Choose one of: {}",
+                            self.choices.iter().map(|choice| choice.id.index().to_string()).collect::<Vec<_>>().join(", ")
+                        )
+                    },
                     "text": {
                         "type": "string",
-                        "description": "The exact short reply to say back to the speaker."
+                        "description": "The exact short line to say, 1-3 short sentences, no narration or speaker label."
                     }
                 },
-                "required": ["text"]
+                "required": ["target_actor_id", "text"]
             }),
         }
     }
@@ -719,13 +787,34 @@ impl Tool for ReplyToSpeakerTool {
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         debug!(
             tool_name = Self::NAME,
-            target_actor_id = self.speaker_id.index(),
+            actor_id = self.actor_id.index(),
+            target_actor_id = args.target_actor_id,
             text_len = args.text.len(),
-            "reply_to_speaker invoked"
+            "speak_to invoked"
         );
+        let Some(target_choice) = self
+            .choices
+            .iter()
+            .find(|choice| choice.id.index() == args.target_actor_id)
+        else {
+            let error = format!(
+                "invalid target_actor_id {}; valid targets are {}",
+                args.target_actor_id,
+                render_actor_choices(&self.choices)
+            );
+            push_tool_trace(
+                &self.tool_calls,
+                Self::NAME,
+                &args,
+                None,
+                Some(error.clone()),
+            );
+            return Err(IoError::other(error));
+        };
+
         let text = args.text.trim();
         if text.is_empty() {
-            let error = "reply_to_speaker requires non-empty text".to_string();
+            let error = "speak_to requires non-empty text".to_string();
             push_tool_trace(
                 &self.tool_calls,
                 Self::NAME,
@@ -737,15 +826,88 @@ impl Tool for ReplyToSpeakerTool {
         }
 
         let action = ActionKind::Speak {
-            target: self.speaker_id,
+            target: target_choice.id,
             text: text.to_string(),
         };
-        let mut guard = self
-            .selected_action
-            .lock()
-            .map_err(|_| IoError::other("selected action lock poisoned"))?;
-        if guard.is_some() {
-            let error = "an action was already selected".to_string();
+        commit_action(
+            &self.selected_action,
+            &self.tool_calls,
+            Self::NAME,
+            &args,
+            action,
+        )
+    }
+}
+
+struct MoveToTool {
+    actor_id: ActorId,
+    choices: Vec<PlaceChoice>,
+    selected_action: SelectedActionSink,
+    tool_calls: ToolTraceSink,
+}
+
+impl MoveToTool {
+    fn new(
+        actor_id: ActorId,
+        choices: Vec<PlaceChoice>,
+        selected_action: SelectedActionSink,
+        tool_calls: ToolTraceSink,
+    ) -> Self {
+        Self {
+            actor_id,
+            choices,
+            selected_action,
+            tool_calls,
+        }
+    }
+}
+
+impl Tool for MoveToTool {
+    const NAME: &'static str = MOVE_TO_TOOL_NAME;
+    type Error = IoError;
+    type Args = MoveToArgs;
+    type Output = ActionAcknowledgement;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: format!(
+                "Move to an adjacent room. Valid destinations: {}.",
+                render_place_choices(&self.choices)
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "destination_place_id": {
+                        "type": "integer",
+                        "description": format!(
+                            "Adjacent room id. Choose one of: {}",
+                            self.choices.iter().map(|choice| choice.id.index().to_string()).collect::<Vec<_>>().join(", ")
+                        )
+                    }
+                },
+                "required": ["destination_place_id"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        debug!(
+            tool_name = Self::NAME,
+            actor_id = self.actor_id.index(),
+            destination_place_id = args.destination_place_id,
+            "move_to invoked"
+        );
+        let Some(destination_choice) = self
+            .choices
+            .iter()
+            .find(|choice| choice.id.index() == args.destination_place_id)
+        else {
+            let error = format!(
+                "invalid destination_place_id {}; valid destinations are {}",
+                args.destination_place_id,
+                render_place_choices(&self.choices)
+            );
             push_tool_trace(
                 &self.tool_calls,
                 Self::NAME,
@@ -754,37 +916,127 @@ impl Tool for ReplyToSpeakerTool {
                 Some(error.clone()),
             );
             return Err(IoError::other(error));
-        }
-        *guard = Some(action.clone());
-        debug!(
-            tool_name = Self::NAME,
-            target_actor_id = self.speaker_id.index(),
-            "reply_to_speaker committed action"
-        );
-
-        let output = ReplyAcknowledgement {
-            accepted: true,
-            action,
         };
-        push_tool_trace(
+
+        let action = ActionKind::MoveTo {
+            destination: destination_choice.id,
+        };
+        commit_action(
+            &self.selected_action,
             &self.tool_calls,
             Self::NAME,
             &args,
-            Some(serialize_pretty(&output)),
-            None,
+            action,
+        )
+    }
+}
+
+struct InspectEntityTool {
+    actor_id: ActorId,
+    choices: Vec<EntityChoice>,
+    selected_action: SelectedActionSink,
+    tool_calls: ToolTraceSink,
+}
+
+impl InspectEntityTool {
+    fn new(
+        actor_id: ActorId,
+        choices: Vec<EntityChoice>,
+        selected_action: SelectedActionSink,
+        tool_calls: ToolTraceSink,
+    ) -> Self {
+        Self {
+            actor_id,
+            choices,
+            selected_action,
+            tool_calls,
+        }
+    }
+}
+
+impl Tool for InspectEntityTool {
+    const NAME: &'static str = INSPECT_ENTITY_TOOL_NAME;
+    type Error = IoError;
+    type Args = InspectEntityArgs;
+    type Output = ActionAcknowledgement;
+
+    async fn definition(&self, _prompt: String) -> ToolDefinition {
+        ToolDefinition {
+            name: Self::NAME.to_string(),
+            description: format!(
+                "Inspect a nearby entity. Valid entities: {}.",
+                render_entity_choices(&self.choices)
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "entity_id": {
+                        "type": "integer",
+                        "description": format!(
+                            "Nearby entity id. Choose one of: {}",
+                            self.choices.iter().map(|choice| choice.id.index().to_string()).collect::<Vec<_>>().join(", ")
+                        )
+                    }
+                },
+                "required": ["entity_id"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        debug!(
+            tool_name = Self::NAME,
+            actor_id = self.actor_id.index(),
+            entity_id = args.entity_id,
+            "inspect_entity invoked"
         );
-        Ok(output)
+        let Some(entity_choice) = self
+            .choices
+            .iter()
+            .find(|choice| choice.id.index() == args.entity_id)
+        else {
+            let error = format!(
+                "invalid entity_id {}; valid entities are {}",
+                args.entity_id,
+                render_entity_choices(&self.choices)
+            );
+            push_tool_trace(
+                &self.tool_calls,
+                Self::NAME,
+                &args,
+                None,
+                Some(error.clone()),
+            );
+            return Err(IoError::other(error));
+        };
+
+        let action = ActionKind::InspectEntity {
+            entity_id: entity_choice.id,
+        };
+        commit_action(
+            &self.selected_action,
+            &self.tool_calls,
+            Self::NAME,
+            &args,
+            action,
+        )
     }
 }
 
 struct DoNothingTool {
-    selected_action: Arc<Mutex<Option<ActionKind>>>,
+    actor_id: ActorId,
+    selected_action: SelectedActionSink,
     tool_calls: ToolTraceSink,
 }
 
 impl DoNothingTool {
-    fn new(selected_action: Arc<Mutex<Option<ActionKind>>>, tool_calls: ToolTraceSink) -> Self {
+    fn new(
+        actor_id: ActorId,
+        selected_action: SelectedActionSink,
+        tool_calls: ToolTraceSink,
+    ) -> Self {
         Self {
+            actor_id,
             selected_action,
             tool_calls,
         }
@@ -792,15 +1044,17 @@ impl DoNothingTool {
 }
 
 impl Tool for DoNothingTool {
-    const NAME: &'static str = "do_nothing";
+    const NAME: &'static str = DO_NOTHING_TOOL_NAME;
     type Error = IoError;
     type Args = serde_json::Value;
-    type Output = IdleAcknowledgement;
+    type Output = ActionAcknowledgement;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: "Decline to answer or act right now.".to_string(),
+            description:
+                "Decline to act right now. Use this if no other available action is worth taking."
+                    .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {}
@@ -809,39 +1063,18 @@ impl Tool for DoNothingTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        debug!(tool_name = Self::NAME, "do_nothing invoked");
-        let mut guard = self
-            .selected_action
-            .lock()
-            .map_err(|_| IoError::other("selected action lock poisoned"))?;
-        if guard.is_some() {
-            let error = "an action was already selected".to_string();
-            push_tool_trace(
-                &self.tool_calls,
-                Self::NAME,
-                &args,
-                None,
-                Some(error.clone()),
-            );
-            return Err(IoError::other(error));
-        }
-
-        let action = ActionKind::DoNothing;
-        *guard = Some(action.clone());
-        debug!(tool_name = Self::NAME, "do_nothing committed action");
-
-        let output = IdleAcknowledgement {
-            accepted: true,
-            action,
-        };
-        push_tool_trace(
+        debug!(
+            tool_name = Self::NAME,
+            actor_id = self.actor_id.index(),
+            "do_nothing invoked"
+        );
+        commit_action(
+            &self.selected_action,
             &self.tool_calls,
             Self::NAME,
             &args,
-            Some(serialize_pretty(&output)),
-            None,
-        );
-        Ok(output)
+            ActionKind::DoNothing,
+        )
     }
 }
 
@@ -878,6 +1111,66 @@ fn push_tool_trace(
     }
 }
 
+fn commit_action(
+    selected_action: &SelectedActionSink,
+    tool_calls: &ToolTraceSink,
+    tool_name: &str,
+    args: &impl Serialize,
+    action: ActionKind,
+) -> Result<ActionAcknowledgement, IoError> {
+    let mut guard = selected_action
+        .lock()
+        .map_err(|_| IoError::other("selected action lock poisoned"))?;
+    if guard.is_some() {
+        let error = "an action was already selected".to_string();
+        push_tool_trace(tool_calls, tool_name, args, None, Some(error.clone()));
+        return Err(IoError::other(error));
+    }
+
+    *guard = Some(action.clone());
+    debug!(tool_name, action = ?action, "tool committed action");
+
+    let output = ActionAcknowledgement {
+        accepted: true,
+        action,
+    };
+    push_tool_trace(
+        tool_calls,
+        tool_name,
+        args,
+        Some(serialize_pretty(&output)),
+        None,
+    );
+    Ok(output)
+}
+
+fn available_tool_names(context: &ActorTurnContext) -> Vec<String> {
+    let mut tool_names = Vec::new();
+    if context
+        .available_actions
+        .iter()
+        .any(|action| matches!(action, AgentAvailableAction::SpeakTo { .. }))
+    {
+        tool_names.push(SPEAK_TO_TOOL_NAME.to_string());
+    }
+    if context
+        .available_actions
+        .iter()
+        .any(|action| matches!(action, AgentAvailableAction::MoveTo { .. }))
+    {
+        tool_names.push(MOVE_TO_TOOL_NAME.to_string());
+    }
+    if context
+        .available_actions
+        .iter()
+        .any(|action| matches!(action, AgentAvailableAction::InspectEntity { .. }))
+    {
+        tool_names.push(INSPECT_ENTITY_TOOL_NAME.to_string());
+    }
+    tool_names.push(DO_NOTHING_TOOL_NAME.to_string());
+    tool_names
+}
+
 fn latest_inbound_speech(context: &ActorTurnContext) -> Option<(ActorId, String)> {
     context
         .recent_speech
@@ -892,42 +1185,185 @@ fn latest_inbound_speech(context: &ActorTurnContext) -> Option<(ActorId, String)
         })
 }
 
-fn build_conversation_prompt(
-    context: &ActorTurnContext,
-    speaker_id: ActorId,
-    speaker_input: &str,
-) -> String {
-    format!(
-        "You are {} the {} in {}.\nTraits: {}\nGoal: {}\nMemory: {}\n{} just said: {}\nDecide whether to answer right now.\nYou MUST call exactly one tool.\nIf you answer, call reply_to_speaker with only the exact words you say, 1-3 short sentences, no narration, no speaker labels, no stage directions.\nIf you do not want to answer, call do_nothing.\nDo not write plain text outside a tool call.\nDo not call both tools.\nCall one tool and stop.",
-        context.actor.name(context.world_seed),
-        context.actor.occupation.label(),
-        crate::world::place_name_from_parts(
-            context.world_seed,
-            context.current_place.id,
-            context.current_place.city_id,
-            context.current_place.kind,
-        ),
-        context
-            .actor
-            .traits
-            .iter()
-            .map(|trait_tag| trait_tag.label())
-            .collect::<Vec<_>>()
-            .join(", "),
-        context.actor.goal.label(),
-        render_memory_for_prompt(&context.memory),
-        speaker_id.name(context.world_seed),
-        speaker_input.trim(),
-    )
+fn speak_choices(context: &ActorTurnContext) -> Vec<ActorTargetChoice> {
+    let mut choices = context
+        .available_actions
+        .iter()
+        .filter_map(|action| match action {
+            AgentAvailableAction::SpeakTo { target } => Some(*target),
+            _ => None,
+        })
+        .map(|id| ActorTargetChoice {
+            id,
+            label: context
+                .local_state
+                .nearby_actors
+                .iter()
+                .find(|actor| actor.id == id)
+                .map(|actor| {
+                    format!(
+                        "{} ({}, {})",
+                        actor.name(context.world_seed),
+                        actor.occupation.label(),
+                        actor.archetype.label()
+                    )
+                })
+                .unwrap_or_else(|| id.name(context.world_seed)),
+        })
+        .collect::<Vec<_>>();
+    choices.sort_by_key(|choice| choice.id.index());
+    choices
 }
 
-fn render_memory_for_prompt(memory: &ConversationMemory) -> String {
-    let summary = memory.summary.trim();
-    if summary.is_empty() {
+fn move_choices(context: &ActorTurnContext) -> Vec<PlaceChoice> {
+    let mut choices = context
+        .available_actions
+        .iter()
+        .filter_map(|action| match action {
+            AgentAvailableAction::MoveTo { destination } => Some(*destination),
+            _ => None,
+        })
+        .map(|id| {
+            let label = context
+                .local_state
+                .routes
+                .iter()
+                .find(|route| route.destination.id == id)
+                .map(|route| {
+                    format!(
+                        "{} via {}s",
+                        place_name_from_parts(
+                            context.world_seed,
+                            route.destination.id,
+                            route.destination.city_id,
+                            route.destination.kind,
+                        ),
+                        route.travel_time.seconds()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}",
+                        place_name_from_parts(
+                            context.world_seed,
+                            id,
+                            context.current_place.city_id,
+                            context.current_place.kind,
+                        )
+                    )
+                });
+            PlaceChoice { id, label }
+        })
+        .collect::<Vec<_>>();
+    choices.sort_by_key(|choice| choice.id.index());
+    choices
+}
+
+fn inspect_choices(context: &ActorTurnContext) -> Vec<EntityChoice> {
+    let mut choices = context
+        .available_actions
+        .iter()
+        .filter_map(|action| match action {
+            AgentAvailableAction::InspectEntity { entity_id } => Some(*entity_id),
+            _ => None,
+        })
+        .map(|id| {
+            let label = context
+                .local_state
+                .nearby_entities
+                .iter()
+                .find(|entity| entity.id == id)
+                .map(|entity| entity.kind.label().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            EntityChoice { id, label }
+        })
+        .collect::<Vec<_>>();
+    choices.sort_by_key(|choice| choice.id.index());
+    choices
+}
+
+fn render_actor_choices(choices: &[ActorTargetChoice]) -> String {
+    if choices.is_empty() {
         "none".to_string()
     } else {
-        summary.to_string()
+        choices
+            .iter()
+            .map(|choice| format!("actor#{} {}", choice.id.index(), choice.label))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
+}
+
+fn render_place_choices(choices: &[PlaceChoice]) -> String {
+    if choices.is_empty() {
+        "none".to_string()
+    } else {
+        choices
+            .iter()
+            .map(|choice| format!("place#{} {}", choice.id.index(), choice.label))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn render_entity_choices(choices: &[EntityChoice]) -> String {
+    if choices.is_empty() {
+        "none".to_string()
+    } else {
+        choices
+            .iter()
+            .map(|choice| format!("entity#{} {}", choice.id.index(), choice.label))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn first_move_destination(context: &ActorTurnContext) -> Option<PlaceId> {
+    context
+        .available_actions
+        .iter()
+        .find_map(|action| match action {
+            AgentAvailableAction::MoveTo { destination } => Some(*destination),
+            _ => None,
+        })
+}
+
+fn first_nearby_entity(context: &ActorTurnContext) -> Option<EntityId> {
+    context
+        .available_actions
+        .iter()
+        .find_map(|action| match action {
+            AgentAvailableAction::InspectEntity { entity_id } => Some(*entity_id),
+            _ => None,
+        })
+}
+
+fn preferred_speak_target(context: &ActorTurnContext) -> Option<ActorId> {
+    let speakable_targets = context
+        .available_actions
+        .iter()
+        .filter_map(|action| match action {
+            AgentAvailableAction::SpeakTo { target } => Some(*target),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if let Some((speaker_id, _)) = latest_inbound_speech(context)
+        && speakable_targets.contains(&speaker_id)
+    {
+        return Some(speaker_id);
+    }
+
+    context
+        .local_state
+        .nearby_actors
+        .iter()
+        .find(|actor| {
+            actor.controller == crate::world::ControllerMode::Manual
+                && speakable_targets.contains(&actor.id)
+        })
+        .map(|actor| actor.id)
+        .or_else(|| speakable_targets.first().copied())
 }
 
 fn mock_reply_text(context: &ActorTurnContext, speaker_input: &str) -> String {
@@ -979,6 +1415,30 @@ fn mock_reply_text(context: &ActorTurnContext, speaker_input: &str) -> String {
     lines.join(" ")
 }
 
+fn mock_initiation_text(context: &ActorTurnContext, target: ActorId) -> String {
+    if target == context.actor.id {
+        return "I'm talking to myself again.".to_string();
+    }
+
+    let target_name = target.name(context.world_seed);
+    let place_name = place_name_from_parts(
+        context.world_seed,
+        context.current_place.id,
+        context.current_place.city_id,
+        context.current_place.kind,
+    );
+    let theme = match context.actor.goal.label() {
+        "wander" => "room to room",
+        "observe" => "what everyone is doing",
+        "work" => "whether anything useful is happening",
+        _ => "what matters around here",
+    };
+
+    format!(
+        "{target_name}, before you drift off, tell me what you make of {place_name}. I've been thinking about {theme}."
+    )
+}
+
 fn speaker_label(line: &DialogueLine) -> String {
     match line.speaker {
         DialogueSpeaker::Actor(_) => "Actor".to_string(),
@@ -986,11 +1446,11 @@ fn speaker_label(line: &DialogueLine) -> String {
     }
 }
 
-const CONVERSATION_PREAMBLE: &str = "You are handling one immediate conversation turn for an NPC in a text game. You must choose exactly one real tool call. Use reply_to_speaker to answer in character, or do_nothing to stay silent. Never answer in plain text. Do not narrate. Do not explain. Call one tool and stop.";
-const CONVERSATION_MAX_TOKENS: u64 = 192;
-const CONVERSATION_SELECTION_TIMEOUT: Duration = Duration::from_secs(60);
-const CONVERSATION_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const CONVERSATION_POST_COMMIT_GRACE: Duration = Duration::from_secs(2);
+const TURN_PREAMBLE: &str = "You are choosing one autonomous NPC turn in a text game. You may initiate or continue conversation with speak_to, move to an adjacent room with move_to, inspect something nearby with inspect_entity, or stay idle with do_nothing. Recent speech matters, but does not force a reply. You must call exactly one real available tool. Never write plain text outside a tool call. Never narrate. Never explain. Call one tool and stop.";
+const TURN_MAX_TOKENS: u64 = 224;
+const TURN_SELECTION_TIMEOUT: Duration = Duration::from_secs(60);
+const TURN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const TURN_POST_COMMIT_GRACE: Duration = Duration::from_secs(2);
 const MEMORY_MAX_TOKENS: u64 = 96;
 const MEMORY_SUMMARY_TIMEOUT: Duration = Duration::from_secs(4);
 const MEMORY_PREAMBLE: &str =
@@ -1015,14 +1475,32 @@ fn fallback_summary(transcript: &[DialogueLine]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use petgraph::stable_graph::NodeIndex;
+    use rig::tool::Tool;
+    use serde_json::json;
+
     use crate::ai::context::build_actor_turn_context;
     use crate::domain::commands::AgentAvailableAction;
     use crate::domain::events::{DialogueLine, DialogueSpeaker};
     use crate::domain::seed::WorldSeed;
     use crate::domain::time::{GameTime, TimeDelta};
-    use crate::world::World;
+    use crate::world::{ControllerMode, World};
 
-    use super::{ActionKind, LlmBackend, MockBackend};
+    use super::{
+        ActionKind, ActorTargetChoice, DoNothingTool, EntityChoice, InspectEntityArgs,
+        InspectEntityTool, LlmBackend, MockBackend, MoveToArgs, MoveToTool, PlaceChoice,
+        SpeakToArgs, SpeakToTool,
+    };
+
+    fn ai_actor_id(world: &World) -> crate::world::ActorId {
+        world
+            .actor_ids()
+            .into_iter()
+            .find(|candidate| world.actor(*candidate).controller == ControllerMode::AiAgent)
+            .expect("expected an ai actor")
+    }
 
     #[tokio::test]
     async fn mock_backend_chooses_speak_when_addressed() {
@@ -1075,15 +1553,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mock_backend_can_proactively_speak_without_inbound_speech() {
+        let world = World::generate(WorldSeed::new(4), 16);
+        let actor_id = ai_actor_id(&world);
+        let target_id = world.manual_actor_id().unwrap();
+        let context = build_actor_turn_context(
+            &world,
+            GameTime::from_seconds(0),
+            actor_id,
+            vec![
+                AgentAvailableAction::SpeakTo { target: target_id },
+                AgentAvailableAction::DoNothing,
+            ],
+        )
+        .unwrap();
+
+        let action = MockBackend.choose_action(&context).await.unwrap();
+        assert!(matches!(
+            action.action,
+            ActionKind::Speak { target, .. } if target == target_id
+        ));
+        assert!(action.trace.toolset.iter().any(|tool| tool == "speak_to"));
+    }
+
+    #[tokio::test]
+    async fn mock_backend_can_choose_move() {
+        let world = World::generate(WorldSeed::new(5), 16);
+        let actor_id = ai_actor_id(&world);
+        let destination = world.place_routes(world.actor_place_id(actor_id).unwrap())[0].0;
+        let context = build_actor_turn_context(
+            &world,
+            GameTime::from_seconds(0),
+            actor_id,
+            vec![
+                AgentAvailableAction::MoveTo { destination },
+                AgentAvailableAction::DoNothing,
+            ],
+        )
+        .unwrap();
+
+        let action = MockBackend.choose_action(&context).await.unwrap();
+        assert!(matches!(
+            action.action,
+            ActionKind::MoveTo { destination: chosen } if chosen == destination
+        ));
+    }
+
+    #[tokio::test]
+    async fn mock_backend_can_choose_inspect() {
+        let mut world = World::generate(WorldSeed::new(6), 16);
+        let actor_id = ai_actor_id(&world);
+        let place_id = world.actor_place_id(actor_id).unwrap();
+        let entity_id = world
+            .place_entities(place_id)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                let other_place = world
+                    .city_places(world.place_city_id(place_id).unwrap())
+                    .into_iter()
+                    .find(|candidate| !world.place_entities(*candidate).is_empty())
+                    .expect("expected a place with an entity");
+                world.move_actor(actor_id, other_place);
+                world.place_entities(other_place)[0]
+            });
+
+        let context = build_actor_turn_context(
+            &world,
+            GameTime::from_seconds(0),
+            actor_id,
+            vec![
+                AgentAvailableAction::InspectEntity { entity_id },
+                AgentAvailableAction::DoNothing,
+            ],
+        )
+        .unwrap();
+
+        let action = MockBackend.choose_action(&context).await.unwrap();
+        assert!(matches!(
+            action.action,
+            ActionKind::InspectEntity { entity_id: chosen } if chosen == entity_id
+        ));
+    }
+
+    #[tokio::test]
     async fn mock_backend_can_choose_do_nothing() {
         let world = World::generate(WorldSeed::new(3), 16);
-        let actor_id = world
-            .actor_ids()
-            .into_iter()
-            .find(|candidate| {
-                world.actor(*candidate).controller == crate::world::ControllerMode::AiAgent
-            })
-            .unwrap();
+        let actor_id = ai_actor_id(&world);
         let context = build_actor_turn_context(
             &world,
             GameTime::from_seconds(0),
@@ -1094,6 +1650,133 @@ mod tests {
 
         let action = MockBackend.choose_action(&context).await.unwrap();
         assert_eq!(action.action, ActionKind::DoNothing);
+    }
+
+    #[tokio::test]
+    async fn speak_to_tool_commits_speak_action() {
+        let selected_action = Arc::new(Mutex::new(None));
+        let tool_calls = Arc::new(Mutex::new(Vec::new()));
+        let actor_id = crate::world::ActorId(NodeIndex::new(1));
+        let target_id = crate::world::ActorId(NodeIndex::new(2));
+        let tool = SpeakToTool::new(
+            actor_id,
+            vec![ActorTargetChoice {
+                id: target_id,
+                label: "target".to_string(),
+            }],
+            Arc::clone(&selected_action),
+            Arc::clone(&tool_calls),
+        );
+
+        let output = tool
+            .call(SpeakToArgs {
+                target_actor_id: target_id.index(),
+                text: "hello there".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            output.action,
+            ActionKind::Speak { target, .. } if target == target_id
+        ));
+        assert!(matches!(
+            selected_action.lock().unwrap().clone(),
+            Some(ActionKind::Speak { target, .. }) if target == target_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn move_to_tool_commits_move_action() {
+        let selected_action = Arc::new(Mutex::new(None));
+        let tool_calls = Arc::new(Mutex::new(Vec::new()));
+        let actor_id = crate::world::ActorId(NodeIndex::new(1));
+        let destination = crate::world::PlaceId(NodeIndex::new(8));
+        let tool = MoveToTool::new(
+            actor_id,
+            vec![PlaceChoice {
+                id: destination,
+                label: "hallway".to_string(),
+            }],
+            Arc::clone(&selected_action),
+            Arc::clone(&tool_calls),
+        );
+
+        let output = tool
+            .call(MoveToArgs {
+                destination_place_id: destination.index(),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            output.action,
+            ActionKind::MoveTo { destination: chosen } if chosen == destination
+        ));
+    }
+
+    #[tokio::test]
+    async fn inspect_entity_tool_commits_inspect_action() {
+        let selected_action = Arc::new(Mutex::new(None));
+        let tool_calls = Arc::new(Mutex::new(Vec::new()));
+        let actor_id = crate::world::ActorId(NodeIndex::new(1));
+        let entity_id = crate::world::EntityId(NodeIndex::new(4));
+        let tool = InspectEntityTool::new(
+            actor_id,
+            vec![EntityChoice {
+                id: entity_id,
+                label: "locker".to_string(),
+            }],
+            Arc::clone(&selected_action),
+            Arc::clone(&tool_calls),
+        );
+
+        let output = tool
+            .call(InspectEntityArgs {
+                entity_id: entity_id.index(),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            output.action,
+            ActionKind::InspectEntity { entity_id: chosen } if chosen == entity_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_tool_commits_fail_cleanly() {
+        let selected_action = Arc::new(Mutex::new(None));
+        let tool_calls = Arc::new(Mutex::new(Vec::new()));
+        let actor_id = crate::world::ActorId(NodeIndex::new(1));
+        let target_id = crate::world::ActorId(NodeIndex::new(2));
+        let speak_tool = SpeakToTool::new(
+            actor_id,
+            vec![ActorTargetChoice {
+                id: target_id,
+                label: "target".to_string(),
+            }],
+            Arc::clone(&selected_action),
+            Arc::clone(&tool_calls),
+        );
+        let idle_tool = DoNothingTool::new(
+            actor_id,
+            Arc::clone(&selected_action),
+            Arc::clone(&tool_calls),
+        );
+
+        speak_tool
+            .call(SpeakToArgs {
+                target_actor_id: target_id.index(),
+                text: "hello".to_string(),
+            })
+            .await
+            .unwrap();
+        let err = idle_tool.call(json!({})).await.unwrap_err();
+
+        assert!(err.to_string().contains("already selected"));
+        assert_eq!(tool_calls.lock().unwrap().len(), 2);
+        assert!(tool_calls.lock().unwrap()[1].error.is_some());
     }
 
     #[test]

@@ -111,6 +111,8 @@ What the log captures:
 - TUI action submission and pending completion
 - panics with backtraces
 
+The file is intentionally formatted for live tailing: compact, one-line events, no span open/close noise, and the most useful `riggy` fields kept inline.
+
 Default filter:
 
 ```text
@@ -136,7 +138,7 @@ The TUI has an agent debug panel.
 When debugging NPCs, the fastest loop is:
 
 1. Reproduce in the TUI or headless client.
-2. Check `logs/riggy.log`.
+2. Tail `logs/riggy.log`.
 3. Check the agent debug panel or headless `debug` output.
 4. Confirm whether the model made a real tool call or only emitted plain text.
 
@@ -199,6 +201,13 @@ Recommended command sequence:
 cargo test -p riggy
 cargo run -p riggy --bin riggy_headless -- --mock -c look -c "say 0 hello" -c debug
 tail -n 200 logs/riggy.log
+```
+
+Useful live log commands:
+
+```bash
+tail -f logs/riggy.log
+tail -f logs/riggy.log | rg "selected_action|tool|autonomous|error"
 ```
 
 ## Testing

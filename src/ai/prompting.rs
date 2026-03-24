@@ -7,7 +7,7 @@ use crate::world::place_name_from_parts;
 
 pub fn build_turn_prompt(context: &ActorTurnContext) -> String {
     format!(
-        "Time: {time_label} ({time_seconds}s)\nCurrent place: {current_place}\nYou are actor #{actor_id}: {actor} ({occupation}, {archetype})\nHome: {home_place}\nTraits: {traits}\nGoal: {goal}\nMemory: {memory}\nNearby actors: {nearby_actors}\nNearby entities: {nearby_entities}\nRoutes: {routes}\nAvailable actions:\n{available_actions}\nRecent speech:\n{recent_speech}\n\nDecide the next action for this actor. If you already know what to do, call perform_action immediately. Someone speaking to you matters, but does not force a reply. The tools are already scoped to you, so never invent or repeat an actor_id argument. Do not narrate. Do not explain. Call perform_action exactly once. Choosing do_nothing is valid.",
+        "Time: {time_label} ({time_seconds}s)\nCurrent place: {current_place}\nYou are actor #{actor_id}: {actor} ({occupation}, {archetype})\nHome: {home_place}\nTraits: {traits}\nGoal: {goal}\nMemory: {memory}\nNearby actors: {nearby_actors}\nNearby entities: {nearby_entities}\nRoutes: {routes}\nAvailable actions:\n{available_actions}\nRecent speech:\n{recent_speech}\n\nDecide the next action for this actor. You may initiate a conversation, continue one, move to another room, inspect something nearby, or stay idle. Recent speech matters, but does not force a reply. The tools are already scoped to you, so never invent or repeat your own actor_id. Call exactly one available tool: speak_to, move_to, inspect_entity, or do_nothing. If you use speak_to, provide only the exact words spoken, 1-3 short sentences, no narration, no speaker labels, and no stage directions. Do not narrate. Do not explain. Call one tool and stop.",
         time_label = context.current_time.format(),
         time_seconds = context.current_time.seconds(),
         current_place = render_place(context.world_seed, context.current_place),
@@ -145,7 +145,7 @@ fn render_available_actions(world_seed: WorldSeed, context: &ActorTurnContext) -
         .iter()
         .map(|action| match action {
             AgentAvailableAction::MoveTo { destination } => format!(
-                "- move_to destination={} ({})",
+                "- move_to destination_place_id={} ({})",
                 destination.index(),
                 render_place(
                     world_seed,
@@ -165,7 +165,7 @@ fn render_available_actions(world_seed: WorldSeed, context: &ActorTurnContext) -
             ),
             AgentAvailableAction::SpeakTo { target } => {
                 format!(
-                    "- speak target={} ({})",
+                    "- speak_to target_actor_id={} ({})",
                     target.index(),
                     target.name(world_seed)
                 )
@@ -177,4 +177,49 @@ fn render_available_actions(world_seed: WorldSeed, context: &ActorTurnContext) -
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ai::context::build_actor_turn_context;
+    use crate::domain::seed::WorldSeed;
+    use crate::domain::time::GameTime;
+    use crate::world::World;
+
+    use super::build_turn_prompt;
+
+    #[test]
+    fn turn_prompt_mentions_generic_tools_and_not_legacy_names() {
+        let world = World::generate(WorldSeed::new(42), 18);
+        let actor_id = world
+            .actor_ids()
+            .into_iter()
+            .find(|candidate| {
+                world.actor(*candidate).controller == crate::world::ControllerMode::AiAgent
+            })
+            .expect("expected an ai actor");
+        let context = build_actor_turn_context(
+            &world,
+            GameTime::from_seconds(0),
+            actor_id,
+            vec![
+                crate::domain::commands::AgentAvailableAction::SpeakTo {
+                    target: world.manual_actor_id().unwrap(),
+                },
+                crate::domain::commands::AgentAvailableAction::MoveTo {
+                    destination: world.place_routes(world.actor_place_id(actor_id).unwrap())[0].0,
+                },
+                crate::domain::commands::AgentAvailableAction::DoNothing,
+            ],
+        )
+        .unwrap();
+
+        let prompt = build_turn_prompt(&context);
+
+        assert!(prompt.contains("speak_to"));
+        assert!(prompt.contains("move_to"));
+        assert!(prompt.contains("do_nothing"));
+        assert!(!prompt.contains("reply_to_speaker"));
+        assert!(!prompt.contains("perform_action"));
+    }
 }

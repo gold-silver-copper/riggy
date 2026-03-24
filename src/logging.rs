@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use tracing::{error, info};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub struct LoggingGuard {
@@ -32,14 +31,11 @@ pub fn init() -> Result<LoggingGuard> {
         .with(env_filter)
         .with(
             fmt::layer()
+                .compact()
                 .with_ansi(false)
                 .with_writer(writer)
-                .with_file(true)
-                .with_line_number(true)
                 .with_target(true)
-                .with_thread_ids(true)
                 .with_thread_names(true)
-                .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE),
         )
         .try_init()?;
 

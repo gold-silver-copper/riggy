@@ -411,6 +411,14 @@ impl WorldFormatter {
         }
     }
 
+    fn actor_subject(&self, actor_id: crate::world::ActorId) -> String {
+        if actor_id == self.manual_actor_id {
+            "You".to_string()
+        } else {
+            actor_id.name(self.seed)
+        }
+    }
+
     fn system_context(&self, context: &SystemContext) -> String {
         match context {
             SystemContext::Travel {
@@ -445,25 +453,45 @@ impl WorldFormatter {
                 clean_inline_text(&line.text)
             )),
             GameEvent::TravelCompleted {
+                actor_id,
                 destination,
                 route,
                 duration,
             } => Some(format!(
-                "You travel to {} using {} in {}.",
+                "{} {} to {} using {} in {}.",
+                self.actor_subject(*actor_id),
+                if *actor_id == self.manual_actor_id {
+                    "travel"
+                } else {
+                    "travels"
+                },
                 self.place(destination),
                 route.kind.label(),
                 format_duration(*duration)
             )),
-            GameEvent::EntityInspected { entity } => Some(format!(
-                "You inspect {}. It looks like a {} left out in plain view.",
+            GameEvent::EntityInspected { actor_id, entity } => Some(format!(
+                "{} {} {}. It looks like a {} left out in plain view.",
+                self.actor_subject(*actor_id),
+                if *actor_id == self.manual_actor_id {
+                    "inspect"
+                } else {
+                    "inspects"
+                },
                 self.entity(entity),
                 entity.kind.label()
             )),
             GameEvent::WaitCompleted {
+                actor_id,
                 duration,
                 current_time,
             } => Some(format!(
-                "You wait for {}. The time is now {}.",
+                "{} {} for {}. The time is now {}.",
+                self.actor_subject(*actor_id),
+                if *actor_id == self.manual_actor_id {
+                    "wait"
+                } else {
+                    "waits"
+                },
                 format_duration(*duration),
                 current_time.format()
             )),

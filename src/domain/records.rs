@@ -69,14 +69,17 @@ pub enum GameEvent {
         line: DialogueLine,
     },
     TravelCompleted {
+        actor_id: ActorId,
         destination: PlaceSummary,
         route: TravelRoute,
         duration: TimeDelta,
     },
     EntityInspected {
+        actor_id: ActorId,
         entity: EntitySummary,
     },
     WaitCompleted {
+        actor_id: ActorId,
         duration: TimeDelta,
         current_time: GameTime,
     },
