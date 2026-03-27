@@ -9,7 +9,7 @@ The main constraints for this roadmap are:
 - no string-matching control flow
 - no UI copy embedded in domain logic
 - no direct LLM-to-world mutation path
-- graph state remains authoritative
+- world state remains authoritative
 - AI context and memory are explicit and testable
 
 ## Current Status
@@ -18,7 +18,7 @@ Completed phases:
 
 - [x] Phase 1: typed read-model and presenter boundary
 - [x] Phase 2: typed command/event application boundary
-- [x] Phase 3: graph-authoritative identity and invariants
+- [x] Phase 3: simplified world model and validation
 - [x] Phase 4: canonical semantic vocabularies
 - [x] Phase 5: AI dialogue boundary without direct world mutation
 - [x] Phase 6: typed AI context contracts
@@ -37,8 +37,8 @@ What is true in the code now:
 - `src/app/service.rs` owns command handling and emits typed `GameEvent`s
 - `src/app/read_model.rs` owns `UiSnapshot` projection from `GameState`
 - `src/app/query.rs` owns shared query helpers used by both service validation and read-model projection
-- `src/world.rs` uses the graph as the authoritative source of node identity and containment
-- `src/domain/invariants.rs` validates graph structure and cross-edge consistency
+- `src/world.rs` owns a simple, game-local authoritative world model for cities, places, NPCs, entities, player state, and active processes
+- `World::validate()` checks world consistency directly without graph/BFO infrastructure
 - `src/domain/vocab.rs` owns canonical enums for city and NPC semantics
 - `GameService::new` and `GameService::load` validate worlds before gameplay begins
 - world generation now samples typed semantic vocabularies rather than raw string tables
@@ -73,7 +73,7 @@ Split the codebase into four layers.
 Owns:
 
 - ids
-- graph-backed world state
+- game-local world state
 - canonical enums and value types
 - invariants
 - domain commands and domain events
@@ -241,58 +241,51 @@ Completion notes:
 - the TUI now consumes `GameService::snapshot()` instead of accessing raw `GameState`.
 - service/query read paths were deduplicated through `src/app/query.rs`.
 
-### Phase 3: Make the Graph Truly Authoritative
+### Phase 3: Simplify the World Model
 
 Goal:
 
-Remove duplicated identity and state assumptions.
+Replace the graph/BFO-backed prototype model with a simpler game-local world.
 
 Progress:
 
-- [x] removed duplicated id fields from `City`, `Place`, `Npc`, and `Entity`
-- [x] removed `Place.city_id` and made city containment edge-derived
-- [x] removed node-id registry vectors from `World` and derived ids from the graph itself
-- [x] stopped construction from using placeholder ids followed by mutation
-- [x] added explicit graph invariant validation in `src/domain/invariants.rs`
-- [x] added regression coverage for invalid graph states
-- [x] added cross-edge validation for NPC resident city vs present place city consistency
+- [x] removed the text game's direct dependency on `riggy_model`, `riggy_ontology`, `bfo`, and `petgraph`
+- [x] moved domain primitives needed by the game into local modules under `src/domain`
+- [x] replaced node/edge traversal with direct collections and typed ids in `src/world.rs`
+- [x] kept explicit `World::validate()` checks for containment, residency, route, and process consistency
+- [x] preserved regression coverage for invalid generated and loaded world states
 - [x] enforced world validation in `GameService::new` and `GameService::load`
 
 Status:
 
 - Phase 3 is complete.
-- The graph is now the authoritative source of identity and containment, and world validation is explicit instead of implicit.
+- The game now uses a simple authoritative world model, and world validation is explicit instead of implicit.
 
 Work:
 
-- stop storing ids redundantly inside node payloads unless absolutely required
-- either:
-  - remove `id` fields from `City`, `Place`, `Npc`, and `Entity`, or
-  - centralize them in typed record wrappers
-- audit denormalized fields like `Place.city_id`
-- formalize containment and residency rules in an invariant layer
+- keep only the domain state the text game actually uses
+- make containment, residency, and routing direct data instead of derived graph edges
+- preserve explicit validation for invalid save snapshots and bad procgen output
 
 Deliverables:
 
-- `src/domain/invariants.rs`
-- graph validation API
+- `src/world.rs`
+- world validation API
 
 Acceptance criteria:
 
 - world can be validated explicitly
-- invalid graph states are detectable in tests
-- construction code no longer relies on placeholder ids followed by mutation
+- invalid world states are detectable in tests
+- construction code no longer depends on graph/node machinery
 
 Completion notes:
 
-- `World` now stores only `seed` and `graph`; node ids are derived from graph node indices on demand.
-- `City`, `Place`, `Npc`, and `Entity` no longer mirror graph identity inside payload structs.
-- `Place` no longer stores `city_id`; `World::place_city_id` resolves that from `ContainsPlace` edges.
-- `src/domain/invariants.rs` now validates containment, residency, route endpoint rules, and NPC resident-city vs present-place-city consistency.
-- `World::validate()` provides an explicit graph validation API for runtime/debug/test use.
+- `World` now stores cities, places, NPCs, entities, player state, and processes directly.
+- local domain modules now own time, seed, vocab, records, and conversation memory for the text game.
+- `World::validate()` checks containment, residency, route endpoint rules, and NPC resident-city vs present-place-city consistency.
 - `GameService::new` now rejects invalid generated worlds before runtime starts.
 - `GameService::load` now rejects invalid saved worlds before they can enter gameplay.
-- regression coverage exists for both graph-layer invalid states and invalid load-time snapshots.
+- regression coverage exists for both invalid in-memory world states and invalid load-time snapshots.
 
 ### Phase 4: Replace Raw Semantic Strings With Canonical Types
 
@@ -559,7 +552,7 @@ src/
 
 ### Domain Tests
 
-- graph invariant tests
+- world validation tests
 - procgen determinism tests
 - command precondition tests
 - event emission tests
@@ -587,7 +580,7 @@ Recommended order for implementation:
 
 1. typed read models and presenter extraction
 2. typed commands and events
-3. graph invariant layer
+3. simple world model and validation layer
 4. semantic vocab types
 5. simplified AI boundary
 6. typed AI context contracts

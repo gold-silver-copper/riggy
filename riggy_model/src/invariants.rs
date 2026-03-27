@@ -261,20 +261,24 @@ fn relation_endpoints_are_valid(
             kind.domain_allows(source_class) && kind.range_allows(target_class)
         }
         None => match edge.relation() {
-            WorldRelation::Riggy(RiggyRelation::TravelRoute) => matches!(
-                world.graph.node_weight(source),
-                Some(WorldNode::City(_) | WorldNode::Place(_))
-            ) && matches!(
-                world.graph.node_weight(target),
-                Some(WorldNode::City(_) | WorldNode::Place(_))
-            ),
-            WorldRelation::Riggy(RiggyRelation::Contains) => matches!(
-                world.graph.node_weight(source),
-                Some(WorldNode::City(_) | WorldNode::Place(_) | WorldNode::Entity(_))
-            ) && matches!(
-                world.graph.node_weight(target),
-                Some(WorldNode::Place(_) | WorldNode::Entity(_) | WorldNode::Player(_))
-            ),
+            WorldRelation::Riggy(RiggyRelation::TravelRoute) => {
+                matches!(
+                    world.graph.node_weight(source),
+                    Some(WorldNode::City(_) | WorldNode::Place(_))
+                ) && matches!(
+                    world.graph.node_weight(target),
+                    Some(WorldNode::City(_) | WorldNode::Place(_))
+                )
+            }
+            WorldRelation::Riggy(RiggyRelation::Contains) => {
+                matches!(
+                    world.graph.node_weight(source),
+                    Some(WorldNode::City(_) | WorldNode::Place(_) | WorldNode::Entity(_))
+                ) && matches!(
+                    world.graph.node_weight(target),
+                    Some(WorldNode::Place(_) | WorldNode::Entity(_) | WorldNode::Player(_))
+                )
+            }
             WorldRelation::Riggy(RiggyRelation::ResidentOf) => {
                 matches!(world.graph.node_weight(source), Some(WorldNode::City(_)))
                     && matches!(world.graph.node_weight(target), Some(WorldNode::Npc(_)))
@@ -301,11 +305,13 @@ fn relation_endpoints_are_valid(
                 )
             }
             WorldRelation::Riggy(RiggyRelation::HasOutput) => {
-                matches!(world.graph.node_weight(source), Some(WorldNode::Occurrent(_)))
-                    && matches!(
-                        world.graph.node_weight(target),
-                        Some(WorldNode::InformationContent(_))
-                    )
+                matches!(
+                    world.graph.node_weight(source),
+                    Some(WorldNode::Occurrent(_))
+                ) && matches!(
+                    world.graph.node_weight(target),
+                    Some(WorldNode::InformationContent(_))
+                )
             }
             WorldRelation::Bfo(_) => unreachable!("handled above"),
         },
@@ -401,22 +407,23 @@ fn validate_target_cardinality(
                 }
                 _ => {}
             },
-            WorldRelation::Riggy(RiggyRelation::PresentAt) => match world.graph.node_weight(index)
-            {
-                Some(WorldNode::Npc(_)) => {
-                    violations.push(InvariantViolation::NpcMultiplePresentAtPlaces {
-                        npc_id: NpcId(index),
-                        count,
-                    });
+            WorldRelation::Riggy(RiggyRelation::PresentAt) => {
+                match world.graph.node_weight(index) {
+                    Some(WorldNode::Npc(_)) => {
+                        violations.push(InvariantViolation::NpcMultiplePresentAtPlaces {
+                            npc_id: NpcId(index),
+                            count,
+                        });
+                    }
+                    Some(WorldNode::Player(_)) => {
+                        violations.push(InvariantViolation::PlayerMultiplePresentAtPlaces {
+                            player_id: PlayerId(index),
+                            count,
+                        });
+                    }
+                    _ => {}
                 }
-                Some(WorldNode::Player(_)) => {
-                    violations.push(InvariantViolation::PlayerMultiplePresentAtPlaces {
-                        player_id: PlayerId(index),
-                        count,
-                    });
-                }
-                _ => {}
-            },
+            }
             WorldRelation::Riggy(RiggyRelation::ResidentOf) => {
                 if matches!(world.graph.node_weight(index), Some(WorldNode::Npc(_))) {
                     violations.push(InvariantViolation::NpcMultipleResidentCities {

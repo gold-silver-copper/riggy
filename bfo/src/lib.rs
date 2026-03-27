@@ -1,4 +1,12 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+#[cfg(feature = "cco")]
+#[cfg_attr(docsrs, doc(cfg(feature = "cco")))]
+pub mod cco {
+    include!(concat!(env!("OUT_DIR"), "/cco_generated.rs"));
+}
 
 #[cfg(test)]
 mod tests {
@@ -185,5 +193,117 @@ mod tests {
                     filler_ofn: "BFO:0000028",
                 })
         );
+    }
+}
+
+#[cfg(all(test, feature = "cco"))]
+mod cco_tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::cco::{self, CcoClassId, CcoModule, CcoRelation, artifact, event};
+    use super::{BfoClass, RelationKind};
+
+    fn ofn_path() -> PathBuf {
+        PathBuf::from(env!("OUT_DIR")).join("cco.ofn")
+    }
+
+    fn count_cco_declarations(prefix: &str) -> usize {
+        fs::read_to_string(ofn_path())
+            .expect("failed to read generated cco.ofn")
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with(prefix) && trimmed.contains("cco:ont")
+            })
+            .count()
+    }
+
+    #[test]
+    fn generated_class_inventory_matches_ofn_declarations() {
+        assert_eq!(
+            CcoClassId::ALL.len(),
+            count_cco_declarations("Declaration(Class(")
+        );
+    }
+
+    #[test]
+    fn generated_relation_inventory_matches_ofn_declarations() {
+        assert_eq!(
+            CcoRelation::ALL.len(),
+            count_cco_declarations("Declaration(ObjectProperty(")
+        );
+    }
+
+    #[test]
+    fn generated_class_lookup_and_parent_links_work() {
+        assert_eq!(
+            CcoClassId::from_id("ont00000001"),
+            Some(artifact::ArtifactClass::DeflectingPrism.into())
+        );
+        assert_eq!(
+            artifact::ArtifactClass::DeflectingPrism.label(),
+            "Deflecting Prism"
+        );
+        assert_eq!(
+            artifact::ArtifactClass::DeflectingPrism
+                .class()
+                .definition(),
+            Some(
+                "A Prism designed to deflect a beam of light entering the Prism by a fixed angle."
+            )
+        );
+        assert_eq!(
+            artifact::ArtifactClass::DeflectingPrism
+                .class()
+                .direct_cco_parents(),
+            &[artifact::ArtifactClass::Prism.into()]
+        );
+        assert_eq!(
+            event::EventClass::Change.class().direct_bfo_parents(),
+            &[BfoClass::Process.into()]
+        );
+    }
+
+    #[test]
+    fn generated_modules_group_classes_cleanly() {
+        assert_eq!(
+            artifact::ArtifactClass::DeflectingPrism.module(),
+            CcoModule::Artifact
+        );
+        assert_eq!(event::EventClass::Change.module(), CcoModule::Event);
+        assert!(
+            CcoModule::Artifact
+                .classes()
+                .contains(&artifact::ArtifactClass::Prism.into())
+        );
+        assert!(artifact::ArtifactClass::from_id("ont00000001").is_some());
+        assert!(event::EventClass::from_id("ont00000001").is_none());
+    }
+
+    #[test]
+    fn generated_relation_lookup_and_bfo_parent_links_work() {
+        assert_eq!(
+            CcoRelation::from_id("ont00001777"),
+            Some(CcoRelation::HasProcessPart)
+        );
+        assert_eq!(CcoRelation::HasProcessPart.label(), "has process part");
+        assert_eq!(
+            CcoRelation::HasProcessPart.direct_bfo_parents(),
+            &[RelationKind::HasOccurrentPart.into()]
+        );
+    }
+
+    #[test]
+    fn generated_external_relation_parents_are_preserved() {
+        assert_eq!(
+            CcoRelation::IsMadeOf.direct_external_parents(),
+            &["owl:topObjectProperty"]
+        );
+    }
+
+    #[test]
+    fn feature_module_is_exposed_under_bfo() {
+        assert!(cco::CcoModule::ALL.contains(&CcoModule::Artifact));
     }
 }

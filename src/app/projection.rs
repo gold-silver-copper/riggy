@@ -1,16 +1,16 @@
-use crate::ai::context::{CityContext, NpcContext};
-use crate::app::query::{active_dialogue_npc_id, current_place_id};
+use crate::ai::context::{ActorContext, CityContext};
+use crate::app::query::current_place_id;
 use crate::domain::events::{EntitySummary, PlaceSummary};
-use crate::simulation::{
-    ActorView, CityView, DialoguePartnerView, GameState, Interactable, RouteView,
-};
-use crate::world::{CityId, EntityId, NpcId, PlaceId, World};
+use crate::simulation::{ActorView, CityView, GameState, Interactable, RouteView};
+use crate::world::{ActorId, CityId, EntityId, PlaceId, World};
 
 pub fn place_summary(world: &World, place_id: PlaceId) -> PlaceSummary {
     let place = world.place(place_id);
     PlaceSummary {
         id: place_id,
-        district_id: place.district_id,
+        city_id: world
+            .place_city_id(place_id)
+            .expect("place should belong to a city"),
         kind: place.kind,
     }
 }
@@ -23,10 +23,10 @@ pub fn entity_summary(world: &World, entity_id: EntityId) -> EntitySummary {
     }
 }
 
-pub fn actor_view(world: &World, npc_id: NpcId) -> ActorView {
-    let profile = world.npc_profile(npc_id);
+pub fn actor_view(world: &World, actor_id: ActorId) -> ActorView {
+    let profile = world.actor_profile(actor_id);
     ActorView {
-        id: npc_id,
+        id: actor_id,
         occupation: profile.occupation,
         archetype: profile.archetype,
     }
@@ -39,22 +39,14 @@ pub fn city_view(world: &World, city_id: CityId) -> CityView {
         biome: city.biome,
         economy: city.economy,
         culture: city.culture,
-        districts: city.districts.iter().map(|district| district.id).collect(),
-        landmarks: city.landmarks.iter().map(|landmark| landmark.id).collect(),
+        connected_cities: world.city_connections(city_id),
     }
 }
 
-pub fn dialogue_partner_view(state: &GameState) -> Option<DialoguePartnerView> {
-    active_dialogue_npc_id(state).map(|npc_id| DialoguePartnerView {
-        actor: actor_view(&state.world, npc_id),
-        memory: state.world.npc_conversation_memory(npc_id),
-    })
-}
-
-pub fn route_views(state: &GameState) -> Vec<RouteView> {
+pub fn route_views(state: &GameState, focused_actor_id: ActorId) -> Vec<RouteView> {
     state
         .world
-        .place_routes(current_place_id(state))
+        .place_routes(current_place_id(state, focused_actor_id))
         .iter()
         .map(|(place_id, route)| RouteView {
             destination: place_summary(&state.world, *place_id),
@@ -64,17 +56,18 @@ pub fn route_views(state: &GameState) -> Vec<RouteView> {
         .collect()
 }
 
-pub fn interactables(state: &GameState) -> Vec<Interactable> {
+pub fn interactables(state: &GameState, focused_actor_id: ActorId) -> Vec<Interactable> {
     let mut interactables = state
         .world
-        .place_npcs(current_place_id(state))
+        .place_actors(current_place_id(state, focused_actor_id))
         .into_iter()
-        .map(|npc_id| Interactable::Talk(actor_view(&state.world, npc_id)))
+        .filter(|actor_id| *actor_id != focused_actor_id)
+        .map(|actor_id| Interactable::Talk(actor_view(&state.world, actor_id)))
         .collect::<Vec<_>>();
     interactables.extend(
         state
             .world
-            .place_entities(current_place_id(state))
+            .place_entities(current_place_id(state, focused_actor_id))
             .into_iter()
             .map(|entity_id| Interactable::Inspect(entity_summary(&state.world, entity_id))),
     );
@@ -88,20 +81,19 @@ pub fn city_context(world: &World, city_id: CityId) -> CityContext {
         biome: city.biome,
         economy: city.economy,
         culture: city.culture,
-        districts: city.districts.iter().map(|district| district.id).collect(),
-        landmarks: city.landmarks.iter().map(|landmark| landmark.id).collect(),
         connected_cities: world.city_connections(city_id),
     }
 }
 
-pub fn npc_context(world: &World, npc_id: NpcId) -> NpcContext {
-    let profile = world.npc_profile(npc_id);
-    NpcContext {
-        id: npc_id,
+pub fn actor_context(world: &World, actor_id: ActorId) -> ActorContext {
+    let profile = world.actor_profile(actor_id);
+    ActorContext {
+        id: actor_id,
+        controller: profile.controller,
         archetype: profile.archetype,
         occupation: profile.occupation,
         traits: profile.traits,
         goal: profile.goal,
-        home_district: profile.home_district,
+        home_place: place_summary(world, profile.home_place_id),
     }
 }

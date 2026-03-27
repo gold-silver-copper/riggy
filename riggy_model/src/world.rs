@@ -16,10 +16,10 @@ pub use riggy_ontology::terms::{
 use riggy_ontology::time::{GameTime, TimeDelta};
 use riggy_ontology::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
 
-use crate::invariants::{InvariantViolation, validate_world};
-use crate::records::{ContextEntry, DialogueLine, DialogueSpeaker, SystemContext};
 pub use crate::graph_ecs::{CityId, EntityId, NpcId, PlaceId, PlayerId, ProcessId};
 use crate::graph_ecs::{WorldEdge, WorldGraph, WorldNode, WorldRelation, add_edge, edge_snapshot};
+use crate::invariants::{InvariantViolation, validate_world};
+use crate::records::{ContextEntry, DialogueLine, DialogueSpeaker, SystemContext};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct World {
@@ -271,21 +271,13 @@ impl World {
             city_hubs.push(station.platform_id);
 
             for window in road_lanes.windows(2) {
-                let route = random_timed_route(
-                    &mut rng,
-                    RouteKind::LocalRoad,
-                    (60, 180),
-                );
+                let route = random_timed_route(&mut rng, RouteKind::LocalRoad, (60, 180));
                 add_bidirectional_route(&mut graph, window[0].0, window[1].0, route);
             }
             if road_lanes.len() > 2 {
                 let a = road_lanes[0];
                 let b = *road_lanes.last().unwrap();
-                let route = random_timed_route(
-                    &mut rng,
-                    RouteKind::LocalRoad,
-                    (120, 360),
-                );
+                let route = random_timed_route(&mut rng, RouteKind::LocalRoad, (120, 360));
                 add_bidirectional_route(&mut graph, a.0, b.0, route);
             }
 
@@ -1457,11 +1449,7 @@ fn add_npc_dependent_continuants(
     }
 }
 
-fn random_timed_route(
-    rng: &mut ChaCha8Rng,
-    kind: RouteKind,
-    walking: (u32, u32),
-) -> TravelRoute {
+fn random_timed_route(rng: &mut ChaCha8Rng, kind: RouteKind, walking: (u32, u32)) -> TravelRoute {
     TravelRoute {
         kind,
         travel_time: TimeDelta::from_seconds(rng.random_range(walking.0..=walking.1)),

@@ -1,22 +1,28 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::app::projection::{city_context, npc_context};
-use crate::domain::events::DialogueLine;
+use crate::app::projection::{actor_context, city_context, entity_summary, place_summary};
+use crate::domain::commands::AgentAvailableAction;
+use crate::domain::events::{DialogueLine, EntitySummary, PlaceSummary};
 use crate::domain::memory::ConversationMemory;
 use crate::domain::seed::WorldSeed;
-use crate::domain::time::GameTime;
+use crate::domain::time::{GameTime, TimeDelta};
 use crate::domain::vocab::{Biome, Culture, Economy, GoalTag, NpcArchetype, Occupation, TraitTag};
-use crate::world::{CityId, DistrictId, LandmarkId, NpcId, ProcessId, World};
+use crate::world::{ActorId, CityId, ControllerMode, World, place_name_from_parts};
+
+const RECENT_SPEECH_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NpcDialogueContext {
+pub struct ActorTurnContext {
     pub world_seed: WorldSeed,
     pub current_time: GameTime,
     pub city: CityContext,
-    pub npc: NpcContext,
+    pub current_place: PlaceSummary,
+    pub actor: ActorContext,
     pub memory: ConversationMemory,
-    pub turn: DialogueTurnContext,
+    pub local_state: LocalStateContext,
+    pub recent_speech: Vec<DialogueLine>,
+    pub available_actions: Vec<AgentAvailableAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,8 +31,6 @@ pub struct CityContext {
     pub biome: Biome,
     pub economy: Economy,
     pub culture: Culture,
-    pub districts: Vec<DistrictId>,
-    pub landmarks: Vec<LandmarkId>,
     pub connected_cities: Vec<CityId>,
 }
 
@@ -37,163 +41,114 @@ impl CityContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NpcContext {
-    pub id: NpcId,
+pub struct ActorContext {
+    pub id: ActorId,
+    pub controller: ControllerMode,
     pub archetype: NpcArchetype,
     pub occupation: Occupation,
     pub traits: Vec<TraitTag>,
     pub goal: GoalTag,
-    pub home_district: DistrictId,
+    pub home_place: PlaceSummary,
 }
 
-impl NpcContext {
+impl ActorContext {
     pub fn name(&self, world_seed: WorldSeed) -> String {
         self.id.name(world_seed)
     }
 
-    pub fn home_district_name(&self, world_seed: WorldSeed) -> String {
-        self.home_district.name(world_seed)
+    pub fn home_place_name(&self, world_seed: WorldSeed) -> String {
+        place_name_from_parts(
+            world_seed,
+            self.home_place.id,
+            self.home_place.city_id,
+            self.home_place.kind,
+        )
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DialogueTurnContext {
-    pub transcript: Vec<DialogueLine>,
-    pub player_input: String,
+pub struct LocalStateContext {
+    pub nearby_actors: Vec<ActorContext>,
+    pub nearby_entities: Vec<EntitySummary>,
+    pub routes: Vec<RouteContext>,
 }
 
-pub fn build_npc_dialogue_context(
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteContext {
+    pub destination: PlaceSummary,
+    pub travel_time: TimeDelta,
+}
+
+pub fn build_actor_turn_context(
     world: &World,
     current_time: GameTime,
-    city_id: CityId,
-    memory: &ConversationMemory,
-    process_id: ProcessId,
-    player_input: String,
-) -> Result<NpcDialogueContext> {
-    let npc_id = world
-        .dialogue_npc_id(process_id)
-        .ok_or_else(|| anyhow::anyhow!("dialogue context process is missing an NPC participant"))?;
+    actor_id: ActorId,
+    available_actions: Vec<AgentAvailableAction>,
+) -> Result<ActorTurnContext> {
+    let place_id = world
+        .actor_place_id(actor_id)
+        .ok_or_else(|| anyhow::anyhow!("turn actor is missing a place"))?;
+    let city_id = world
+        .place_city_id(place_id)
+        .ok_or_else(|| anyhow::anyhow!("turn actor place is missing a city"))?;
     if !world.city_ids().contains(&city_id) {
-        bail!("dialogue context city does not exist");
+        bail!("turn context city does not exist");
     }
-    if !world.npc_ids().contains(&npc_id) {
-        bail!("dialogue context npc does not exist");
-    }
-    if !world.city_npcs(city_id).contains(&npc_id) {
-        bail!("dialogue context npc does not belong to the provided city");
+    if !world.actor_ids().contains(&actor_id) {
+        bail!("turn context actor does not exist");
     }
 
-    Ok(NpcDialogueContext {
+    let nearby_actor_ids = world
+        .place_actors(place_id)
+        .into_iter()
+        .filter(|candidate| *candidate != actor_id)
+        .collect::<Vec<_>>();
+    let local_state = LocalStateContext {
+        nearby_actors: nearby_actor_ids
+            .iter()
+            .copied()
+            .map(|nearby_actor_id| actor_context(world, nearby_actor_id))
+            .collect(),
+        nearby_entities: world
+            .place_entities(place_id)
+            .into_iter()
+            .map(|entity_id| entity_summary(world, entity_id))
+            .collect(),
+        routes: world
+            .place_routes(place_id)
+            .into_iter()
+            .map(|(destination_id, route)| RouteContext {
+                destination: place_summary(world, destination_id),
+                travel_time: route.travel_time,
+            })
+            .collect(),
+    };
+
+    let mut recent_speech = nearby_actor_ids
+        .iter()
+        .copied()
+        .flat_map(|nearby_actor_id| {
+            world.speech_lines_between(actor_id, nearby_actor_id, RECENT_SPEECH_LIMIT)
+        })
+        .collect::<Vec<_>>();
+    recent_speech.sort_by_key(|line| line.timestamp);
+    let speech_len = recent_speech.len();
+    let recent_speech = recent_speech
+        .into_iter()
+        .skip(speech_len.saturating_sub(RECENT_SPEECH_LIMIT))
+        .collect();
+
+    Ok(ActorTurnContext {
         world_seed: world.seed,
         current_time,
         city: city_context(world, city_id),
-        npc: npc_context(world, npc_id),
-        memory: memory.clone(),
-        turn: DialogueTurnContext {
-            transcript: world.dialogue_lines(process_id),
-            player_input,
-        },
+        current_place: place_summary(world, place_id),
+        actor: actor_context(world, actor_id),
+        memory: world
+            .actor_conversation_memory(actor_id)
+            .unwrap_or_default(),
+        local_state,
+        recent_speech,
+        available_actions,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::domain::events::{DialogueLine, DialogueSpeaker};
-    use crate::domain::memory::ConversationMemory;
-    use crate::domain::time::GameTime;
-    use crate::world::World;
-
-    use super::build_npc_dialogue_context;
-
-    #[test]
-    fn builder_creates_context_from_world_state() {
-        let world = World::generate(crate::domain::seed::WorldSeed::new(9), 16);
-        let city_id = world.city_ids()[0];
-        let npc_id = world.city_npcs(city_id)[0];
-        let player_id = world.player_id().expect("world should contain a player");
-        let memory = ConversationMemory {
-            summary: "The player kept their word once before.".to_string(),
-        };
-        let mut world = world;
-        let place_id = world.city_places(city_id)[0];
-        let process_id =
-            world.start_dialogue_process(player_id, npc_id, place_id, GameTime::from_seconds(4));
-        world.append_dialogue_utterance(
-            process_id,
-            player_id,
-            DialogueLine {
-                timestamp: GameTime::from_seconds(4),
-                speaker: DialogueSpeaker::Player,
-                text: "hello".to_string(),
-            },
-        );
-
-        let context = build_npc_dialogue_context(
-            &world,
-            GameTime::from_seconds(34),
-            city_id,
-            &memory,
-            process_id,
-            "What is this city like?".to_string(),
-        )
-        .unwrap();
-
-        assert_eq!(context.current_time, GameTime::from_seconds(34));
-        assert_eq!(context.current_time.format(), "Day 1 00:00:34");
-        assert_eq!(context.city.id, city_id);
-        assert_eq!(context.npc.id, npc_id);
-        assert_eq!(
-            context.memory.summary,
-            "The player kept their word once before."
-        );
-        assert!(
-            !context.city.districts[0]
-                .description(context.world_seed)
-                .is_empty()
-        );
-        assert!(
-            !context.city.landmarks[0]
-                .name(context.world_seed)
-                .is_empty()
-        );
-        assert_eq!(context.npc.home_district.city_id, city_id);
-        assert_eq!(context.turn.player_input, "What is this city like?");
-        assert!(!context.city.connected_cities.is_empty());
-        assert_eq!(context.turn.transcript.len(), 1);
-        assert_eq!(context.turn.transcript[0].speaker, DialogueSpeaker::Player);
-    }
-
-    #[test]
-    fn builder_rejects_incoherent_city_and_npc_inputs() {
-        let world = World::generate(crate::domain::seed::WorldSeed::new(9), 16);
-        let city_id = world.city_ids()[0];
-        let other_city_id = world
-            .city_ids()
-            .into_iter()
-            .find(|candidate| *candidate != city_id)
-            .expect("world should contain at least two cities");
-        let npc_id = world.city_npcs(city_id)[0];
-        let player_id = world.player_id().expect("world should contain a player");
-        let memory = ConversationMemory::default();
-        let mut world = world;
-        let place_id = world.city_places(city_id)[0];
-        let process_id =
-            world.start_dialogue_process(player_id, npc_id, place_id, GameTime::from_seconds(0));
-
-        let error = build_npc_dialogue_context(
-            &world,
-            GameTime::from_seconds(90),
-            other_city_id,
-            &memory,
-            process_id,
-            "hello".to_string(),
-        )
-        .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("npc does not belong to the provided city")
-        );
-    }
 }

@@ -1,95 +1,333 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
+use tracing::{debug, error, info, trace, warn};
 
-use crate::ai::context::build_npc_dialogue_context;
+use crate::ai::context::build_actor_turn_context;
+use crate::app::projection::actor_view as build_actor_view;
 use crate::app::projection::{
     entity_summary as build_entity_summary, place_summary as build_place_summary,
 };
-use crate::app::query::{
-    active_dialogue_npc_id, active_dialogue_process_id, current_city_id, current_place_id,
-    current_time, player_id,
-};
 use crate::app::read_model::build_ui_snapshot;
-use crate::domain::commands::GameCommand;
+use crate::domain::commands::{
+    ActionKind, ActionPlan, ActionRequest, AgentAvailableAction, AvailableAction, PlannedAction,
+};
 use crate::domain::events::{
-    CommandResult, ContextEntry, DialogueLine, DialogueSpeaker, EntitySummary, GameEvent,
+    ActionResult, ContextEntry, DialogueLine, DialogueSpeaker, EntitySummary, GameEvent,
     PlaceSummary, SystemContext,
 };
 use crate::domain::seed::WorldSeed;
 use crate::domain::time::{GameTime, TimeDelta};
+use crate::llm::AgentDebugTrace;
 use crate::llm::LlmBackend;
-use crate::simulation::{GameState, UiSnapshot};
-use crate::world::{EntityId, NpcId, PlaceId, PlaceKind, World};
+use crate::simulation::{AgentDebugSnapshot, GameState};
+use crate::world::{ActorId, ControllerMode, EntityId, PlaceId, World};
 
 const START_TIME: GameTime = GameTime::from_seconds(8 * 60 * 60);
-const DIALOGUE_TIME: TimeDelta = TimeDelta::from_seconds(30);
-
+const INSPECT_TIME: TimeDelta = TimeDelta::from_seconds(10);
 #[derive(Debug)]
 pub struct GameService<B> {
     state: GameState,
     backend: B,
+    agent_debug_traces: BTreeMap<ActorId, AgentDebugTrace>,
 }
 
 impl<B: LlmBackend> GameService<B> {
     pub fn new(backend: B) -> Result<Self> {
-        let seed = WorldSeed::new(42);
+        Self::new_with_seed(backend, current_world_seed())
+    }
+
+    pub fn new_with_seed(backend: B, seed: WorldSeed) -> Result<Self> {
         let mut world = World::generate(seed, 18);
-        validate_world(&world)?;
-        let start_city_id = world.city_ids()[0];
+        let actor_id = world
+            .manual_actor_id()
+            .expect("generated world should contain a manual actor");
+        let start_city_id = world
+            .actor_city_id(actor_id)
+            .unwrap_or_else(|| world.city_ids()[0]);
         let city_places = world.city_places(start_city_id);
         let start_place_id = city_places
             .iter()
             .copied()
-            .find(|place_id| matches!(world.place(*place_id).kind, PlaceKind::ApartmentLobby))
-            .or_else(|| {
-                city_places
-                    .iter()
-                    .copied()
-                    .find(|place_id| world.place(*place_id).kind.supports_people())
-            })
+            .find(|place_id| world.place(*place_id).kind.supports_people())
             .or_else(|| city_places.first().copied())
             .expect("generated city should have places");
-        let player_id = world.ensure_player();
-        world.move_player(player_id, start_place_id);
+        world.set_actor_home(actor_id, start_place_id);
+        world.move_actor(actor_id, start_place_id);
         world.set_current_time(START_TIME);
-        world.discover_city(player_id, start_city_id, START_TIME);
+        world.discover_city(actor_id, start_city_id, START_TIME);
         for city_id in world.city_connections(start_city_id) {
-            world.discover_city(player_id, city_id, START_TIME);
+            world.discover_city(actor_id, city_id, START_TIME);
         }
-        world.append_context_entry(
-            player_id,
-            ContextEntry::System {
-                timestamp: START_TIME,
-                context: SystemContext::Start,
-            },
+        validate_world(&world)?;
+        info!(
+            backend = %backend.label(),
+            world_seed = seed.raw(),
+            manual_actor_id = actor_id.index(),
+            start_city_id = start_city_id.index(),
+            start_place_id = start_place_id.index(),
+            "initialized game service"
         );
 
         Ok(Self {
             state: GameState { world },
             backend,
+            agent_debug_traces: BTreeMap::new(),
         })
     }
 
-    pub fn backend_name(&self) -> &'static str {
-        self.backend.name()
+    pub fn backend_label(&self) -> String {
+        self.backend.label()
     }
 
-    pub fn snapshot(&self) -> UiSnapshot {
-        build_ui_snapshot(&self.state)
+    pub fn snapshot(&self) -> crate::simulation::UiSnapshot {
+        self.snapshot_for(self.manual_actor_id())
     }
 
-    pub async fn apply_command(&mut self, command: GameCommand) -> Result<CommandResult> {
-        let events = match command {
-            GameCommand::TravelTo(destination) => self.travel_to(destination)?,
-            GameCommand::OpenDialogue(npc_id) => self.start_dialogue(npc_id)?,
-            GameCommand::SubmitDialogueLine(input) => self.submit_dialogue_line(input).await?,
-            GameCommand::InspectEntity(entity_id) => vec![self.inspect_entity(entity_id)?],
-            GameCommand::Wait(duration) => vec![self.wait_for(duration.max(TimeDelta::ONE_SECOND))],
-            GameCommand::LeaveDialogue => vec![self.leave_dialogue().await?],
+    pub fn snapshot_for(&self, focused_actor_id: ActorId) -> crate::simulation::UiSnapshot {
+        build_ui_snapshot(
+            &self.state,
+            focused_actor_id,
+            self.available_actions(focused_actor_id),
+            self.local_agent_debug_snapshots(focused_actor_id),
+        )
+    }
+
+    pub fn available_actions(&self, actor_id: ActorId) -> Vec<AvailableAction> {
+        let Some(place_id) = self.state.world.actor_place_id(actor_id) else {
+            return Vec::new();
         };
-        Ok(CommandResult {
+
+        let mut actions = self
+            .state
+            .world
+            .place_routes(place_id)
+            .into_iter()
+            .map(|(destination, _)| AvailableAction::MoveTo { destination })
+            .collect::<Vec<_>>();
+        actions.extend(
+            self.state
+                .world
+                .place_actors(place_id)
+                .into_iter()
+                .filter(|candidate| *candidate != actor_id)
+                .map(|target| AvailableAction::SpeakTo { target }),
+        );
+        actions.extend(
+            self.state
+                .world
+                .place_entities(place_id)
+                .into_iter()
+                .map(|entity_id| AvailableAction::InspectEntity { entity_id }),
+        );
+        actions.push(AvailableAction::Wait);
+        actions
+    }
+
+    pub fn available_agent_actions(&self, actor_id: ActorId) -> Vec<AgentAvailableAction> {
+        let Some(place_id) = self.state.world.actor_place_id(actor_id) else {
+            return vec![AgentAvailableAction::DoNothing];
+        };
+
+        let mut actions = self
+            .state
+            .world
+            .place_routes(place_id)
+            .into_iter()
+            .map(|(destination, _)| AgentAvailableAction::MoveTo { destination })
+            .collect::<Vec<_>>();
+        actions.extend(
+            self.state
+                .world
+                .place_actors(place_id)
+                .into_iter()
+                .filter(|candidate| *candidate != actor_id)
+                .map(|target| AgentAvailableAction::SpeakTo { target }),
+        );
+        actions.extend(
+            self.state
+                .world
+                .place_entities(place_id)
+                .into_iter()
+                .map(|entity_id| AgentAvailableAction::InspectEntity { entity_id }),
+        );
+        actions.push(AgentAvailableAction::DoNothing);
+        actions
+    }
+
+    pub fn plan_action(&self, request: ActionRequest) -> Result<ActionPlan> {
+        debug!(
+            actor_id = request.actor_id.index(),
+            action = ?request.action,
+            "planning action"
+        );
+        if !self.state.world.actor_ids().contains(&request.actor_id) {
+            bail!("Actor does not exist.");
+        }
+
+        let actor_place_id = self
+            .state
+            .world
+            .actor_place_id(request.actor_id)
+            .ok_or_else(|| anyhow::anyhow!("Actor is not in a place."))?;
+        let available_actions = self.available_actions(request.actor_id);
+
+        match request.action {
+            ActionKind::MoveTo { destination } => {
+                let route = self
+                    .state
+                    .world
+                    .place_routes(actor_place_id)
+                    .into_iter()
+                    .find_map(|(candidate, route)| (candidate == destination).then_some(route))
+                    .ok_or_else(|| anyhow::anyhow!("Selected route is no longer available."))?;
+                Ok(ActionPlan {
+                    actor_id: request.actor_id,
+                    duration: route.travel_time,
+                    action: PlannedAction::MoveTo {
+                        origin: actor_place_id,
+                        destination,
+                        route,
+                    },
+                })
+            }
+            ActionKind::Speak { target, text } => {
+                if !available_actions.contains(&AvailableAction::SpeakTo { target }) {
+                    bail!("That person is no longer here.");
+                }
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    bail!("You cannot say nothing.");
+                }
+                Ok(ActionPlan {
+                    actor_id: request.actor_id,
+                    duration: line_duration(trimmed),
+                    action: PlannedAction::Speak {
+                        place_id: actor_place_id,
+                        target,
+                        text: trimmed.to_string(),
+                    },
+                })
+            }
+            ActionKind::InspectEntity { entity_id } => {
+                if !available_actions.contains(&AvailableAction::InspectEntity { entity_id }) {
+                    bail!("That entity is no longer here.");
+                }
+                Ok(ActionPlan {
+                    actor_id: request.actor_id,
+                    duration: INSPECT_TIME,
+                    action: PlannedAction::InspectEntity {
+                        place_id: actor_place_id,
+                        entity_id,
+                    },
+                })
+            }
+            ActionKind::Wait { duration } => {
+                if !available_actions.contains(&AvailableAction::Wait) {
+                    bail!("This actor cannot wait right now.");
+                }
+                Ok(ActionPlan {
+                    actor_id: request.actor_id,
+                    duration: duration.max(TimeDelta::ONE_SECOND),
+                    action: PlannedAction::Wait {
+                        place_id: actor_place_id,
+                    },
+                })
+            }
+            ActionKind::DoNothing => Ok(ActionPlan {
+                actor_id: request.actor_id,
+                duration: TimeDelta::ZERO,
+                action: PlannedAction::DoNothing {
+                    place_id: actor_place_id,
+                },
+            }),
+        }
+    }
+
+    pub async fn choose_autonomous_action(
+        &mut self,
+        actor_id: ActorId,
+    ) -> Result<Option<ActionRequest>> {
+        debug!(actor_id = actor_id.index(), "choosing autonomous action");
+        if !self.state.world.actor_ids().contains(&actor_id) {
+            bail!("Actor does not exist.");
+        }
+        if self.state.world.actor(actor_id).controller != ControllerMode::AiAgent {
+            return Ok(None);
+        }
+
+        let available_actions = self.available_agent_actions(actor_id);
+        let context = build_actor_turn_context(
+            &self.state.world,
+            self.current_time(),
+            actor_id,
+            available_actions,
+        )?;
+        trace!(
+            actor_id = actor_id.index(),
+            available_actions = ?context.available_actions,
+            recent_speech = ?context.recent_speech,
+            "built autonomous actor turn context"
+        );
+        let selection_started = Instant::now();
+        let selection = match self.backend.choose_action(&context).await {
+            Ok(selection) => selection,
+            Err(error) => {
+                let mut trace = AgentDebugTrace::from_context(&context, &self.backend.label());
+                trace.error = Some(error.to_string());
+                self.agent_debug_traces.insert(actor_id, trace);
+                error!(
+                    actor_id = actor_id.index(),
+                    error = %error,
+                    elapsed_ms = selection_started.elapsed().as_millis(),
+                    "autonomous action selection failed"
+                );
+                return Ok(None);
+            }
+        };
+        self.agent_debug_traces
+            .insert(actor_id, selection.trace.clone());
+        info!(
+            actor_id = actor_id.index(),
+            selected_action = ?selection.action,
+            tool_calls = selection.trace.tool_calls.len(),
+            elapsed_ms = selection_started.elapsed().as_millis(),
+            "autonomous actor selected action"
+        );
+
+        Ok(Some(ActionRequest {
+            actor_id,
+            action: selection.action,
+        }))
+    }
+
+    pub async fn apply_action(&mut self, request: ActionRequest) -> Result<ActionResult> {
+        info!(
+            actor_id = request.actor_id.index(),
+            action = ?request.action,
+            "applying action"
+        );
+        let actor_id = request.actor_id;
+        let plan = self.plan_action(request)?;
+        debug!(
+            actor_id = actor_id.index(),
+            duration_seconds = plan.duration.seconds(),
+            planned_action = ?plan.action,
+            "planned action"
+        );
+        let mut events = self.execute_plan(plan).await?;
+        if let Some(place_id) = self.state.world.actor_place_id(actor_id) {
+            events.extend(self.run_autonomous_turns(place_id).await?);
+        }
+        info!(
+            actor_id = actor_id.index(),
+            event_count = events.len(),
+            "action application complete"
+        );
+        Ok(ActionResult {
             events,
             should_quit: false,
         })
@@ -103,223 +341,289 @@ impl<B: LlmBackend> GameService<B> {
 
     pub fn load(&mut self, path: &Path) -> Result<()> {
         let data = fs::read_to_string(path)?;
-        let mut state = serde_json::from_str::<GameState>(&data)?;
-        let player_id = state.world.ensure_player();
-        let current_time = state.world.current_time();
-        for process_id in state.world.active_dialogue_process_ids(player_id) {
-            state.world.end_process(process_id, current_time);
-        }
-        if state.world.player_place_id(player_id).is_none() {
-            let start_city_id = state.world.city_ids()[0];
-            let start_place_id = state.world.city_places(start_city_id)[0];
-            state.world.move_player(player_id, start_place_id);
-        }
+        let state = serde_json::from_str::<GameState>(&data)?;
         validate_world(&state.world)?;
         self.state = state;
+        self.agent_debug_traces.clear();
+        info!(path = %path.display(), "loaded game state");
         Ok(())
     }
 
-    async fn submit_dialogue_line(&mut self, input: String) -> Result<Vec<GameEvent>> {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            return Ok(Vec::new());
+    async fn execute_plan(&mut self, plan: ActionPlan) -> Result<Vec<GameEvent>> {
+        debug!(
+            actor_id = plan.actor_id.index(),
+            duration_seconds = plan.duration.seconds(),
+            planned_action = ?plan.action,
+            "executing action plan"
+        );
+        match plan.action {
+            PlannedAction::MoveTo {
+                destination, route, ..
+            } => {
+                let started_at = self.current_time();
+                self.state.world.record_travel_process(
+                    plan.actor_id,
+                    destination,
+                    started_at,
+                    plan.duration,
+                );
+                self.state.world.move_actor(plan.actor_id, destination);
+                self.advance_time(plan.duration);
+                self.learn_city(
+                    plan.actor_id,
+                    self.state
+                        .world
+                        .place_city_id(destination)
+                        .expect("destination should belong to a city"),
+                );
+
+                let destination = self.place_summary(destination);
+                let context_event = self.push_system_context(
+                    plan.actor_id,
+                    self.current_time(),
+                    SystemContext::Travel {
+                        destination,
+                        duration: plan.duration,
+                    },
+                );
+                info!(
+                    actor_id = plan.actor_id.index(),
+                    destination_id = destination.id.index(),
+                    duration_seconds = plan.duration.seconds(),
+                    route_kind = route.kind.label(),
+                    "travel completed"
+                );
+                Ok(vec![
+                    context_event,
+                    GameEvent::TravelCompleted {
+                        actor_id: plan.actor_id,
+                        destination,
+                        route,
+                        duration: plan.duration,
+                    },
+                ])
+            }
+            PlannedAction::Speak {
+                place_id,
+                target,
+                text,
+            } => {
+                let started_at = self.current_time();
+                let line = DialogueLine {
+                    timestamp: started_at,
+                    speaker: DialogueSpeaker::Actor(plan.actor_id),
+                    text,
+                };
+                self.state.world.record_speech_process(
+                    plan.actor_id,
+                    target,
+                    place_id,
+                    started_at,
+                    plan.duration,
+                    vec![line.clone()],
+                );
+                self.advance_time(plan.duration);
+
+                let transcript = self
+                    .state
+                    .world
+                    .speech_lines_between(plan.actor_id, target, 64);
+                let memory_summary = self.backend.summarize_memory(&transcript).await?;
+                self.state
+                    .world
+                    .merge_actor_conversation_memory(plan.actor_id, memory_summary.clone());
+                self.state
+                    .world
+                    .merge_actor_conversation_memory(target, memory_summary);
+                info!(
+                    actor_id = plan.actor_id.index(),
+                    target_id = target.index(),
+                    text = %line.text,
+                    duration_seconds = plan.duration.seconds(),
+                    "speech recorded"
+                );
+
+                Ok(vec![GameEvent::SpeechLineRecorded { line }])
+            }
+            PlannedAction::InspectEntity {
+                entity_id,
+                place_id,
+            } => {
+                let started_at = self.current_time();
+                self.state.world.record_inspect_process(
+                    plan.actor_id,
+                    entity_id,
+                    place_id,
+                    started_at,
+                    plan.duration,
+                );
+                self.advance_time(plan.duration);
+                info!(
+                    actor_id = plan.actor_id.index(),
+                    entity_id = entity_id.index(),
+                    duration_seconds = plan.duration.seconds(),
+                    "entity inspected"
+                );
+                let entity = self.entity_summary(entity_id);
+                let context_event = self.push_system_context(
+                    plan.actor_id,
+                    self.current_time(),
+                    SystemContext::Inspect { entity },
+                );
+                Ok(vec![
+                    context_event,
+                    GameEvent::EntityInspected {
+                        actor_id: plan.actor_id,
+                        entity,
+                    },
+                ])
+            }
+            PlannedAction::Wait { place_id } => {
+                let started_at = self.current_time();
+                self.state.world.record_waiting_process(
+                    plan.actor_id,
+                    place_id,
+                    started_at,
+                    plan.duration,
+                );
+                self.advance_time(plan.duration);
+                info!(
+                    actor_id = plan.actor_id.index(),
+                    duration_seconds = plan.duration.seconds(),
+                    "wait completed"
+                );
+                let current_time = self.current_time();
+                let context_event = self.push_system_context(
+                    plan.actor_id,
+                    current_time,
+                    SystemContext::Wait {
+                        duration: plan.duration,
+                        current_time,
+                    },
+                );
+                Ok(vec![
+                    context_event,
+                    GameEvent::WaitCompleted {
+                        actor_id: plan.actor_id,
+                        duration: plan.duration,
+                        current_time,
+                    },
+                ])
+            }
+            PlannedAction::DoNothing { place_id } => {
+                self.state.world.record_do_nothing_process(
+                    plan.actor_id,
+                    place_id,
+                    self.current_time(),
+                );
+                info!(actor_id = plan.actor_id.index(), "actor chose do_nothing");
+                Ok(Vec::new())
+            }
         }
-
-        let Some(process_id) = active_dialogue_process_id(&self.state) else {
-            bail!("You are not talking to anyone right now.");
-        };
-        let mut events = self.record_dialogue_line(DialogueSpeaker::Player, trimmed.to_string());
-
-        let npc_id = self
-            .state
-            .world
-            .dialogue_npc_id(process_id)
-            .expect("active dialogue should include an npc");
-        let memory = self
-            .state
-            .world
-            .npc_conversation_memory(npc_id)
-            .unwrap_or_default();
-        let context = build_npc_dialogue_context(
-            &self.state.world,
-            current_time(&self.state),
-            current_city_id(&self.state),
-            &memory,
-            process_id,
-            trimmed.to_string(),
-        )?;
-
-        let response = self.backend.generate_dialogue(&context).await?;
-        let text = response.text;
-
-        events.extend(self.record_dialogue_line(DialogueSpeaker::Npc(npc_id), text));
-        self.advance_time(DIALOGUE_TIME);
-        Ok(events)
     }
 
-    fn travel_to(&mut self, destination_id: PlaceId) -> Result<Vec<GameEvent>> {
-        let (resolved_destination_id, route) = self
+    async fn run_autonomous_turns(&mut self, place_id: PlaceId) -> Result<Vec<GameEvent>> {
+        let mut events = Vec::new();
+        let ai_actors = self
             .state
             .world
-            .place_routes(current_place_id(&self.state))
+            .place_actors(place_id)
             .into_iter()
-            .find(|(place_id, _)| *place_id == destination_id)
-            .ok_or_else(|| anyhow::anyhow!("Selected route is no longer available."))?;
-        let travel_time = route.travel_time;
+            .filter(|actor_id| {
+                self.state.world.actor(*actor_id).controller == ControllerMode::AiAgent
+            })
+            .collect::<Vec<_>>();
+        debug!(
+            place_id = place_id.index(),
+            ai_actor_ids = ?ai_actors.iter().map(|id| id.index()).collect::<Vec<_>>(),
+            "running autonomous turns"
+        );
 
-        self.move_player_to(resolved_destination_id);
-        self.advance_time(travel_time);
-        let player_id = self.player_id();
-        self.state.world.record_travel_process(
-            player_id,
-            resolved_destination_id,
-            travel_time,
-            current_time(&self.state),
-        );
-        self.learn_city(current_city_id(&self.state));
-        let destination = self.place_summary(resolved_destination_id);
-        let context_event = self.push_system_context(
-            current_time(&self.state),
-            SystemContext::Travel {
-                destination,
-                duration: travel_time,
-            },
-        );
-        Ok(vec![
-            context_event,
-            GameEvent::TravelCompleted {
-                destination,
-                route,
-                duration: travel_time,
-            },
-        ])
-    }
+        for actor_id in ai_actors {
+            if self.state.world.actor_place_id(actor_id) != Some(place_id) {
+                warn!(
+                    actor_id = actor_id.index(),
+                    place_id = place_id.index(),
+                    "skipping autonomous actor that moved before its turn"
+                );
+                continue;
+            }
+            let Some(request) = self.choose_autonomous_action(actor_id).await? else {
+                continue;
+            };
+            let plan = self.plan_action(request)?;
+            events.extend(self.execute_plan(plan).await?);
+        }
 
-    fn start_dialogue(&mut self, npc_id: NpcId) -> Result<Vec<GameEvent>> {
-        if active_dialogue_process_id(&self.state).is_some() {
-            bail!("You are already talking to someone.");
-        }
-        let is_nearby = self
-            .state
-            .world
-            .place_npcs(current_place_id(&self.state))
-            .contains(&npc_id);
-        if !is_nearby {
-            bail!("That person is no longer here.");
-        }
-        let player_id = self.player_id();
-        self.state.world.start_dialogue_process(
-            player_id,
-            npc_id,
-            current_place_id(&self.state),
-            current_time(&self.state),
-        );
-        let opening_text = format!(
-            "What do you want to know about {}?",
-            self.state.world.city_name(current_city_id(&self.state))
-        );
-        let mut events = vec![GameEvent::DialogueStarted { npc_id }];
-        events.extend(self.record_dialogue_line(DialogueSpeaker::Npc(npc_id), opening_text));
         Ok(events)
     }
 
-    fn inspect_entity(&self, entity_id: EntityId) -> Result<GameEvent> {
-        let is_here = self
-            .state
-            .world
-            .place_entities(current_place_id(&self.state))
-            .contains(&entity_id);
-        if !is_here {
-            bail!("That entity is no longer here.");
-        }
-        Ok(GameEvent::EntityInspected {
-            entity: self.entity_summary(entity_id),
-        })
-    }
-
-    fn wait_for(&mut self, duration: TimeDelta) -> GameEvent {
-        let duration = duration.max(TimeDelta::ONE_SECOND);
-        self.advance_time(duration);
-        let player_id = self.player_id();
-        self.state.world.record_waiting_process(
-            player_id,
-            current_place_id(&self.state),
-            duration,
-            current_time(&self.state),
-        );
-        GameEvent::WaitCompleted {
-            duration,
-            current_time: current_time(&self.state),
-        }
-    }
-
-    async fn leave_dialogue(&mut self) -> Result<GameEvent> {
-        let Some(process_id) = active_dialogue_process_id(&self.state) else {
-            bail!("You are not talking to anyone right now.");
-        };
-        let npc_id = active_dialogue_npc_id(&self.state)
-            .expect("active dialogue should include an npc participant");
-        let transcript = self.state.world.dialogue_lines(process_id);
-        let summary = self.backend.summarize_memory(&transcript).await?;
-        self.state
-            .world
-            .end_process(process_id, current_time(&self.state));
-        self.state
-            .world
-            .merge_npc_conversation_memory(npc_id, summary);
-        Ok(GameEvent::DialogueEnded { npc_id })
-    }
-
-    fn push_system_context(&mut self, timestamp: GameTime, context: SystemContext) -> GameEvent {
+    fn push_system_context(
+        &mut self,
+        actor_id: ActorId,
+        timestamp: GameTime,
+        context: SystemContext,
+    ) -> GameEvent {
         let entry = ContextEntry::System { timestamp, context };
         self.state
             .world
-            .append_context_entry(self.player_id(), entry.clone());
+            .append_context_entry(actor_id, entry.clone());
         GameEvent::ContextAppended { entry }
     }
 
-    fn move_player_to(&mut self, place_id: PlaceId) {
-        let player_id = self.player_id();
-        self.state.world.move_player(player_id, place_id);
-    }
-
-    fn record_dialogue_line(&mut self, speaker: DialogueSpeaker, text: String) -> Vec<GameEvent> {
-        let process_id = active_dialogue_process_id(&self.state)
-            .expect("dialogue should be active while recording a line");
-        let line = DialogueLine {
-            timestamp: current_time(&self.state),
-            speaker,
-            text,
-        };
-        self.state
-            .world
-            .append_dialogue_utterance(process_id, self.player_id(), line.clone());
-        let entry = ContextEntry::Dialogue(line.clone());
-        vec![
-            GameEvent::DialogueLineRecorded { line },
-            GameEvent::ContextAppended { entry },
-        ]
-    }
-
     fn advance_time(&mut self, duration: TimeDelta) {
-        let next_time = current_time(&self.state).advance(duration);
+        let next_time = self.current_time().advance(duration);
         self.state.world.set_current_time(next_time);
     }
 
-    fn learn_city(&mut self, city_id: crate::world::CityId) {
-        let player_id = self.player_id();
+    fn learn_city(&mut self, actor_id: ActorId, city_id: crate::world::CityId) {
         self.state
             .world
-            .discover_city(player_id, city_id, current_time(&self.state));
+            .discover_city(actor_id, city_id, self.current_time());
         for connected in self.state.world.city_connections(city_id) {
             self.state
                 .world
-                .discover_city(player_id, connected, current_time(&self.state));
+                .discover_city(actor_id, connected, self.current_time());
         }
     }
 
-    fn player_id(&self) -> crate::world::PlayerId {
-        player_id(&self.state)
+    fn current_time(&self) -> GameTime {
+        self.state.world.current_time()
+    }
+
+    fn local_agent_debug_snapshots(&self, focused_actor_id: ActorId) -> Vec<AgentDebugSnapshot> {
+        let Some(place_id) = self.state.world.actor_place_id(focused_actor_id) else {
+            return Vec::new();
+        };
+
+        self.state
+            .world
+            .place_actors(place_id)
+            .into_iter()
+            .filter(|actor_id| {
+                *actor_id != focused_actor_id
+                    && self.state.world.actor(*actor_id).controller == ControllerMode::AiAgent
+            })
+            .map(|actor_id| AgentDebugSnapshot {
+                actor: build_actor_view(&self.state.world, actor_id),
+                trace: self.agent_debug_traces.get(&actor_id).cloned(),
+            })
+            .collect()
+    }
+
+    pub fn manual_actor_id(&self) -> ActorId {
+        self.state
+            .world
+            .manual_actor_id()
+            .expect("world should contain a manual actor")
+    }
+
+    pub fn actor_exists(&self, actor_id: ActorId) -> bool {
+        self.state.world.actor_ids().contains(&actor_id)
+    }
+
+    pub fn agent_debug_trace(&self, actor_id: ActorId) -> Option<AgentDebugTrace> {
+        self.agent_debug_traces.get(&actor_id).cloned()
     }
 
     fn place_summary(&self, place_id: PlaceId) -> PlaceSummary {
@@ -329,6 +633,18 @@ impl<B: LlmBackend> GameService<B> {
     fn entity_summary(&self, entity_id: EntityId) -> EntitySummary {
         build_entity_summary(&self.state.world, entity_id)
     }
+}
+
+fn current_world_seed() -> WorldSeed {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    WorldSeed::new(duration.as_nanos() as u64)
+}
+
+fn line_duration(text: &str) -> TimeDelta {
+    let word_count = text.split_whitespace().count().max(1) as u32;
+    TimeDelta::from_seconds(4 + word_count.saturating_mul(2))
 }
 
 fn validate_world(world: &World) -> Result<()> {
@@ -343,48 +659,24 @@ fn validate_world(world: &World) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
-    use petgraph::visit::EdgeRef;
     use serde_json::to_vec_pretty;
 
-    use crate::ai::context::NpcDialogueContext;
-    use crate::domain::commands::GameCommand;
-    use crate::domain::events::{DialogueLine, GameEvent};
+    use crate::domain::commands::{
+        ActionKind, ActionRequest, AgentAvailableAction, AvailableAction, PlannedAction,
+    };
+    use crate::domain::events::{DialogueLine, DialogueSpeaker, GameEvent};
     use crate::domain::memory::ConversationMemory;
+    use crate::domain::seed::WorldSeed;
     use crate::domain::time::TimeDelta;
-    use crate::graph_ecs::WorldEdge;
-    use crate::llm::{DialogueResponse, LlmBackend, MockBackend};
-    use crate::simulation::{Interactable, UiMode};
-    use crate::world::NpcId;
+    use crate::llm::{ActionSelection, AgentDebugTrace, LlmBackend, MockBackend};
+    use crate::simulation::Interactable;
+    use crate::world::{ControllerMode, WorldRelation};
 
     use super::GameService;
 
-    #[derive(Debug, Clone, Copy)]
-    struct FailingSummaryBackend;
-
-    impl LlmBackend for FailingSummaryBackend {
-        async fn generate_dialogue(
-            &self,
-            _context: &NpcDialogueContext,
-        ) -> anyhow::Result<DialogueResponse> {
-            Ok(DialogueResponse {
-                text: "Normal reply.".to_string(),
-            })
-        }
-
-        async fn summarize_memory(
-            &self,
-            _transcript: &[DialogueLine],
-        ) -> anyhow::Result<ConversationMemory> {
-            anyhow::bail!("summary failed")
-        }
-
-        fn name(&self) -> &'static str {
-            "failing-summary"
-        }
-    }
-
-    fn nearby_npc_id<B: LlmBackend>(game: &GameService<B>) -> NpcId {
+    fn nearby_actor_id<B: LlmBackend>(game: &GameService<B>) -> crate::world::ActorId {
         game.snapshot()
             .interactables
             .into_iter()
@@ -392,86 +684,233 @@ mod tests {
                 Interactable::Talk(actor) => Some(actor.id),
                 _ => None,
             })
-            .expect("expected a nearby npc")
+            .expect("expected a nearby actor")
     }
 
-    async fn open_dialogue_with_nearby_npc<B: LlmBackend>(game: &mut GameService<B>) -> NpcId {
-        let npc_id = nearby_npc_id(game);
-        game.apply_command(GameCommand::OpenDialogue(npc_id))
-            .await
-            .unwrap();
-        npc_id
-    }
-
-    #[tokio::test]
-    async fn dialogue_can_be_opened_and_closed_through_typed_commands() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        open_dialogue_with_nearby_npc(&mut game).await;
-        assert_eq!(game.snapshot().mode, UiMode::Dialogue);
-        let leave = game
-            .apply_command(GameCommand::LeaveDialogue)
-            .await
-            .unwrap();
-        assert!(matches!(
-            leave.events.as_slice(),
-            [GameEvent::DialogueEnded { .. }]
-        ));
-    }
-
-    #[tokio::test]
-    async fn save_and_load_round_trip() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        game.apply_command(GameCommand::Wait(TimeDelta::from_seconds(60)))
-            .await
-            .unwrap();
-        game.save(Path::new("/tmp/riggy-test-save.json")).unwrap();
-
-        let mut loaded = GameService::new(MockBackend).unwrap();
-        loaded.load(Path::new("/tmp/riggy-test-save.json")).unwrap();
-        assert_eq!(
-            game.state.world.current_time(),
-            loaded.state.world.current_time()
-        );
-        let loaded_player_id = loaded.state.world.player_id().unwrap();
-        let game_player_id = game.state.world.player_id().unwrap();
-        assert_eq!(
-            game.state.world.player_city_id(game_player_id),
-            loaded.state.world.player_city_id(loaded_player_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn load_closes_stale_dialogue_processes() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
-        assert_eq!(game.snapshot().mode, UiMode::Dialogue);
-        game.save(Path::new("/tmp/riggy-dialogue-save.json"))
-            .unwrap();
-
-        let mut loaded = GameService::new(MockBackend).unwrap();
-        loaded
-            .load(Path::new("/tmp/riggy-dialogue-save.json"))
-            .unwrap();
-
-        assert_eq!(loaded.snapshot().mode, UiMode::Explore);
-        assert_eq!(
-            loaded
-                .state
+    fn place_with_entity<B: LlmBackend>(
+        game: &GameService<B>,
+    ) -> Option<(crate::world::PlaceId, crate::world::EntityId)> {
+        game.state.world.city_ids().into_iter().find_map(|city_id| {
+            game.state
                 .world
-                .active_dialogue_npc_id(loaded.player_id()),
-            None
-        );
-        assert!(loaded.snapshot().interactables.iter().any(
-            |interactable| matches!(interactable, Interactable::Talk(actor) if actor.id == npc_id)
-        ));
+                .city_places(city_id)
+                .into_iter()
+                .find_map(|place_id| {
+                    game.state
+                        .world
+                        .place_entities(place_id)
+                        .into_iter()
+                        .next()
+                        .map(|entity_id| (place_id, entity_id))
+                })
+        })
+    }
+
+    fn test_game() -> GameService<MockBackend> {
+        GameService::new_with_seed(MockBackend, WorldSeed::new(42)).unwrap()
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ScriptMode {
+        DoNothing,
+        ReplyToLatestSpeaker,
+        ProactiveSpeakToPlayer,
+        ProactiveSpeakToNpc,
+        MoveFirstNpc,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedBackend {
+        mode: ScriptMode,
+        calls: Arc<Mutex<Vec<crate::world::ActorId>>>,
+        acted: Arc<Mutex<bool>>,
+    }
+
+    impl ScriptedBackend {
+        fn new(mode: ScriptMode) -> Self {
+            Self {
+                mode,
+                calls: Arc::new(Mutex::new(Vec::new())),
+                acted: Arc::new(Mutex::new(false)),
+            }
+        }
+
+        fn call_log(&self) -> Vec<crate::world::ActorId> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn take_first_turn(&self) -> bool {
+            let mut acted = self.acted.lock().unwrap();
+            if *acted {
+                false
+            } else {
+                *acted = true;
+                true
+            }
+        }
+    }
+
+    impl LlmBackend for ScriptedBackend {
+        async fn choose_action(
+            &self,
+            context: &crate::ai::context::ActorTurnContext,
+        ) -> anyhow::Result<ActionSelection> {
+            self.calls.lock().unwrap().push(context.actor.id);
+            let mut trace = AgentDebugTrace::from_context(context, self.name());
+            trace.toolset = context
+                .available_actions
+                .iter()
+                .filter_map(|action| match action {
+                    AgentAvailableAction::MoveTo { .. } => Some("move_to"),
+                    AgentAvailableAction::SpeakTo { .. } => Some("speak_to"),
+                    AgentAvailableAction::InspectEntity { .. } => Some("inspect_entity"),
+                    AgentAvailableAction::DoNothing => Some("do_nothing"),
+                })
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+
+            let action = match self.mode {
+                ScriptMode::DoNothing => ActionKind::DoNothing,
+                ScriptMode::ReplyToLatestSpeaker => {
+                    if let Some(line) = context.recent_speech.iter().rev().find(|line| {
+                        matches!(line.speaker, DialogueSpeaker::Actor(actor_id) if actor_id != context.actor.id)
+                    }) {
+                        match line.speaker {
+                            DialogueSpeaker::Actor(target)
+                                if context
+                                    .available_actions
+                                    .contains(&AgentAvailableAction::SpeakTo { target }) =>
+                            {
+                                ActionKind::Speak {
+                                    target,
+                                    text: "I heard you. Here's my answer.".to_string(),
+                                }
+                            }
+                            _ => ActionKind::DoNothing,
+                        }
+                    } else {
+                        ActionKind::DoNothing
+                    }
+                }
+                ScriptMode::ProactiveSpeakToPlayer => {
+                    if self.take_first_turn() {
+                        context
+                            .local_state
+                            .nearby_actors
+                            .iter()
+                            .find(|actor| actor.controller == ControllerMode::Manual)
+                            .map(|actor| ActionKind::Speak {
+                                target: actor.id,
+                                text: "You look like you know more than you're saying.".to_string(),
+                            })
+                            .unwrap_or(ActionKind::DoNothing)
+                    } else {
+                        ActionKind::DoNothing
+                    }
+                }
+                ScriptMode::ProactiveSpeakToNpc => {
+                    if self.take_first_turn() {
+                        context
+                            .local_state
+                            .nearby_actors
+                            .iter()
+                            .find(|actor| actor.controller == ControllerMode::AiAgent)
+                            .map(|actor| ActionKind::Speak {
+                                target: actor.id,
+                                text: "Keep your eyes open in this room.".to_string(),
+                            })
+                            .unwrap_or(ActionKind::DoNothing)
+                    } else {
+                        ActionKind::DoNothing
+                    }
+                }
+                ScriptMode::MoveFirstNpc => {
+                    if self.take_first_turn() {
+                        context
+                            .available_actions
+                            .iter()
+                            .find_map(|action| match action {
+                                AgentAvailableAction::MoveTo { destination } => {
+                                    Some(ActionKind::MoveTo {
+                                        destination: *destination,
+                                    })
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or(ActionKind::DoNothing)
+                    } else {
+                        ActionKind::DoNothing
+                    }
+                }
+            };
+
+            trace.model_output = Some(format!("scripted backend selected {action:?}"));
+            trace.selected_action = Some(action.clone());
+            Ok(ActionSelection { action, trace })
+        }
+
+        async fn summarize_memory(
+            &self,
+            transcript: &[DialogueLine],
+        ) -> anyhow::Result<ConversationMemory> {
+            let summary = transcript
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            Ok(ConversationMemory { summary }.normalized())
+        }
+
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+
+        fn label(&self) -> String {
+            "scripted".to_string()
+        }
+    }
+
+    fn scripted_game(mode: ScriptMode) -> GameService<ScriptedBackend> {
+        GameService::new_with_seed(ScriptedBackend::new(mode), WorldSeed::new(42)).unwrap()
+    }
+
+    fn current_room_ai_actors<B: LlmBackend>(game: &GameService<B>) -> Vec<crate::world::ActorId> {
+        let place_id = game
+            .state
+            .world
+            .actor_place_id(game.manual_actor_id())
+            .expect("manual actor should have a place");
+        game.state
+            .world
+            .place_actors(place_id)
+            .into_iter()
+            .filter(|actor_id| {
+                game.state.world.actor(*actor_id).controller == ControllerMode::AiAgent
+            })
+            .collect()
+    }
+
+    #[test]
+    fn new_game_starts_with_empty_recent_activity() {
+        let game = test_game();
+
+        assert!(game.snapshot().context_feed.is_empty());
     }
 
     #[tokio::test]
-    async fn dialogue_submission_uses_typed_command_path() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        open_dialogue_with_nearby_npc(&mut game).await;
+    async fn speak_action_triggers_autonomous_ai_reply_turn() {
+        let mut game = scripted_game(ScriptMode::ReplyToLatestSpeaker);
+        let actor_id = game.manual_actor_id();
+        let target_id = nearby_actor_id(&game);
+
         let result = game
-            .apply_command(GameCommand::SubmitDialogueLine("hello".to_string()))
+            .apply_action(ActionRequest {
+                actor_id,
+                action: ActionKind::Speak {
+                    target: target_id,
+                    text: "hello".to_string(),
+                },
+            })
             .await
             .unwrap();
 
@@ -479,105 +918,341 @@ mod tests {
             result
                 .events
                 .iter()
-                .any(|event| matches!(event, GameEvent::DialogueLineRecorded { .. }))
+                .filter(|event| matches!(event, GameEvent::SpeechLineRecorded { .. }))
+                .count()
+                >= 2
         );
-    }
-
-    #[tokio::test]
-    async fn leaving_dialogue_persists_conversation_memory() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
-        game.apply_command(GameCommand::SubmitDialogueLine(
-            "tell me about work".to_string(),
-        ))
-        .await
-        .unwrap();
-        game.apply_command(GameCommand::LeaveDialogue)
-            .await
-            .unwrap();
-
-        let memory = game.state.world.npc_conversation_memory(npc_id).unwrap();
-        assert!(!memory.summary.is_empty());
-        assert!(memory.summary.contains("tell me about work"));
-    }
-
-    #[tokio::test]
-    async fn leaving_dialogue_preserves_session_when_summary_fails() {
-        let mut game = GameService::new(FailingSummaryBackend).unwrap();
-        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
-        let error = game
-            .apply_command(GameCommand::LeaveDialogue)
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("summary failed"));
+        assert!(
+            game.snapshot()
+                .context_feed
+                .iter()
+                .any(|entry| matches!(entry, crate::domain::events::ContextEntry::Dialogue(_)))
+        );
         assert_eq!(
-            game.state.world.active_dialogue_npc_id(game.player_id()),
-            Some(npc_id)
+            game.state
+                .world
+                .speech_lines_between(actor_id, target_id, 8)
+                .len(),
+            2
         );
     }
 
     #[tokio::test]
-    async fn leaving_dialogue_merges_conversation_memory_across_sessions() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = open_dialogue_with_nearby_npc(&mut game).await;
-        game.apply_command(GameCommand::SubmitDialogueLine(
-            "tell me about work".to_string(),
-        ))
-        .await
-        .unwrap();
-        game.apply_command(GameCommand::LeaveDialogue)
+    async fn choose_autonomous_action_can_choose_do_nothing() {
+        let mut game = scripted_game(ScriptMode::DoNothing);
+        let target_id = nearby_actor_id(&game);
+
+        let follow_up = game.choose_autonomous_action(target_id).await.unwrap();
+        assert!(matches!(
+            follow_up,
+            Some(ActionRequest {
+                actor_id,
+                action: ActionKind::DoNothing,
+            }) if actor_id == target_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn npc_can_proactively_speak_to_player_without_prior_inbound_speech() {
+        let mut game = scripted_game(ScriptMode::ProactiveSpeakToPlayer);
+        let actor_id = game.manual_actor_id();
+
+        let result = game
+            .apply_action(ActionRequest {
+                actor_id,
+                action: ActionKind::Wait {
+                    duration: TimeDelta::from_seconds(1),
+                },
+            })
             .await
             .unwrap();
 
-        game.apply_command(GameCommand::OpenDialogue(npc_id))
-            .await
-            .unwrap();
-        game.apply_command(GameCommand::SubmitDialogueLine(
-            "tell me about the city".to_string(),
-        ))
+        let npc_lines = result
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::SpeechLineRecorded { line } => Some(line),
+                _ => None,
+            })
+            .filter(|line| matches!(line.speaker, DialogueSpeaker::Actor(speaker) if speaker != actor_id))
+            .collect::<Vec<_>>();
+        assert!(!npc_lines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn npc_can_proactively_speak_to_another_npc() {
+        let mut game = scripted_game(ScriptMode::ProactiveSpeakToNpc);
+        let actor_id = game.manual_actor_id();
+        let room_ai_actors = current_room_ai_actors(&game);
+
+        game.apply_action(ActionRequest {
+            actor_id,
+            action: ActionKind::Wait {
+                duration: TimeDelta::from_seconds(1),
+            },
+        })
         .await
         .unwrap();
-        game.apply_command(GameCommand::LeaveDialogue)
-            .await
+
+        let spoke_between_ai = room_ai_actors.iter().any(|speaker| {
+            room_ai_actors.iter().any(|target| {
+                speaker != target
+                    && !game
+                        .state
+                        .world
+                        .speech_lines_between(*speaker, *target, 8)
+                        .is_empty()
+            })
+        });
+        assert!(spoke_between_ai);
+    }
+
+    #[tokio::test]
+    async fn npc_can_move_during_autonomous_turn() {
+        let mut game = scripted_game(ScriptMode::MoveFirstNpc);
+        let actor_id = game.manual_actor_id();
+        let mover_id = current_room_ai_actors(&game)[0];
+        let origin = game.state.world.actor_place_id(mover_id).unwrap();
+
+        game.apply_action(ActionRequest {
+            actor_id,
+            action: ActionKind::Wait {
+                duration: TimeDelta::from_seconds(1),
+            },
+        })
+        .await
+        .unwrap();
+
+        let destination = game.state.world.actor_place_id(mover_id).unwrap();
+        assert_ne!(origin, destination);
+    }
+
+    #[tokio::test]
+    async fn autonomous_turns_only_run_for_current_room_actors() {
+        let mut game = scripted_game(ScriptMode::DoNothing);
+        let actor_id = game.manual_actor_id();
+        let current_room_ai = current_room_ai_actors(&game);
+        let moved_out_actor = current_room_ai[0];
+        let current_place = game.state.world.actor_place_id(actor_id).unwrap();
+        let other_place = game
+            .state
+            .world
+            .place_routes(current_place)
+            .into_iter()
+            .map(|(destination, _)| destination)
+            .find(|destination| *destination != current_place)
+            .expect("expected another room");
+        game.state.world.move_actor(moved_out_actor, other_place);
+
+        game.apply_action(ActionRequest {
+            actor_id,
+            action: ActionKind::Wait {
+                duration: TimeDelta::from_seconds(1),
+            },
+        })
+        .await
+        .unwrap();
+
+        let calls = game.backend.call_log();
+        assert!(!calls.contains(&moved_out_actor));
+        for actor in current_room_ai_actors(&game) {
+            assert!(calls.contains(&actor));
+        }
+    }
+
+    #[tokio::test]
+    async fn each_npc_acts_at_most_once_per_player_action() {
+        let mut game = scripted_game(ScriptMode::DoNothing);
+        let actor_id = game.manual_actor_id();
+        let room_ai_actors = current_room_ai_actors(&game);
+
+        game.apply_action(ActionRequest {
+            actor_id,
+            action: ActionKind::Wait {
+                duration: TimeDelta::from_seconds(1),
+            },
+        })
+        .await
+        .unwrap();
+
+        let calls = game.backend.call_log();
+        assert_eq!(calls.len(), room_ai_actors.len());
+        let mut unique = calls.clone();
+        unique.sort_unstable_by_key(|actor_id| actor_id.index());
+        unique.dedup();
+        assert_eq!(unique.len(), room_ai_actors.len());
+    }
+
+    #[tokio::test]
+    async fn wait_and_inspect_actions_append_system_context() {
+        let mut game = test_game();
+        let actor_id = game.manual_actor_id();
+        let (place_id, entity_id) =
+            place_with_entity(&game).expect("expected a place with an entity");
+        game.state.world.move_actor(actor_id, place_id);
+
+        game.apply_action(ActionRequest {
+            actor_id,
+            action: ActionKind::InspectEntity { entity_id },
+        })
+        .await
+        .unwrap();
+        game.apply_action(ActionRequest {
+            actor_id,
+            action: ActionKind::Wait {
+                duration: TimeDelta::from_seconds(30),
+            },
+        })
+        .await
+        .unwrap();
+
+        assert!(game.snapshot().context_feed.iter().any(|entry| matches!(
+            entry,
+            crate::domain::events::ContextEntry::System {
+                context: crate::domain::events::SystemContext::Inspect { .. },
+                ..
+            }
+        )));
+        assert!(game.snapshot().context_feed.iter().any(|entry| matches!(
+            entry,
+            crate::domain::events::ContextEntry::System {
+                context: crate::domain::events::SystemContext::Wait { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn snapshot_for_renders_any_focused_actor() {
+        let game = test_game();
+        let target_id = nearby_actor_id(&game);
+
+        let snapshot = game.snapshot_for(target_id);
+
+        assert_eq!(snapshot.focused_actor_id, target_id);
+        assert_eq!(snapshot.status.id, target_id);
+        assert!(snapshot.available_actions.contains(&AvailableAction::Wait));
+    }
+
+    #[test]
+    fn available_actions_and_plan_action_share_the_same_surface() {
+        let game = test_game();
+        let actor_id = game.manual_actor_id();
+        let actions = game.available_actions(actor_id);
+
+        let move_destination = actions
+            .iter()
+            .find_map(|action| match action {
+                AvailableAction::MoveTo { destination } => Some(*destination),
+                _ => None,
+            })
+            .expect("expected at least one move action");
+        let talk_target = actions
+            .iter()
+            .find_map(|action| match action {
+                AvailableAction::SpeakTo { target } => Some(*target),
+                _ => None,
+            })
+            .expect("expected at least one speak action");
+
+        let move_plan = game
+            .plan_action(ActionRequest {
+                actor_id,
+                action: ActionKind::MoveTo {
+                    destination: move_destination,
+                },
+            })
+            .unwrap();
+        let speak_plan = game
+            .plan_action(ActionRequest {
+                actor_id,
+                action: ActionKind::Speak {
+                    target: talk_target,
+                    text: "hello".to_string(),
+                },
+            })
             .unwrap();
 
-        let memory = game.state.world.npc_conversation_memory(npc_id).unwrap();
-        assert!(memory.summary.contains("tell me about work"));
-        assert!(memory.summary.contains("tell me about the city"));
+        assert!(move_plan.duration > TimeDelta::ZERO);
+        assert!(matches!(
+            move_plan.action,
+            PlannedAction::MoveTo { destination, .. } if destination == move_destination
+        ));
+        assert!(matches!(
+            speak_plan.action,
+            PlannedAction::Speak { target, .. } if target == talk_target
+        ));
+    }
+
+    #[test]
+    fn agent_action_surface_exposes_do_nothing_but_not_wait() {
+        let game = test_game();
+        let actor_id = nearby_actor_id(&game);
+        let actions = game.available_agent_actions(actor_id);
+
+        assert!(actions.contains(&AgentAvailableAction::DoNothing));
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, AgentAvailableAction::SpeakTo { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn save_and_load_round_trip() {
+        let mut game = test_game();
+        game.apply_action(ActionRequest {
+            actor_id: game.manual_actor_id(),
+            action: ActionKind::Wait {
+                duration: TimeDelta::from_seconds(60),
+            },
+        })
+        .await
+        .unwrap();
+        game.save(Path::new("/tmp/riggy-test-save.json")).unwrap();
+
+        let mut loaded = test_game();
+        loaded.load(Path::new("/tmp/riggy-test-save.json")).unwrap();
+        assert_eq!(
+            game.state.world.current_time(),
+            loaded.state.world.current_time()
+        );
+        let loaded_actor_id = loaded.state.world.manual_actor_id().unwrap();
+        let game_actor_id = game.state.world.manual_actor_id().unwrap();
+        assert_eq!(
+            game.state.world.actor_city_id(game_actor_id),
+            loaded.state.world.actor_city_id(loaded_actor_id)
+        );
     }
 
     #[tokio::test]
     async fn load_rejects_invalid_world_snapshot() {
-        let mut game = GameService::new(MockBackend).unwrap();
-        let npc_id = game.state.world.npc_ids()[0];
-        let resident_city_id = game.state.world.npc_resident_city_ids(npc_id)[0];
-        let present_edge_id = game
+        let mut game = test_game();
+        let actor_id = game
             .state
             .world
-            .graph
-            .edges_directed(npc_id.0, petgraph::Direction::Incoming)
-            .find(|edge| matches!(edge.weight(), WorldEdge::PresentAt))
-            .map(|edge| edge.id())
-            .expect("npc should have place");
-        let other_city_id = game
-            .state
-            .world
-            .city_ids()
+            .actor_ids()
             .into_iter()
-            .find(|city_id| *city_id != resident_city_id)
-            .expect("world should have another city");
-        let other_place_id = game.state.world.city_places(other_city_id)[0];
-        game.state.world.graph.remove_edge(present_edge_id);
+            .find(|candidate| *candidate != game.manual_actor_id())
+            .unwrap();
+        let current_place_id = game.state.world.actor_place_id(actor_id).unwrap();
+        let city_id = game.state.world.actor_resident_city_ids(actor_id)[0];
+        let other_place_id = game
+            .state
+            .world
+            .city_places(city_id)
+            .into_iter()
+            .find(|place_id| *place_id != current_place_id)
+            .expect("world should have another room");
         game.state
             .world
             .graph
-            .add_edge(other_place_id.0, npc_id.0, WorldEdge::PresentAt);
+            .add_edge(actor_id.0, other_place_id.0, WorldRelation::LocatedAt);
 
         let invalid_path = Path::new("/tmp/riggy-invalid-save.json");
         std::fs::write(invalid_path, to_vec_pretty(&game.state).unwrap()).unwrap();
 
-        let mut loaded = GameService::new(MockBackend).unwrap();
+        let mut loaded = test_game();
         let err = loaded.load(invalid_path).unwrap_err();
         assert!(err.to_string().contains("world validation failed"));
     }

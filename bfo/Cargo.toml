@@ -6,5 +6,16 @@ description = "Basic Formal Ontology types and relation schema"
 license = "MIT"
 build = "build.rs"
 
+[package.metadata.docs.rs]
+features = ["cco"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+cco = []
+
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
+
+[build-dependencies]
+ttl2ofn = { path = "../ttl2ofn" }
